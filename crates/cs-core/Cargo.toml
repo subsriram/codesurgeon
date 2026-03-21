@@ -1,0 +1,72 @@
+[package]
+name = "cs-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Async
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# IDs
+uuid = { workspace = true }
+
+# Tree-sitter core
+tree-sitter = "0.25"
+
+# Language grammars — one per supported language
+tree-sitter-python     = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-bash       = "0.25"
+tree-sitter-html       = "0.23"
+tree-sitter-rust       = "0.24"
+tree-sitter-swift      = "0.7"
+# tree-sitter-sql   — use regex fallback for now
+
+# Dependency graph
+petgraph = { version = "0.6", features = ["serde-1"] }
+
+# Full-text search
+tantivy = "0.22"
+
+# Persistence
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Parallel indexing
+rayon = "1"
+
+# File hashing
+blake3 = "1"
+
+# File watching
+notify = "6"
+
+# Filesystem traversal (respects .gitignore)
+ignore = "0.4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Optional: local embeddings for semantic search (CPU or Apple Silicon Accelerate)
+# Build with: cargo build --features embeddings
+# Build with Accelerate BLAS on Apple Silicon: cargo build --features metal
+fastembed = { version = "5", optional = true }
+
+[features]
+default    = []
+embeddings = ["dep:fastembed"]
+metal      = ["embeddings", "fastembed/accelerate"]
+
+[dev-dependencies]
+tempfile = "3"

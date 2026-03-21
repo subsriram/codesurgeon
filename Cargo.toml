@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/cs-core",
+    "crates/cs-mcp",
+    "crates/cs-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Sriram Krishnamurthy"]
+license = "MIT"
+repository = "https://github.com/sriramk/codesurgeon"
+homepage = "https://github.com/sriramk/codesurgeon"
+description = "Local-first codebase context engine for AI coding agents"
+keywords = ["mcp", "ai", "code-analysis", "tree-sitter", "llm"]
+categories = ["development-tools", "command-line-utilities"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Internal crates
+cs-core = { path = "crates/cs-core" }

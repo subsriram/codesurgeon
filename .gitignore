@@ -1,0 +1,20 @@
+# Rust build output
+target/
+
+# codesurgeon index (generated, not source)
+.codesurgeon/
+
+# Embedding model cache (downloaded at runtime)
+.fastembed_cache/
+
+# Editor / OS
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Env / secrets
+.env
+.env.*
