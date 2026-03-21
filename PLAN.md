@@ -275,9 +275,11 @@ codesurgeon/
 - [x] `capsule::tests::chunk_for_query_short_body_unchanged` — short bodies returned verbatim
 
 ### Phase 6 — Distribution
-- [ ] GitHub repository + CI (cargo test, cargo clippy)
-- [ ] Published CLI via `cargo install` or Homebrew
-- [ ] README with benchmark results vs vexp
+- [x] GitHub repository — https://github.com/subsriram/codesurgeon
+- [x] CI — `.github/workflows/ci.yml`: cargo test + clippy (-D warnings) + rustfmt --check
+- [x] README with benchmark table vs baseline and vs vexp
+- [x] `docs/ranking.md` — full ranking pipeline documentation
+- [ ] Published CLI via `cargo install` or Homebrew (deferred — fastembed/ort native deps need crates.io compat check)
 
 ### Post-Phase-6 — Multi-root workspace support (deferred)
 Currently each `codesurgeon-mcp` instance serves one workspace. Multiple codebases are handled
