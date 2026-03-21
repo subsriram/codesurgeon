@@ -31,7 +31,6 @@ impl Language {
     }
 
     /// Returns the tree-sitter Language for grammars we have bindings for.
-    /// SQL uses a regex fallback (no grammar crate).
     pub fn tree_sitter_language(&self) -> Option<tree_sitter::Language> {
         match self {
             Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
@@ -42,13 +41,12 @@ impl Language {
             Language::Html => Some(tree_sitter_html::LANGUAGE.into()),
             Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
             Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
-            // SQL: no stable grammar crate — use regex fallback
-            Language::Sql => None,
+            Language::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
         }
     }
 
     pub fn uses_tree_sitter(&self) -> bool {
-        !matches!(self, Language::Sql)
+        true
     }
 }
 

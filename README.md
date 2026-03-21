@@ -155,7 +155,7 @@ codesurgeon docs                           # Generate per-module CLAUDE.md files
 | Swift | tree-sitter | Full AST — class/struct/enum/extension/protocol/func/method |
 | Shell (bash/zsh) | tree-sitter | Function extraction |
 | HTML | tree-sitter | Script/style blocks |
-| SQL | Regex fallback | CREATE TABLE/VIEW/FUNCTION |
+| SQL | tree-sitter | CREATE TABLE/VIEW/FUNCTION/INDEX/TYPE |
 
 ## License
 

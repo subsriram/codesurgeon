@@ -29,7 +29,7 @@ pub fn index_file(workspace_root: &Path, abs_path: &Path, content: &str) -> Resu
         Language::Html => extract_html(&rel_path, content),
         Language::Rust => extract_rust(&rel_path, content),
         Language::Swift => extract_swift(&rel_path, content),
-        Language::Sql => extract_sql_fallback(&rel_path, content),
+        Language::Sql => extract_sql(&rel_path, content),
     }
 }
 
@@ -1417,66 +1417,68 @@ fn walk_swift(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// SQL (regex fallback)
+// SQL (tree-sitter-sequel)
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn extract_sql_fallback(file_path: &str, source: &str) -> Result<Vec<Symbol>> {
+fn extract_sql(file_path: &str, source: &str) -> Result<Vec<Symbol>> {
+    let mut parser = match make_parser(&Language::Sql) {
+        Some(p) => p,
+        None => return Ok(vec![]),
+    };
+
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("sql parse failed"))?;
+    let root = tree.root_node();
     let mut symbols = Vec::new();
-    let upper = source.to_uppercase();
 
-    // Find CREATE TABLE / VIEW / FUNCTION / PROCEDURE / INDEX
-    let patterns: &[(&str, SymbolKind)] = &[
-        ("CREATE TABLE", SymbolKind::Struct),
-        ("CREATE VIEW", SymbolKind::TypeAlias),
-        ("CREATE FUNCTION", SymbolKind::Function),
-        ("CREATE PROCEDURE", SymbolKind::Function),
-        ("CREATE INDEX", SymbolKind::Constant),
-    ];
+    walk_sql(&root, source, file_path, &mut symbols);
 
-    for (line_no, line) in source.lines().enumerate() {
-        let upper_line = line.trim().to_uppercase();
-        for (pattern, ref kind) in patterns {
-            if upper_line.starts_with(pattern) {
-                // Extract name after the keyword
-                let rest = &line[pattern.len()..].trim();
-                // Skip optional IF NOT EXISTS
-                let rest = rest
-                    .trim_start_matches("IF")
-                    .trim()
-                    .trim_start_matches("NOT")
-                    .trim()
-                    .trim_start_matches("EXISTS")
-                    .trim();
-                let name = rest
-                    .split(|c: char| c == '(' || c == ' ' || c == '\t')
-                    .next()
-                    .unwrap_or("_")
-                    .trim_matches('"')
-                    .trim_matches('`')
-                    .to_string();
+    Ok(symbols)
+}
 
-                if name.is_empty() {
-                    continue;
-                }
+fn walk_sql(node: &Node, source: &str, file_path: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+        let sym_kind = match kind {
+            "create_table" => Some(SymbolKind::Struct),
+            "create_view" | "create_materialized_view" => Some(SymbolKind::TypeAlias),
+            "create_function" => Some(SymbolKind::Function),
+            "create_index" => Some(SymbolKind::Constant),
+            "create_type" => Some(SymbolKind::Enum),
+            _ => None,
+        };
 
-                let start = line_no as u32 + 1;
+        if let Some(sym_kind) = sym_kind {
+            // Name lives in the first `object_reference` child's `name` field
+            let name = child
+                .named_children(&mut child.walk())
+                .find(|n| n.kind() == "object_reference")
+                .and_then(|obj_ref| obj_ref.child_by_field_name("name"))
+                .map(|n| node_text(&n, source).to_string())
+                .unwrap_or_default();
+
+            if !name.is_empty() {
+                let (start, end) = node_lines(&child);
+                let body = node_text(&child, source).to_string();
+                let sig = body.lines().next().unwrap_or("").trim().to_string();
                 symbols.push(Symbol::new(
                     file_path,
                     &name,
-                    kind.clone(),
+                    sym_kind,
                     start,
-                    start,
-                    line.trim().to_string(),
+                    end,
+                    sig,
                     None,
-                    line.trim().to_string(),
+                    body,
                     Language::Sql,
                 ));
-                break;
             }
+        } else {
+            walk_sql(&child, source, file_path, symbols);
         }
     }
-
-    Ok(symbols)
 }
 
 #[cfg(test)]
@@ -1587,6 +1589,37 @@ pub fn validate_token(token: UserToken) -> bool {
         assert!(
             edge.is_some(),
             "expected References edge from validate_token to UserToken"
+        );
+    }
+
+    #[test]
+    fn indexes_sql_create_table() {
+        let src = r#"
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+CREATE VIEW active_users AS SELECT * FROM users WHERE active = true;
+
+CREATE FUNCTION get_user(p_id INT) RETURNS users AS $$
+BEGIN
+  RETURN QUERY SELECT * FROM users WHERE id = p_id;
+END;
+$$ LANGUAGE plpgsql;
+"#;
+        let symbols = extract_sql("schema.sql", src).expect("sql parse");
+        assert!(
+            symbols.iter().any(|s| s.name == "users" && s.kind == SymbolKind::Struct),
+            "expected users table"
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "active_users" && s.kind == SymbolKind::TypeAlias),
+            "expected active_users view"
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "get_user" && s.kind == SymbolKind::Function),
+            "expected get_user function"
         );
     }
 }

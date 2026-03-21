@@ -101,4 +101,4 @@ The search/ranking logic is documented in `docs/ranking.md`.
 | HTML | tree-sitter | Script/style blocks |
 | Rust | tree-sitter | Full AST incl. impl/trait |
 | Swift | tree-sitter | Full AST — class/struct/enum/extension/protocol/func/method |
-| SQL | Regex fallback | CREATE TABLE/VIEW/FUNCTION |
+| SQL | tree-sitter (tree-sitter-sequel) | CREATE TABLE/VIEW/FUNCTION/INDEX/TYPE |

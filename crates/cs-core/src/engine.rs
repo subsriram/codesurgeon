@@ -11,7 +11,7 @@ use crate::memory::{new_session_id, MemoryStore};
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
 use crate::symbol::{Symbol, SymbolKind};
-use crate::watcher::{hash_content, ChangeKind, FileWatcher};
+use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
