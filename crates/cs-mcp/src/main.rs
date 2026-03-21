@@ -28,7 +28,8 @@ use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 struct Request {
-    _jsonrpc: String,
+    #[allow(dead_code)]
+    jsonrpc: String,
     #[serde(default)]
     id: Option<Value>,
     method: String,
