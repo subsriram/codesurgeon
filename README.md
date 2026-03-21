@@ -152,7 +152,7 @@ codesurgeon docs                           # Generate per-module CLAUDE.md files
 | Python | tree-sitter | Full AST |
 | TypeScript / TSX | tree-sitter | Full AST |
 | JavaScript / JSX | tree-sitter | Full AST |
-| Swift | Regex fallback | Stable tree-sitter grammar crate pending |
+| Swift | tree-sitter | Full AST — class/struct/enum/extension/protocol/func/method |
 | Shell (bash/zsh) | tree-sitter | Function extraction |
 | HTML | tree-sitter | Script/style blocks |
 | SQL | Regex fallback | CREATE TABLE/VIEW/FUNCTION |

@@ -173,7 +173,7 @@ codesurgeon/
 - [x] `language.rs` — Language enum, extension detection, tree-sitter grammar map
 - [x] `symbol.rs` — `Symbol`, `Edge`, `SymbolKind`, `EdgeKind` types with blake3 hashing
 - [x] `indexer.rs` — Full tree-sitter extraction for Python, TypeScript/TSX, JavaScript/JSX,
-  Shell, HTML, Rust; regex fallback for Swift and SQL
+  Shell, HTML, Rust; tree-sitter for Swift; regex fallback for SQL
 - [x] `graph.rs` — petgraph DAG wrapper with centrality scoring, path finding, blast radius
 - [x] `db.rs` — SQLite schema (symbols, edges, files, observations) + FTS5 virtual table
 - [x] `search.rs` — tantivy BM25 index + TF-IDF re-ranking + intent detection

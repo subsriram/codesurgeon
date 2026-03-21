@@ -100,5 +100,5 @@ The search/ranking logic is documented in `docs/ranking.md`.
 | Shell (bash/zsh) | tree-sitter | Function extraction |
 | HTML | tree-sitter | Script/style blocks |
 | Rust | tree-sitter | Full AST incl. impl/trait |
-| Swift | Regex fallback | Stable grammar crate pending |
+| Swift | tree-sitter | Full AST — class/struct/enum/extension/protocol/func/method |
 | SQL | Regex fallback | CREATE TABLE/VIEW/FUNCTION |
