@@ -17,7 +17,7 @@ pub struct SearchIndex {
 }
 
 struct SearchSchema {
-    schema: Schema,
+    _schema: Schema,
     f_id: tantivy::schema::Field,
     f_name: tantivy::schema::Field,
     f_fqn: tantivy::schema::Field,
@@ -47,7 +47,7 @@ impl SearchIndex {
             index,
             writer,
             schema: SearchSchema {
-                schema,
+                _schema: schema,
                 f_id,
                 f_name,
                 f_fqn,

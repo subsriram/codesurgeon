@@ -16,18 +16,19 @@
 //! ```
 
 use anyhow::Result;
-use cs_core::{engine::EngineConfig, CoreEngine};
+use cs_core::{engine::EngineConfig, watcher::FileWatcher, CoreEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 // ── JSON-RPC types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct Request {
-    jsonrpc: String,
+    _jsonrpc: String,
     #[serde(default)]
     id: Option<Value>,
     method: String,
@@ -265,6 +266,29 @@ async fn main() -> Result<()> {
                 stats.file_count
             ),
             Err(e) => tracing::error!("Indexing failed: {}", e),
+        });
+    }
+
+    // Watch for file changes and re-index incrementally
+    {
+        let engine_clone = Arc::clone(&engine);
+        let workspace_clone = workspace.clone();
+        tokio::task::spawn_blocking(move || {
+            let watcher = match FileWatcher::new(&workspace_clone) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("Failed to start file watcher: {}", e);
+                    return;
+                }
+            };
+            tracing::info!("File watcher started for {}", workspace_clone.display());
+            loop {
+                for event in watcher.poll(Duration::from_millis(500)) {
+                    if let Err(e) = engine_clone.reindex_file(&event.path, event.kind) {
+                        tracing::warn!("reindex_file failed for {:?}: {}", event.path, e);
+                    }
+                }
+            }
         });
     }
 
