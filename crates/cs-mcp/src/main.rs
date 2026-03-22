@@ -19,10 +19,11 @@ use anyhow::Result;
 use cs_core::{engine::EngineConfig, watcher::FileWatcher, CoreEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+mod transport;
 
 // ── JSON-RPC types ────────────────────────────────────────────────────────────
 
@@ -373,45 +374,10 @@ async fn run_stdio_loop(engine: Arc<CoreEngine>) {
     let mut out = std::io::BufWriter::new(stdout.lock());
 
     loop {
-        let mut first_line = String::new();
-        match stdin_reader.read_line(&mut first_line) {
-            Ok(0) => break,           // EOF — client closed the connection
-            Ok(_) => {}
+        let message = match transport::read_message(&mut stdin_reader) {
+            Ok(Some(m)) => m,
+            Ok(None) => break,  // EOF — client closed the connection
             Err(e) => { tracing::error!("stdin read error: {}", e); break; }
-        }
-
-        let trimmed = first_line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let message: String = if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
-            // ── LSP-framed mode ───────────────────────────────────────────────
-            let len: usize = match rest.trim().parse() {
-                Ok(n) => n,
-                Err(_) => { tracing::warn!("Invalid Content-Length: {}", rest.trim()); continue; }
-            };
-            // Consume remaining headers until the mandatory blank line.
-            loop {
-                let mut h = String::new();
-                match stdin_reader.read_line(&mut h) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                if h.trim().is_empty() { break; }
-            }
-            let mut body = vec![0u8; len];
-            if let Err(e) = stdin_reader.read_exact(&mut body) {
-                tracing::error!("Failed to read framed body: {}", e);
-                break;
-            }
-            match String::from_utf8(body) {
-                Ok(s) => s,
-                Err(e) => { tracing::warn!("Non-UTF-8 body: {}", e); continue; }
-            }
-        } else {
-            // ── NDJSON mode ───────────────────────────────────────────────────
-            trimmed.to_string()
         };
 
         if message.is_empty() {
@@ -425,10 +391,7 @@ async fn run_stdio_loop(engine: Arc<CoreEngine>) {
                 Ok(j) => j,
                 Err(e) => { tracing::error!("Failed to serialize response: {}", e); continue; }
             };
-            // Always respond with Content-Length framing.
-            if let Err(e) = write!(out, "Content-Length: {}\r\n\r\n{}", json.len(), json)
-                .and_then(|_| out.flush())
-            {
+            if let Err(e) = transport::write_message(&mut out, &json) {
                 tracing::error!("stdout write error: {}", e);
                 break;
             }
