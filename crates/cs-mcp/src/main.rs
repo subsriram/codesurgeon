@@ -291,76 +291,91 @@ async fn main() -> Result<()> {
         workspace.display()
     );
 
-    let pid_path = match acquire_pid_lock(&workspace) {
-        Ok(p) => p,
+    // Try to become the exclusive background-indexing instance for this workspace.
+    // If another instance is already running we do NOT exit — we still serve this
+    // connection (e.g. a parallel Codex probe) — we just skip background work to
+    // avoid duplicate index writes.
+    let _pid_path = match acquire_pid_lock(&workspace) {
+        Ok(p) => {
+            let config = EngineConfig::new(&workspace);
+            let engine = Arc::new(CoreEngine::new(config)?);
+
+            // Kick off background indexing (primary instance only)
+            {
+                let engine_clone = Arc::clone(&engine);
+                tokio::task::spawn_blocking(move || match engine_clone.index_workspace() {
+                    Ok(stats) => tracing::info!(
+                        "Index complete: {} symbols, {} edges, {} files",
+                        stats.symbol_count,
+                        stats.edge_count,
+                        stats.file_count
+                    ),
+                    Err(e) => tracing::error!("Indexing failed: {}", e),
+                });
+            }
+
+            // Watch for file changes and re-index incrementally (primary instance only)
+            {
+                let engine_clone = Arc::clone(&engine);
+                let workspace_clone = workspace.clone();
+                tokio::task::spawn_blocking(move || {
+                    let watcher = match FileWatcher::new(&workspace_clone) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            tracing::error!("Failed to start file watcher: {}", e);
+                            return;
+                        }
+                    };
+                    tracing::info!("File watcher started for {}", workspace_clone.display());
+                    loop {
+                        for event in watcher.poll(Duration::from_millis(500)) {
+                            if let Err(e) = engine_clone.reindex_file(&event.path, event.kind) {
+                                tracing::warn!("reindex_file failed for {:?}: {}", event.path, e);
+                            }
+                        }
+                    }
+                });
+            }
+
+            run_stdio_loop(engine).await;
+            release_pid_lock(&p);
+            return Ok(());
+        }
         Err(e) => {
-            // Log to stderr (doesn't pollute MCP stdio) and exit cleanly.
-            eprintln!("codesurgeon-mcp: {e}");
-            std::process::exit(0);
+            // Another instance owns the index — serve this connection read-only
+            // (no background indexing or file watching) so parallel probes still work.
+            tracing::warn!("PID lock held by another instance ({}); serving read-only", e);
         }
     };
 
+    // Secondary instance (no PID lock): serve read-only, no background tasks.
     let config = EngineConfig::new(&workspace);
     let engine = Arc::new(CoreEngine::new(config)?);
+    run_stdio_loop(engine).await;
+    Ok(())
+}
 
-    // Kick off background indexing
-    {
-        let engine_clone = Arc::clone(&engine);
-        tokio::task::spawn_blocking(move || match engine_clone.index_workspace() {
-            Ok(stats) => tracing::info!(
-                "Index complete: {} symbols, {} edges, {} files",
-                stats.symbol_count,
-                stats.edge_count,
-                stats.file_count
-            ),
-            Err(e) => tracing::error!("Indexing failed: {}", e),
-        });
-    }
+// ── stdio loop ────────────────────────────────────────────────────────────────
 
-    // Watch for file changes and re-index incrementally
-    {
-        let engine_clone = Arc::clone(&engine);
-        let workspace_clone = workspace.clone();
-        tokio::task::spawn_blocking(move || {
-            let watcher = match FileWatcher::new(&workspace_clone) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("Failed to start file watcher: {}", e);
-                    return;
-                }
-            };
-            tracing::info!("File watcher started for {}", workspace_clone.display());
-            loop {
-                for event in watcher.poll(Duration::from_millis(500)) {
-                    if let Err(e) = engine_clone.reindex_file(&event.path, event.kind) {
-                        tracing::warn!("reindex_file failed for {:?}: {}", event.path, e);
-                    }
-                }
-            }
-        });
-    }
-
-    // MCP stdio loop
-    //
-    // Supports both transports so the same binary works with Claude Code and Codex:
-    //
-    //   • LSP-framed (Content-Length headers) — required by Codex, spec-correct
-    //   • NDJSON (raw newline-delimited JSON)  — accepted by Claude Code
-    //
-    // Detection: if the first non-empty line starts with "Content-Length:", treat
-    // the stream as framed.  Otherwise treat each line as a JSON message directly.
-    //
-    // Responses are ALWAYS framed (Content-Length) because Codex requires it and
-    // Claude Code accepts it per the MCP spec.
+/// Drives the MCP JSON-RPC session on stdin/stdout.
+///
+/// Supports two wire formats so the same binary works with Claude Code and Codex:
+///   • LSP-framed  — `Content-Length: N\r\n\r\n{json}` — required by Codex (spec-correct)
+///   • NDJSON      — raw newline-terminated JSON        — accepted by Claude Code
+///
+/// Detection is per-message: if the first non-empty line starts with
+/// `Content-Length:` the message is read using LSP framing; otherwise the line
+/// itself is the JSON body.  Responses are **always** written with Content-Length
+/// framing because Codex requires it and Claude Code accepts it per the MCP spec.
+async fn run_stdio_loop(engine: Arc<CoreEngine>) {
     let mut stdin_reader = std::io::BufReader::new(std::io::stdin());
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
     loop {
-        // Read the first line — used to detect framing mode.
         let mut first_line = String::new();
         match stdin_reader.read_line(&mut first_line) {
-            Ok(0) => break,           // EOF
+            Ok(0) => break,           // EOF — client closed the connection
             Ok(_) => {}
             Err(e) => { tracing::error!("stdin read error: {}", e); break; }
         }
@@ -371,7 +386,7 @@ async fn main() -> Result<()> {
         }
 
         let message: String = if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
-            // ── Framed mode ───────────────────────────────────────────────────
+            // ── LSP-framed mode ───────────────────────────────────────────────
             let len: usize = match rest.trim().parse() {
                 Ok(n) => n,
                 Err(_) => { tracing::warn!("Invalid Content-Length: {}", rest.trim()); continue; }
@@ -406,15 +421,19 @@ async fn main() -> Result<()> {
         let response = handle_message(&engine, &message).await;
 
         if let Some(resp) = response {
-            let json = serde_json::to_string(&resp)?;
-            // Always respond with Content-Length framing (required by Codex, accepted by Claude Code).
-            write!(out, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
-            out.flush()?;
+            let json = match serde_json::to_string(&resp) {
+                Ok(j) => j,
+                Err(e) => { tracing::error!("Failed to serialize response: {}", e); continue; }
+            };
+            // Always respond with Content-Length framing.
+            if let Err(e) = write!(out, "Content-Length: {}\r\n\r\n{}", json.len(), json)
+                .and_then(|_| out.flush())
+            {
+                tracing::error!("stdout write error: {}", e);
+                break;
+            }
         }
     }
-
-    release_pid_lock(&pid_path);
-    Ok(())
 }
 
 async fn handle_message(engine: &Arc<CoreEngine>, line: &str) -> Option<Response> {
@@ -434,7 +453,8 @@ async fn handle_message(engine: &Arc<CoreEngine>, line: &str) -> Option<Response
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
-                    "tools": {}
+                    "tools": {},
+                    "resources": {}
                 },
                 "serverInfo": {
                     "name": "codesurgeon",
@@ -451,6 +471,10 @@ async fn handle_message(engine: &Arc<CoreEngine>, line: &str) -> Option<Response
             // Notification — no response
             None
         }
+
+        // Resources — we expose no resources but must respond so Codex probes succeed.
+        "resources/list" => Some(Response::ok(req.id, json!({ "resources": [] }))),
+        "resources/templates/list" => Some(Response::ok(req.id, json!({ "resourceTemplates": [] }))),
 
         "tools/list" => Some(Response::ok(req.id, tool_list())),
 
