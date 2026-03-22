@@ -17,6 +17,7 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -51,7 +52,7 @@ impl EngineConfig {
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IndexStats {
     pub symbol_count: u64,
     pub edge_count: u64,
@@ -106,8 +107,15 @@ pub struct CoreEngine {
     db: Arc<Mutex<Database>>,
     search: Arc<Mutex<SearchIndex>>,
     memory: Arc<Mutex<MemoryStore>>,
+    /// Set to true while index_workspace is running so callers can surface a
+    /// "not ready" message rather than blocking or returning stale results.
+    indexing: Arc<AtomicBool>,
     #[cfg(feature = "embeddings")]
     embedder: Option<Embedder>,
+    /// In-memory cache of all symbol embeddings — loaded after each index pass so
+    /// run_pipeline never needs to hit SQLite for embedding lookups.
+    #[cfg(feature = "embeddings")]
+    embedding_cache: Arc<RwLock<Vec<(u64, Vec<f32>)>>>,
 }
 
 impl CoreEngine {
@@ -165,21 +173,43 @@ impl CoreEngine {
             }
         };
 
+        // Warm the embedding cache from any previously stored embeddings.
+        #[cfg(feature = "embeddings")]
+        let embedding_cache = {
+            let cached = db.lock().unwrap().all_embeddings().unwrap_or_default();
+            Arc::new(RwLock::new(cached))
+        };
+
         Ok(CoreEngine {
             config,
             graph,
             db,
             search,
             memory,
+            indexing: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "embeddings")]
             embedder,
+            #[cfg(feature = "embeddings")]
+            embedding_cache,
         })
     }
 
     // ── Indexing ──────────────────────────────────────────────────────────────
 
+    /// Returns true while index_workspace is running.
+    pub fn is_indexing(&self) -> bool {
+        self.indexing.load(Ordering::Relaxed)
+    }
+
     /// Walk the workspace and index all source files in parallel.
     pub fn index_workspace(&self) -> Result<IndexStats> {
+        self.indexing.store(true, Ordering::Relaxed);
+        let result = self.index_workspace_inner();
+        self.indexing.store(false, Ordering::Relaxed);
+        result
+    }
+
+    fn index_workspace_inner(&self) -> Result<IndexStats> {
         tracing::info!(
             "Indexing workspace: {}",
             self.config.workspace_root.display()
@@ -200,86 +230,103 @@ impl CoreEngine {
             })
             .collect();
 
-        // Write results into graph and db (single-threaded, holding locks briefly)
+        // Pre-process parsed results into (rel_path, file_hash, symbols) tuples.
+        // All of this is lock-free — results is already fully computed.
+        let mut file_data: Vec<(String, String, Vec<Symbol>)> = Vec::new();
+        let mut all_symbols: Vec<Symbol> = Vec::new();
+        for (path, content, symbols) in &results {
+            let rel = path
+                .strip_prefix(&self.config.workspace_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            let file_hash = hash_content(content.as_bytes());
+            all_symbols.extend(symbols.iter().cloned());
+            file_data.push((rel, file_hash, symbols.clone()));
+        }
+
+        // Build edges outside any lock — pure CPU work on already-owned data.
+        let all_edges: Vec<_> = extract_import_edges(&all_symbols)
+            .into_iter()
+            .chain(extract_impl_edges(&all_symbols))
+            .chain(extract_call_edges(&all_symbols))
+            .chain(extract_type_flow_edges(&all_symbols))
+            .collect();
+
+        // Flush everything to SQLite in a single transaction (brief db lock).
+        // Batching into one transaction is 10–50x faster than autocommit per-row
+        // and keeps the write lock held for a much shorter total duration.
         {
-            let mut graph = self.graph.write().unwrap();
-            let mut search = self.search.lock().unwrap();
             let db = self.db.lock().unwrap();
-
-            let mut all_symbols: Vec<Symbol> = Vec::new();
-
-            for (path, content, symbols) in &results {
-                let rel = path
-                    .strip_prefix(&self.config.workspace_root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
-
-                // Hash file content for change tracking
-                let file_hash = hash_content(content.as_bytes());
-                db.upsert_file(&rel, &file_hash)?;
-
-                // Remove stale symbols for this file
-                db.delete_file_symbols(&rel)?;
-                graph.remove_file(&rel);
-
+            db.begin_transaction()?;
+            for (rel, file_hash, symbols) in &file_data {
+                db.upsert_file(rel, file_hash)?;
+                db.delete_file_symbols(rel)?;
                 for sym in symbols {
-                    // Check if any observations should be marked stale
                     if let Err(e) = db.mark_stale_by_symbol_hash(&sym.fqn, &sym.content_hash) {
                         tracing::warn!("Stale check error: {}", e);
                     }
-
                     db.upsert_symbol(sym)?;
-                    search.index_symbol(sym)?;
-                    graph.add_symbol(sym.clone());
-                    all_symbols.push(sym.clone());
                 }
             }
-
-            // Build edges: imports, trait impls, calls, and type-flow references
-            let all_edges: Vec<_> = extract_import_edges(&all_symbols)
-                .into_iter()
-                .chain(extract_impl_edges(&all_symbols))
-                .chain(extract_call_edges(&all_symbols))
-                .chain(extract_type_flow_edges(&all_symbols))
-                .collect();
-
             for edge in &all_edges {
                 db.upsert_edge(edge)?;
+            }
+            db.commit_transaction()?;
+        } // db lock released here — graph/search locks acquired separately below
+
+        // Update in-memory graph and search index (no db lock held).
+        {
+            let mut graph = self.graph.write().unwrap();
+            let mut search = self.search.lock().unwrap();
+            for (rel, _, symbols) in &file_data {
+                graph.remove_file(rel);
+                for sym in symbols {
+                    graph.add_symbol(sym.clone());
+                    search.index_symbol(sym)?;
+                }
+            }
+            for edge in &all_edges {
                 graph.add_edge(edge.from_id, edge.to_id, edge.kind.clone());
             }
-
             search.commit()?;
+        } // graph + search locks released here
 
-            // Embed symbols in batches of 64 (only when embeddings feature is enabled).
-            // We embed the skeleton (signature + docstring) rather than the full body —
-            // shorter text, lower noise, still captures what the symbol "is".
-            #[cfg(feature = "embeddings")]
-            if let Some(emb) = &self.embedder {
-                let skeletons: Vec<String> = all_symbols
-                    .iter()
-                    .map(|s| {
-                        if s.signature.is_empty() {
-                            s.name.clone()
-                        } else if s.kind.is_type_definition() || s.kind == SymbolKind::Impl {
-                            // For types: include body preview so property/field names are embedded.
-                            // This allows semantic queries like "coordinator for documents and lists"
-                            // to match a class whose signature is just "class PDFLibrary: ObservableObject"
-                            // but whose body declares `@Published var documents`, `var lists`, etc.
-                            let body_preview = &s.body[..s.body.len().min(500)];
-                            format!(
-                                "{} {} {}",
-                                s.signature,
-                                s.docstring.as_deref().unwrap_or(""),
-                                body_preview
-                            )
-                        } else {
-                            format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
-                        }
-                    })
-                    .collect();
+        // Embed symbols in batches of 64 (only when embeddings feature is enabled).
+        // We embed the skeleton (signature + docstring) rather than the full body —
+        // shorter text, lower noise, still captures what the symbol "is".
+        // Runs after graph/search locks are released so queries can proceed in parallel.
+        #[cfg(feature = "embeddings")]
+        if let Some(emb) = &self.embedder {
+            let skeletons: Vec<String> = all_symbols
+                .iter()
+                .map(|s| {
+                    if s.signature.is_empty() {
+                        s.name.clone()
+                    } else if s.kind.is_type_definition() || s.kind == SymbolKind::Impl {
+                        // For types: include body preview so property/field names are embedded.
+                        // This allows semantic queries like "coordinator for documents and lists"
+                        // to match a class whose signature is just "class PDFLibrary: ObservableObject"
+                        // but whose body declares `@Published var documents`, `var lists`, etc.
+                        let body_preview = &s.body[..s.body.len().min(500)];
+                        format!(
+                            "{} {} {}",
+                            s.signature,
+                            s.docstring.as_deref().unwrap_or(""),
+                            body_preview
+                        )
+                    } else {
+                        format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
+                    }
+                })
+                .collect();
 
-                for (chunk_syms, chunk_texts) in all_symbols.chunks(64).zip(skeletons.chunks(64)) {
+            {
+                let db = self.db.lock().unwrap();
+                db.begin_transaction()?;
+                for (chunk_syms, chunk_texts) in
+                    all_symbols.chunks(64).zip(skeletons.chunks(64))
+                {
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
                     match emb.embed_batch(&refs) {
                         Ok(vecs) => {
@@ -292,8 +339,10 @@ impl CoreEngine {
                         Err(e) => tracing::warn!("embed_batch error: {}", e),
                     }
                 }
-                tracing::info!("Embeddings stored for {} symbols", all_symbols.len());
+                db.commit_transaction()?;
             }
+            tracing::info!("Embeddings stored for {} symbols", all_symbols.len());
+            self.refresh_embedding_cache();
         }
 
         self.index_stats()
@@ -309,41 +358,93 @@ impl CoreEngine {
 
         tracing::debug!("Re-indexing file: {} ({:?})", rel, kind);
 
-        let db = self.db.lock().unwrap();
-        db.delete_file_symbols(&rel)?;
-
-        {
-            let mut graph = self.graph.write().unwrap();
-            graph.remove_file(&rel);
-        }
+        // Phase 1: Remove stale db rows (brief, independent db lock).
+        { self.db.lock().unwrap().delete_file_symbols(&rel)?; }
+        // Phase 2: Remove from in-memory graph (brief, independent graph lock).
+        { self.graph.write().unwrap().remove_file(&rel); }
 
         if kind == ChangeKind::Removed {
             return Ok(());
         }
 
+        // Phase 3: Parse — no locks held.
         let content = std::fs::read_to_string(path)?;
         let file_hash = hash_content(content.as_bytes());
-        db.upsert_file(&rel, &file_hash)?;
-
         let symbols = index_file(&self.config.workspace_root, path, &content)?;
-        let mut graph = self.graph.write().unwrap();
-        let mut search = self.search.lock().unwrap();
 
-        // Notify memory of the change
+        // Phase 4: Write new rows to SQLite in one transaction (brief db lock).
+        // db lock is acquired fresh here — no overlap with graph/search locks.
+        {
+            let db = self.db.lock().unwrap();
+            db.begin_transaction()?;
+            db.upsert_file(&rel, &file_hash)?;
+            for sym in &symbols {
+                db.mark_stale_by_symbol_hash(&sym.fqn, &sym.content_hash)?;
+                db.upsert_symbol(sym)?;
+            }
+            db.commit_transaction()?;
+        }
+
+        // Phase 5: Update in-memory graph and search (no db lock held).
+        {
+            let mut graph = self.graph.write().unwrap();
+            let mut search = self.search.lock().unwrap();
+            for sym in &symbols {
+                graph.add_symbol(sym.clone());
+                search.index_symbol(sym)?;
+            }
+            search.commit()?;
+        }
+
+        // Phase 6: Notify memory of the change (brief, independent memory lock).
         {
             let mut mem = self.memory.lock().unwrap();
             let change_summary = format!("{} symbol(s) re-indexed", symbols.len());
             let _ = mem.record_file_edit(&rel, &change_summary);
         }
 
-        for sym in &symbols {
-            db.mark_stale_by_symbol_hash(&sym.fqn, &sym.content_hash)?;
-            db.upsert_symbol(sym)?;
-            search.index_symbol(sym)?;
-            graph.add_symbol(sym.clone());
+        // Phase 7: Re-embed new symbols and refresh cache (brief db lock, no other locks held).
+        #[cfg(feature = "embeddings")]
+        if let Some(emb) = &self.embedder {
+            let skeletons: Vec<String> = symbols
+                .iter()
+                .map(|s| {
+                    if s.signature.is_empty() {
+                        s.name.clone()
+                    } else if s.kind.is_type_definition() || s.kind == SymbolKind::Impl {
+                        let body_preview = &s.body[..s.body.len().min(500)];
+                        format!(
+                            "{} {} {}",
+                            s.signature,
+                            s.docstring.as_deref().unwrap_or(""),
+                            body_preview
+                        )
+                    } else {
+                        format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
+                    }
+                })
+                .collect();
+            {
+                let db = self.db.lock().unwrap();
+                db.begin_transaction()?;
+                for (chunk_syms, chunk_texts) in symbols.chunks(64).zip(skeletons.chunks(64)) {
+                    let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
+                    match emb.embed_batch(&refs) {
+                        Ok(vecs) => {
+                            for (sym, vec) in chunk_syms.iter().zip(vecs) {
+                                if let Err(e) = db.upsert_embedding(sym.id, &vec) {
+                                    tracing::warn!("embedding store error: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!("embed_batch error: {}", e),
+                    }
+                }
+                db.commit_transaction()?;
+            }
+            self.refresh_embedding_cache();
         }
 
-        search.commit()?;
         Ok(())
     }
 
@@ -701,6 +802,16 @@ impl CoreEngine {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
+    /// Reload all embeddings from SQLite into the in-memory cache.
+    /// Called after every index pass so queries never need to hit the db for vectors.
+    #[cfg(feature = "embeddings")]
+    fn refresh_embedding_cache(&self) {
+        match self.db.lock().unwrap().all_embeddings() {
+            Ok(embs) => *self.embedding_cache.write().unwrap() = embs,
+            Err(e) => tracing::warn!("Failed to refresh embedding cache: {}", e),
+        }
+    }
+
     fn build_context_capsule(
         &self,
         query: &str,
@@ -755,10 +866,11 @@ impl CoreEngine {
         {
             match emb.embed_one(query) {
                 Ok(query_vec) => {
-                    let all_embs = self.db.lock().unwrap().all_embeddings().unwrap_or_default();
-                    all_embs
-                        .into_iter()
-                        .map(|(id, vec)| (id, cosine_similarity(&query_vec, &vec)))
+                    // Read from the in-memory cache — no db lock, no contention with indexing.
+                    let cache = self.embedding_cache.read().unwrap();
+                    cache
+                        .iter()
+                        .map(|(id, vec)| (*id, cosine_similarity(&query_vec, vec)))
                         .collect()
                 }
                 Err(e) => {
@@ -961,6 +1073,12 @@ impl CoreEngine {
                     .take(self.config.max_adjacent)
                     .collect()
             }
+        };
+
+        // Deduplicate adjacent IDs (same symbol may be reachable from multiple pivots).
+        let adjacent_ids: Vec<u64> = {
+            let mut seen = std::collections::HashSet::new();
+            adjacent_ids.into_iter().filter(|id| seen.insert(*id)).collect()
         };
 
         // 6. Resolve IDs → Symbols

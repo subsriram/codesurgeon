@@ -12,7 +12,12 @@ pub struct Database {
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=NORMAL; \
+             PRAGMA busy_timeout=5000; \
+             PRAGMA cache_size=-65536;",
+        )?;
         let db = Database { conn };
         db.create_schema()?;
         Ok(db)
@@ -85,6 +90,18 @@ impl Database {
             );
         "#,
         )?;
+        Ok(())
+    }
+
+    // ── Transactions ──────────────────────────────────────────────────────────
+
+    pub fn begin_transaction(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    pub fn commit_transaction(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
         Ok(())
     }
 

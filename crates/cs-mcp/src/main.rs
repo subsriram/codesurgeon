@@ -20,7 +20,7 @@ use cs_core::{engine::EngineConfig, watcher::FileWatcher, CoreEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -237,6 +237,44 @@ fn tool_list() -> Value {
     })
 }
 
+// ── PID-file lock ─────────────────────────────────────────────────────────────
+
+/// Attempt to acquire a per-workspace PID lock at `<workspace>/.codesurgeon/mcp.pid`.
+///
+/// Returns `Ok(())` if this process should become the server.
+/// Returns `Err` with a human-readable message if another live instance is already running,
+/// so the caller can exit cleanly rather than accumulating duplicate processes.
+fn acquire_pid_lock(workspace: &Path) -> Result<PathBuf> {
+    let pid_path = workspace.join(".codesurgeon").join("mcp.pid");
+    std::fs::create_dir_all(pid_path.parent().unwrap())?;
+
+    if let Ok(existing) = std::fs::read_to_string(&pid_path) {
+        if let Ok(existing_pid) = existing.trim().parse::<u32>() {
+            // `kill -0 <pid>` exits 0 if the process exists, non-zero otherwise.
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &existing_pid.to_string()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if alive && existing_pid != std::process::id() {
+                anyhow::bail!(
+                    "Another codesurgeon-mcp is already serving this workspace (PID {}). \
+                     Kill it first or remove {}.",
+                    existing_pid,
+                    pid_path.display()
+                );
+            }
+        }
+    }
+
+    std::fs::write(&pid_path, std::process::id().to_string())?;
+    Ok(pid_path)
+}
+
+fn release_pid_lock(pid_path: &Path) {
+    let _ = std::fs::remove_file(pid_path);
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -252,6 +290,15 @@ async fn main() -> Result<()> {
         "Starting codesurgeon-mcp for workspace: {}",
         workspace.display()
     );
+
+    let pid_path = match acquire_pid_lock(&workspace) {
+        Ok(p) => p,
+        Err(e) => {
+            // Log to stderr (doesn't pollute MCP stdio) and exit cleanly.
+            eprintln!("codesurgeon-mcp: {e}");
+            std::process::exit(0);
+        }
+    };
 
     let config = EngineConfig::new(&workspace);
     let engine = Arc::new(CoreEngine::new(config)?);
@@ -318,6 +365,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    release_pid_lock(&pid_path);
     Ok(())
 }
 
@@ -393,7 +441,30 @@ async fn handle_message(engine: &Arc<CoreEngine>, line: &str) -> Option<Response
     }
 }
 
+/// Tools that require a populated index to return useful results.
+const INDEX_DEPENDENT_TOOLS: &[&str] = &[
+    "run_pipeline",
+    "get_context_capsule",
+    "get_impact_graph",
+    "get_skeleton",
+    "search_logic_flow",
+    "get_diff_capsule",
+    "generate_module_docs",
+];
+
 async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Result<String> {
+    // If the initial workspace index is still running, return immediately with a
+    // status message for tools that need the index. This prevents the caller from
+    // blocking for up to 120 s and timing out while waiting for lock contention.
+    if INDEX_DEPENDENT_TOOLS.contains(&name) && engine.is_indexing() {
+        let stats = engine.index_stats().unwrap_or_default();
+        return Ok(format!(
+            "⏳ Index build in progress ({} symbols so far). \
+             Results may be incomplete — retry in a few seconds or call `index_status` to monitor.",
+            stats.symbol_count
+        ));
+    }
+
     // Clone the Arc and move into blocking thread so we don't block the async runtime
     let engine = Arc::clone(engine);
     let name = name.to_string();
@@ -464,13 +535,16 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
         }
 
         "index_status" => {
+            let indexing = engine.is_indexing();
             let stats = engine.index_stats()?;
             Ok(format!(
                 "## codesurgeon index status\n\
+                 - Indexing: {}\n\
                  - Symbols: {}\n\
                  - Edges: {}\n\
                  - Files: {}\n\
                  - Session: {}\n",
+                if indexing { "in progress" } else { "ready" },
                 stats.symbol_count, stats.edge_count, stats.file_count, stats.session_id
             ))
         }
