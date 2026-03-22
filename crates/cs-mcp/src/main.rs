@@ -19,7 +19,7 @@ use anyhow::Result;
 use cs_core::{engine::EngineConfig, watcher::FileWatcher, CoreEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -341,26 +341,74 @@ async fn main() -> Result<()> {
     }
 
     // MCP stdio loop
-    let stdin = std::io::stdin();
+    //
+    // Supports both transports so the same binary works with Claude Code and Codex:
+    //
+    //   • LSP-framed (Content-Length headers) — required by Codex, spec-correct
+    //   • NDJSON (raw newline-delimited JSON)  — accepted by Claude Code
+    //
+    // Detection: if the first non-empty line starts with "Content-Length:", treat
+    // the stream as framed.  Otherwise treat each line as a JSON message directly.
+    //
+    // Responses are ALWAYS framed (Content-Length) because Codex requires it and
+    // Claude Code accepts it per the MCP spec.
+    let mut stdin_reader = std::io::BufReader::new(std::io::stdin());
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) if l.trim().is_empty() => continue,
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("stdin read error: {}", e);
+    loop {
+        // Read the first line — used to detect framing mode.
+        let mut first_line = String::new();
+        match stdin_reader.read_line(&mut first_line) {
+            Ok(0) => break,           // EOF
+            Ok(_) => {}
+            Err(e) => { tracing::error!("stdin read error: {}", e); break; }
+        }
+
+        let trimmed = first_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let message: String = if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
+            // ── Framed mode ───────────────────────────────────────────────────
+            let len: usize = match rest.trim().parse() {
+                Ok(n) => n,
+                Err(_) => { tracing::warn!("Invalid Content-Length: {}", rest.trim()); continue; }
+            };
+            // Consume remaining headers until the mandatory blank line.
+            loop {
+                let mut h = String::new();
+                match stdin_reader.read_line(&mut h) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if h.trim().is_empty() { break; }
+            }
+            let mut body = vec![0u8; len];
+            if let Err(e) = stdin_reader.read_exact(&mut body) {
+                tracing::error!("Failed to read framed body: {}", e);
                 break;
             }
+            match String::from_utf8(body) {
+                Ok(s) => s,
+                Err(e) => { tracing::warn!("Non-UTF-8 body: {}", e); continue; }
+            }
+        } else {
+            // ── NDJSON mode ───────────────────────────────────────────────────
+            trimmed.to_string()
         };
 
-        let response = handle_message(&engine, &line).await;
+        if message.is_empty() {
+            continue;
+        }
+
+        let response = handle_message(&engine, &message).await;
 
         if let Some(resp) = response {
             let json = serde_json::to_string(&resp)?;
-            out.write_all(json.as_bytes())?;
-            out.write_all(b"\n")?;
+            // Always respond with Content-Length framing (required by Codex, accepted by Claude Code).
+            write!(out, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
             out.flush()?;
         }
     }
