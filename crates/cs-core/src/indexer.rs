@@ -1568,25 +1568,6 @@ fn walk_markdown(node: Node, source: &str, file_path: &str, symbols: &mut Vec<Sy
                 // Recurse into section for nested sections
                 walk_markdown(child, source, file_path, symbols);
             }
-            "atx_heading" | "setext_heading" => {
-                // Top-level heading not wrapped in a section
-                let level = heading_level(&child, source).unwrap_or(1);
-                let name = heading_text(&child, source).trim().to_string();
-                let (start, end) = node_lines(&child);
-                let sig = format!("{} {}", "#".repeat(level as usize), name);
-                let body = node_text(&child, source).to_string();
-                symbols.push(Symbol::new(
-                    file_path,
-                    &name,
-                    SymbolKind::Module,
-                    start,
-                    end,
-                    sig,
-                    None,
-                    body,
-                    Language::Markdown,
-                ));
-            }
             _ => {}
         }
     }
@@ -1738,6 +1719,15 @@ Basic usage.
             symbols.iter().any(|s| s.name == "Usage"),
             "expected second h2"
         );
+        // Bodies must contain section content, not just the heading line
+        let install = symbols.iter().find(|s| s.name == "Installation").unwrap();
+        assert!(
+            install.body.contains("Install with cargo"),
+            "Installation body should include section content"
+        );
+        // No duplicate symbols — each heading should appear exactly once
+        let intro_count = symbols.iter().filter(|s| s.name == "Introduction").count();
+        assert_eq!(intro_count, 1, "Introduction should appear exactly once");
     }
 
     #[test]
