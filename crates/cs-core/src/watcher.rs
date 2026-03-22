@@ -122,6 +122,8 @@ fn should_watch(path: &Path) -> bool {
                 | "rs"
                 | "swift"
                 | "sql"
+                | "md"
+                | "mdx"
         )
     } else {
         false

@@ -1181,6 +1181,8 @@ impl CoreEngine {
                         | "rs"
                         | "swift"
                         | "sql"
+                        | "md"
+                        | "mdx"
                 ) {
                     Some(path)
                 } else {
