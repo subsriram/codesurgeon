@@ -82,6 +82,36 @@ printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_cont
 
 The server speaks JSON-RPC 2.0 over stdin/stdout. Wrap the response through `| python3 -m json.tool` for readable output.
 
+## Invariants — do not break these
+
+These have been broken by accident before. Treat them as hard constraints.
+
+### 1. `jsonrpc: "2.0"` field in every response
+Every JSON-RPC response **must** include `"jsonrpc":"2.0"`. This field was accidentally
+dropped during a refactor; clients hard-fail on responses that omit it.
+See `Response` struct in `crates/cs-mcp/src/main.rs`.
+
+### 2. LSP-framed stdio transport (`Content-Length` headers)
+`codesurgeon-mcp` supports two read modes and **always writes framed responses**:
+
+- **Framed (LSP-style)** — `Content-Length: N\r\n\r\n{json}` — required by Codex
+- **NDJSON fallback** — raw newline-terminated JSON — used by Claude Code
+
+**Do not remove the Content-Length framing from writes.** Codex will silently drop the
+connection if responses are bare NDJSON. The dual-read logic in the stdio loop must also
+be preserved so Claude Code continues to work.
+
+See `main()` in `crates/cs-mcp/src/main.rs`, and the smoke-test one-liner:
+
+```bash
+msg='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'; \
+printf "Content-Length: ${#msg}\r\n\r\n${msg}" \
+  | CS_WORKSPACE=. timeout 10 ./target/release/codesurgeon-mcp 2>/dev/null
+# expect: Content-Length: N\r\n\r\n{"jsonrpc":"2.0",...}
+```
+
+---
+
 ## Ranking pipeline
 
 The search/ranking logic is documented in `docs/ranking.md`.
