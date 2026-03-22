@@ -911,8 +911,19 @@ impl CoreEngine {
         let mut scored: Vec<(u64, f32)> = reranked
             .into_iter()
             .map(|(id, score)| {
+                let is_markdown = graph
+                    .get_symbol(id)
+                    .map(|s| s.language == Language::Markdown)
+                    .unwrap_or(false);
+                // Markdown symbols have no graph edges so centrality is always 0, which means
+                // they lose badly to high-centrality code symbols (Symbol, CoreEngine, Edge).
+                // Apply a fixed documentation boost instead of the centrality multiplier.
                 let centrality = graph.centrality_score(id);
-                let bm25_score = score * (1.0 + centrality * 3.0);
+                let bm25_score = if is_markdown {
+                    score * 2.5
+                } else {
+                    score * (1.0 + centrality * 3.0)
+                };
                 #[cfg(feature = "embeddings")]
                 let final_score = {
                     let sem = semantic_scores.get(&id).copied().unwrap_or(0.0);
