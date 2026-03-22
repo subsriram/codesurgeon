@@ -44,20 +44,13 @@ Binaries produced:
 
 ## Adding to Claude Code
 
-Add to `~/.claude/mcp_settings.json` (note: **not** `settings.json` — Claude Code's schema rejects `mcpServers` there):
+Use `claude mcp add` (CLI v2.x stores servers in `~/.claude.json`, not `mcp_settings.json`):
 
-```json
-{
-  "mcpServers": {
-    "codesurgeon": {
-      "command": "/Users/sriram/projects/codesurgeon/target/release/codesurgeon-mcp",
-      "args": [],
-      "env": {
-        "CS_WORKSPACE": "/Users/sriram/projects/codesurgeon"
-      }
-    }
-  }
-}
+```bash
+claude mcp add --scope user \
+  -e CS_WORKSPACE=/path/to/your/project \
+  codesurgeon \
+  /path/to/codesurgeon/target/release/codesurgeon-mcp
 ```
 
 Then restart Claude Code — the server indexes in the background on first start.
@@ -70,22 +63,21 @@ Run the full protocol invariant test suite before any merge:
 cargo test -p cs-mcp --test mcp_protocol
 ```
 
-This covers: `jsonrpc` field presence, Content-Length framing, `resources` capability,
-parallel connection handling, NDJSON fallback, and more. All 10 tests run in under 1 second.
+This covers: `jsonrpc` field presence, wire format mirroring, `resources` capability,
+parallel connection handling, NDJSON round-trip, and more. All 11 tests run in under 1 second.
 
-To drive the binary manually, use Content-Length framing (responses are always framed):
+To drive the binary manually — the server mirrors the client's wire format:
 
 ```bash
-# initialize handshake smoke test
-msg='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'; \
+# Content-Length input (Codex style) → Content-Length response
+msg='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'; \
 printf "Content-Length: ${#msg}\r\n\r\n${msg}" \
   | CS_WORKSPACE=/path/to/workspace timeout 10 ./target/release/codesurgeon-mcp 2>/dev/null
-# expect: Content-Length: N\r\n\r\n{"jsonrpc":"2.0",...}
-```
 
-The server also accepts bare NDJSON input (for Claude Code compatibility), but always writes
-Content-Length-framed responses. `| python3 -m json.tool` won't work directly because of the
-header — strip it first with `sed 's/.*\r\n\r\n//'` or use the test suite instead.
+# NDJSON input (Claude Code CLI style) → NDJSON response
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"claude-code","version":"0"}}}' \
+  | CS_WORKSPACE=/path/to/workspace timeout 10 ./target/release/codesurgeon-mcp 2>/dev/null
+```
 
 ## Invariants — do not break these
 
@@ -97,15 +89,15 @@ Every JSON-RPC response **must** include `"jsonrpc":"2.0"`. This field was accid
 dropped during a refactor; clients hard-fail on responses that omit it.
 See `Response` struct in `crates/cs-mcp/src/main.rs`.
 
-### 2. Content-Length framing on all responses
-`codesurgeon-mcp` supports two read modes and **always writes framed responses**:
+### 2. Mirror the client's wire format
+`codesurgeon-mcp` detects the incoming message format and responds in kind:
 
-- **Framed (LSP-style)** — `Content-Length: N\r\n\r\n{json}` — required by Codex (spec-correct)
-- **NDJSON fallback** — raw newline-terminated JSON — accepted by Claude Code
+- **Content-Length input** → **Content-Length response** — required by Codex (spec-correct)
+- **NDJSON input** → **NDJSON response** — required by Claude Code CLI (v2.1.81+)
 
-**Do not remove the Content-Length framing from writes.** Codex silently drops the connection
-if responses are bare NDJSON. The dual-read logic must be preserved so Claude Code continues
-to work. See `crates/cs-mcp/src/transport.rs`.
+Do not collapse these into a single output format. Codex drops the connection on bare NDJSON
+responses; Claude Code CLI drops the connection on Content-Length responses.
+See `transport::Format` and `write_message` in `crates/cs-mcp/src/transport.rs`.
 
 ### 3. `resources` capability + empty-list handlers
 `initialize` must advertise `"resources": {}` in capabilities, and both `resources/list` and
