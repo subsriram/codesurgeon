@@ -350,7 +350,9 @@ async fn main() -> Result<()> {
     };
 
     // Secondary instance (no PID lock): serve read-only, no background tasks.
-    let config = EngineConfig::new(&workspace);
+    // Skip the embedder — secondary instances don't compute new embeddings and
+    // loading the ONNX model wastes ~1-2 GB of RAM per short-lived probe process.
+    let config = EngineConfig::new(&workspace).without_embedder();
     let engine = Arc::new(CoreEngine::new(config)?);
     run_stdio_loop(engine).await;
     Ok(())

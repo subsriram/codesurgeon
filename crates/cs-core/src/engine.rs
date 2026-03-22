@@ -31,6 +31,10 @@ pub struct EngineConfig {
     pub max_adjacent: usize,
     pub max_blast_radius_depth: u32,
     pub session_id: String,
+    /// Whether to load the embedding model on startup.
+    /// Set to false for secondary (read-only) instances to avoid loading the
+    /// ~500 MB ONNX model when it won't be used for indexing or query embedding.
+    pub load_embedder: bool,
 }
 
 impl EngineConfig {
@@ -46,7 +50,13 @@ impl EngineConfig {
             max_adjacent: 20,
             max_blast_radius_depth: 5,
             session_id,
+            load_embedder: true,
         }
+    }
+
+    pub fn without_embedder(mut self) -> Self {
+        self.load_embedder = false;
+        self
     }
 }
 
@@ -160,17 +170,24 @@ impl CoreEngine {
         }
 
         // Attempt to load the embedding model (only compiled in with --features embeddings).
-        // A failure here is non-fatal — we fall back to BM25-only search.
+        // Skipped for secondary (read-only) instances — they don't compute new embeddings
+        // and loading the ~500 MB ONNX model would waste ~1-2 GB of RAM per probe process.
+        // Falls back to BM25-only search when None.
         #[cfg(feature = "embeddings")]
-        let embedder = match Embedder::new() {
-            Ok(e) => {
-                tracing::info!("Embedder loaded (NomicEmbedTextV15, 768-dim)");
-                Some(e)
+        let embedder = if config.load_embedder {
+            match Embedder::new() {
+                Ok(e) => {
+                    tracing::info!("Embedder loaded (NomicEmbedTextV15Q, 768-dim)");
+                    Some(e)
+                }
+                Err(e) => {
+                    tracing::warn!("Embedder unavailable, falling back to BM25: {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("Embedder unavailable, falling back to BM25: {}", e);
-                None
-            }
+        } else {
+            tracing::info!("Embedder skipped (read-only instance)");
+            None
         };
 
         // Warm the embedding cache from any previously stored embeddings.

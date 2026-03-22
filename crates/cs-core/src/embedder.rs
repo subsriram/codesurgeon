@@ -7,7 +7,9 @@
 //! cargo build --features metal               # CPU + Apple Accelerate BLAS (Apple Silicon)
 //! ```
 //!
-//! Uses `NomicEmbedTextV15` (nomic-ai/nomic-embed-text-v1.5) — 768-dim, 8192 context, strong semantic quality.
+//! Uses `NomicEmbedTextV15Q` (nomic-ai/nomic-embed-text-v1.5, quantized) — 768-dim, 8192 context.
+//! The quantized variant uses int8 weights (~130 MB vs ~520 MB for the full model) with
+//! negligible quality loss for code search, and loads ~4x less RAM at runtime.
 //! Embeddings are 768-dimensional, L2-normalised, so dot-product == cosine similarity.
 
 #[cfg(feature = "embeddings")]
@@ -40,7 +42,7 @@ mod inner {
                 .join("fastembed");
 
             let model = TextEmbedding::try_new(
-                InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
+                InitOptions::new(EmbeddingModel::NomicEmbedTextV15Q)
                     .with_cache_dir(cache_dir)
                     .with_show_download_progress(false),
             )
