@@ -26,11 +26,23 @@ mod inner {
     }
 
     impl Embedder {
-        /// Load the model, downloading it on first use (cached in `~/.cache/fastembed`).
+        /// Load the model, downloading it on first use.
+        ///
+        /// The model is cached in `~/.cache/fastembed` (shared across all workspaces)
+        /// so it is only downloaded once and never duplicated per-project.
         pub fn new() -> Result<Self> {
+            // Use a single shared cache dir so every workspace finds the model
+            // in the same place and we avoid per-workspace 49 MB copies.
+            let cache_dir = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(".cache")
+                .join("fastembed");
+
             let model = TextEmbedding::try_new(
                 InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
-                    .with_show_download_progress(true),
+                    .with_cache_dir(cache_dir)
+                    .with_show_download_progress(false),
             )
             .map_err(|e| anyhow::anyhow!("fastembed init failed: {e}"))?;
             Ok(Self {
