@@ -488,16 +488,24 @@ const INDEX_DEPENDENT_TOOLS: &[&str] = &[
 ];
 
 async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Result<String> {
-    // If the initial workspace index is still running, return immediately with a
-    // status message for tools that need the index. This prevents the caller from
-    // blocking for up to 120 s and timing out while waiting for lock contention.
+    // Block index-dependent tools only when the index is genuinely empty (first-ever
+    // run with no persisted data). When a warm index exists in SQLite we serve from it
+    // immediately — re-indexing runs in the background and results stay usable.
     if INDEX_DEPENDENT_TOOLS.contains(&name) && engine.is_indexing() {
         let stats = engine.index_stats().unwrap_or_default();
-        return Ok(format!(
-            "⏳ Index build in progress ({} symbols so far). \
-             Results may be incomplete — retry in a few seconds or call `index_status` to monitor.",
+        if stats.symbol_count == 0 {
+            return Ok(
+                "⏳ Index build in progress — no symbols yet. \
+                 Retry in a few seconds or call `index_status` to monitor."
+                    .to_string(),
+            );
+        }
+        // Warm index available: fall through and serve results.
+        // Re-indexing is finishing in the background; output reflects last-known state.
+        tracing::debug!(
+            "Serving from warm index ({} symbols) while re-index runs in background",
             stats.symbol_count
-        ));
+        );
     }
 
     // Clone the Arc and move into blocking thread so we don't block the async runtime
