@@ -1,3 +1,4 @@
+use crate::language::Language;
 use crate::symbol::{Symbol, SymbolKind};
 use anyhow::Result;
 use tantivy::{
@@ -153,13 +154,17 @@ impl SearchIndex {
                         let filename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
                         let mut b = 1.0f32;
 
-                        // Name/signature term matching
+                        // Name/signature/body term matching
+                        let body_lower = sym.body.to_lowercase();
                         for term in &query_terms {
                             if name_lower.contains(term) {
                                 b += 2.0;
                             }
                             if sig_lower.contains(term) {
                                 b += 1.0;
+                            }
+                            if body_lower.contains(term) {
+                                b += 0.3;
                             }
                         }
 
@@ -196,6 +201,12 @@ impl SearchIndex {
                                 }
                             }
                             _ => {}
+                        }
+
+                        // Markdown docs boost — documentation sections are preferred for
+                        // conceptual queries where terms appear in prose, not code names.
+                        if sym.language == Language::Markdown {
+                            b *= 1.5;
                         }
 
                         b
