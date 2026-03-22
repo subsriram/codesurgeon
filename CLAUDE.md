@@ -64,51 +64,61 @@ Then restart Claude Code — the server indexes in the background on first start
 
 ## Testing MCP over JSON-RPC
 
-You can test the MCP server directly without restarting Claude Code by piping raw JSON-RPC requests to the binary:
+Run the full protocol invariant test suite before any merge:
 
 ```bash
-# index_status
-printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"index_status","arguments":{}}}' \
-  | CS_WORKSPACE=/path/to/workspace timeout 60 ./target/release/codesurgeon-mcp
-
-# re-index a workspace
-printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_pipeline","arguments":{"task":"reindex"}}}' \
-  | CS_WORKSPACE=/path/to/workspace timeout 120 ./target/release/codesurgeon-mcp
-
-# get_context_capsule query
-printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_context_capsule","arguments":{"query":"central state coordinator for documents lists and categories","max_tokens":4000}}}' \
-  | CS_WORKSPACE=/path/to/workspace timeout 60 ./target/release/codesurgeon-mcp
+cargo test -p cs-mcp --test mcp_protocol
 ```
 
-The server speaks JSON-RPC 2.0 over stdin/stdout. Wrap the response through `| python3 -m json.tool` for readable output.
+This covers: `jsonrpc` field presence, Content-Length framing, `resources` capability,
+parallel connection handling, NDJSON fallback, and more. All 10 tests run in under 1 second.
+
+To drive the binary manually, use Content-Length framing (responses are always framed):
+
+```bash
+# initialize handshake smoke test
+msg='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'; \
+printf "Content-Length: ${#msg}\r\n\r\n${msg}" \
+  | CS_WORKSPACE=/path/to/workspace timeout 10 ./target/release/codesurgeon-mcp 2>/dev/null
+# expect: Content-Length: N\r\n\r\n{"jsonrpc":"2.0",...}
+```
+
+The server also accepts bare NDJSON input (for Claude Code compatibility), but always writes
+Content-Length-framed responses. `| python3 -m json.tool` won't work directly because of the
+header — strip it first with `sed 's/.*\r\n\r\n//'` or use the test suite instead.
 
 ## Invariants — do not break these
 
 These have been broken by accident before. Treat them as hard constraints.
+**All are verified by `cargo test -p cs-mcp --test mcp_protocol` — run this before every merge.**
 
 ### 1. `jsonrpc: "2.0"` field in every response
 Every JSON-RPC response **must** include `"jsonrpc":"2.0"`. This field was accidentally
 dropped during a refactor; clients hard-fail on responses that omit it.
 See `Response` struct in `crates/cs-mcp/src/main.rs`.
 
-### 2. LSP-framed stdio transport (`Content-Length` headers)
+### 2. Content-Length framing on all responses
 `codesurgeon-mcp` supports two read modes and **always writes framed responses**:
 
-- **Framed (LSP-style)** — `Content-Length: N\r\n\r\n{json}` — required by Codex
-- **NDJSON fallback** — raw newline-terminated JSON — used by Claude Code
+- **Framed (LSP-style)** — `Content-Length: N\r\n\r\n{json}` — required by Codex (spec-correct)
+- **NDJSON fallback** — raw newline-terminated JSON — accepted by Claude Code
 
-**Do not remove the Content-Length framing from writes.** Codex will silently drop the
-connection if responses are bare NDJSON. The dual-read logic in the stdio loop must also
-be preserved so Claude Code continues to work.
+**Do not remove the Content-Length framing from writes.** Codex silently drops the connection
+if responses are bare NDJSON. The dual-read logic must be preserved so Claude Code continues
+to work. See `crates/cs-mcp/src/transport.rs`.
 
-See `main()` in `crates/cs-mcp/src/main.rs`, and the smoke-test one-liner:
+### 3. `resources` capability + empty-list handlers
+`initialize` must advertise `"resources": {}` in capabilities, and both `resources/list` and
+`resources/templates/list` must return empty arrays (not `-32601 Method not found`).
+Codex probes these methods unconditionally; a -32601 causes "MCP startup failed".
+codesurgeon exposes **tools only** — the resource handlers are stubs for protocol compliance.
 
-```bash
-msg='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'; \
-printf "Content-Length: ${#msg}\r\n\r\n${msg}" \
-  | CS_WORKSPACE=. timeout 10 ./target/release/codesurgeon-mcp 2>/dev/null
-# expect: Content-Length: N\r\n\r\n{"jsonrpc":"2.0",...}
-```
+### 4. Secondary instances must not exit on PID lock conflict
+When a second process tries to serve the same workspace (e.g. parallel Codex probes), it
+must **not** call `exit(0)`. It must serve the connection read-only without background
+indexing or the embedder. The old code exited on PID lock conflict, causing
+"connection closed: initialize response" for the second connection.
+See `acquire_pid_lock` path in `crates/cs-mcp/src/main.rs`.
 
 ---
 
