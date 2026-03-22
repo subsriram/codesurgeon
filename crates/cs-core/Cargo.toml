@@ -62,6 +62,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Build with: cargo build --features embeddings
 # Build with Accelerate BLAS on Apple Silicon: cargo build --features metal
 fastembed = { version = "5", optional = true }
+tree-sitter-md-025 = "0.5.4"
 
 [features]
 default    = []

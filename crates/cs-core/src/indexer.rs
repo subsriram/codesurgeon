@@ -30,6 +30,7 @@ pub fn index_file(workspace_root: &Path, abs_path: &Path, content: &str) -> Resu
         Language::Rust => extract_rust(&rel_path, content),
         Language::Swift => extract_swift(&rel_path, content),
         Language::Sql => extract_sql(&rel_path, content),
+        Language::Markdown => extract_markdown(&rel_path, content),
     }
 }
 
@@ -1481,6 +1482,116 @@ fn walk_sql(node: &Node, source: &str, file_path: &str, symbols: &mut Vec<Symbol
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Markdown
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn extract_markdown(file_path: &str, source: &str) -> Result<Vec<Symbol>> {
+    let mut parser = match make_parser(&Language::Markdown) {
+        Some(p) => p,
+        None => return Ok(vec![]),
+    };
+
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("markdown parse failed"))?;
+
+    let mut symbols = Vec::new();
+    walk_markdown(tree.root_node(), source, file_path, &mut symbols);
+    Ok(symbols)
+}
+
+fn heading_level(node: &Node, source: &str) -> Option<u8> {
+    // ATX headings: look for atx_h1_marker .. atx_h6_marker child
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let level = match child.kind() {
+            "atx_h1_marker" => 1,
+            "atx_h2_marker" => 2,
+            "atx_h3_marker" => 3,
+            "atx_h4_marker" => 4,
+            "atx_h5_marker" => 5,
+            "atx_h6_marker" => 6,
+            // Setext headings use underline nodes
+            "setext_h1_underline" => 1,
+            "setext_h2_underline" => 2,
+            _ => continue,
+        };
+        let _ = source; // suppress unused warning
+        return Some(level);
+    }
+    None
+}
+
+fn heading_text<'a>(node: &Node, source: &'a str) -> &'a str {
+    // The inline child holds the heading text
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "inline" {
+            return node_text(&child, source);
+        }
+    }
+    // Fallback: strip the marker prefix from the whole node text
+    let raw = node_text(node, source);
+    raw.trim_start_matches('#').trim()
+}
+
+fn walk_markdown(node: Node, source: &str, file_path: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "section" => {
+                // A section wraps a heading + its content. Walk children to find the heading.
+                let mut inner = child.walk();
+                for inner_child in child.children(&mut inner) {
+                    if inner_child.kind() == "atx_heading" || inner_child.kind() == "setext_heading" {
+                        let level = heading_level(&inner_child, source).unwrap_or(1);
+                        let name = heading_text(&inner_child, source).trim().to_string();
+                        let (start, _) = node_lines(&inner_child);
+                        let (_, end) = node_lines(&child);
+                        let sig = format!("{} {}", "#".repeat(level as usize), name);
+                        let body = node_text(&child, source).to_string();
+                        symbols.push(Symbol::new(
+                            file_path,
+                            &name,
+                            SymbolKind::Module,
+                            start,
+                            end,
+                            sig,
+                            None,
+                            body,
+                            Language::Markdown,
+                        ));
+                        break;
+                    }
+                }
+                // Recurse into section for nested sections
+                walk_markdown(child, source, file_path, symbols);
+            }
+            "atx_heading" | "setext_heading" => {
+                // Top-level heading not wrapped in a section
+                let level = heading_level(&child, source).unwrap_or(1);
+                let name = heading_text(&child, source).trim().to_string();
+                let (start, end) = node_lines(&child);
+                let sig = format!("{} {}", "#".repeat(level as usize), name);
+                let body = node_text(&child, source).to_string();
+                symbols.push(Symbol::new(
+                    file_path,
+                    &name,
+                    SymbolKind::Module,
+                    start,
+                    end,
+                    sig,
+                    None,
+                    body,
+                    Language::Markdown,
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1589,6 +1700,43 @@ pub fn validate_token(token: UserToken) -> bool {
         assert!(
             edge.is_some(),
             "expected References edge from validate_token to UserToken"
+        );
+    }
+
+    #[test]
+    fn indexes_markdown_headings() {
+        let src = r#"# Introduction
+
+Some intro text.
+
+## Installation
+
+Install with cargo.
+
+### Advanced
+
+Details here.
+
+## Usage
+
+Basic usage.
+"#;
+        let symbols = extract_markdown("README.md", src).expect("md parse");
+        assert!(
+            symbols.iter().any(|s| s.name == "Introduction" && s.kind == SymbolKind::Module),
+            "expected h1"
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "Installation"),
+            "expected h2"
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "Advanced"),
+            "expected h3"
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "Usage"),
+            "expected second h2"
         );
     }
 

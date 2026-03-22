@@ -12,6 +12,7 @@ pub enum Language {
     Rust,
     Swift,
     Sql,
+    Markdown,
 }
 
 impl Language {
@@ -27,6 +28,7 @@ impl Language {
             Language::Rust => "rust",
             Language::Swift => "swift",
             Language::Sql => "sql",
+            Language::Markdown => "markdown",
         }
     }
 
@@ -42,6 +44,7 @@ impl Language {
             Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
             Language::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
             Language::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
+            Language::Markdown => Some(tree_sitter_md_025::LANGUAGE.into()),
         }
     }
 
@@ -70,6 +73,7 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "rs" => Some(Language::Rust),
         "swift" => Some(Language::Swift),
         "sql" => Some(Language::Sql),
+        "md" | "mdx" => Some(Language::Markdown),
         _ => None,
     }
 }
