@@ -20,8 +20,11 @@ use cs_core::{engine::EngineConfig, watcher::FileWatcher, CoreEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// Shared engine state: `None` = still initializing, `Some` = ready.
+type EngineCell = Arc<OnceLock<Arc<CoreEngine>>>;
 
 mod transport;
 
@@ -298,13 +301,27 @@ async fn main() -> Result<()> {
     // avoid duplicate index writes.
     let _pid_path = match acquire_pid_lock(&workspace) {
         Ok(p) => {
-            let config = EngineConfig::new(&workspace);
-            let engine = Arc::new(CoreEngine::new(config)?);
+            // Build the engine in the background so the stdio loop (and the
+            // `initialize` handshake) start immediately.  Claude Code and Codex
+            // both time out if the first response takes more than a few seconds;
+            // loading the ONNX embedding model can take 10-15 s on first run.
+            let cell: EngineCell = Arc::new(OnceLock::new());
+            let cell_bg = Arc::clone(&cell);
+            let workspace_bg = workspace.clone();
 
-            // Kick off background indexing (primary instance only)
-            {
-                let engine_clone = Arc::clone(&engine);
-                tokio::task::spawn_blocking(move || match engine_clone.index_workspace() {
+            tokio::task::spawn_blocking(move || {
+                let config = EngineConfig::new(&workspace_bg);
+                let engine = match CoreEngine::new(config) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!("CoreEngine init failed: {}", e);
+                        return;
+                    }
+                };
+
+                // Kick off background indexing (primary instance only)
+                let e2 = Arc::clone(&engine);
+                std::thread::spawn(move || match e2.index_workspace() {
                     Ok(stats) => tracing::info!(
                         "Index complete: {} symbols, {} edges, {} files",
                         stats.symbol_count,
@@ -313,32 +330,33 @@ async fn main() -> Result<()> {
                     ),
                     Err(e) => tracing::error!("Indexing failed: {}", e),
                 });
-            }
 
-            // Watch for file changes and re-index incrementally (primary instance only)
-            {
-                let engine_clone = Arc::clone(&engine);
-                let workspace_clone = workspace.clone();
-                tokio::task::spawn_blocking(move || {
-                    let watcher = match FileWatcher::new(&workspace_clone) {
+                // Watch for file changes and re-index incrementally (primary instance only)
+                let e3 = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    let watcher = match FileWatcher::new(&workspace_bg) {
                         Ok(w) => w,
                         Err(e) => {
                             tracing::error!("Failed to start file watcher: {}", e);
                             return;
                         }
                     };
-                    tracing::info!("File watcher started for {}", workspace_clone.display());
+                    tracing::info!("File watcher started for {}", workspace_bg.display());
                     loop {
                         for event in watcher.poll(Duration::from_millis(500)) {
-                            if let Err(e) = engine_clone.reindex_file(&event.path, event.kind) {
+                            if let Err(e) = e3.reindex_file(&event.path, event.kind) {
                                 tracing::warn!("reindex_file failed for {:?}: {}", event.path, e);
                             }
                         }
                     }
                 });
-            }
 
-            run_stdio_loop(engine).await;
+                // Make the engine available to the stdio loop.
+                let _ = cell_bg.set(engine);
+                tracing::info!("Engine ready");
+            });
+
+            run_stdio_loop(cell).await;
             release_pid_lock(&p);
             return Ok(());
         }
@@ -352,9 +370,12 @@ async fn main() -> Result<()> {
     // Secondary instance (no PID lock): serve read-only, no background tasks.
     // Skip the embedder — secondary instances don't compute new embeddings and
     // loading the ONNX model wastes ~1-2 GB of RAM per short-lived probe process.
+    // No embedder means init is fast, so blocking here is fine.
     let config = EngineConfig::new(&workspace).without_embedder();
     let engine = Arc::new(CoreEngine::new(config)?);
-    run_stdio_loop(engine).await;
+    let cell: EngineCell = Arc::new(OnceLock::new());
+    let _ = cell.set(engine);
+    run_stdio_loop(cell).await;
     Ok(())
 }
 
@@ -370,13 +391,13 @@ async fn main() -> Result<()> {
 /// `Content-Length:` the message is read using LSP framing; otherwise the line
 /// itself is the JSON body.  Responses are **always** written with Content-Length
 /// framing because Codex requires it and Claude Code accepts it per the MCP spec.
-async fn run_stdio_loop(engine: Arc<CoreEngine>) {
+async fn run_stdio_loop(cell: EngineCell) {
     let mut stdin_reader = std::io::BufReader::new(std::io::stdin());
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
     loop {
-        let message = match transport::read_message(&mut stdin_reader) {
+        let (message, fmt) = match transport::read_message(&mut stdin_reader) {
             Ok(Some(m)) => m,
             Ok(None) => break,  // EOF — client closed the connection
             Err(e) => { tracing::error!("stdin read error: {}", e); break; }
@@ -386,14 +407,14 @@ async fn run_stdio_loop(engine: Arc<CoreEngine>) {
             continue;
         }
 
-        let response = handle_message(&engine, &message).await;
+        let response = handle_message(cell.get(), &message).await;
 
         if let Some(resp) = response {
             let json = match serde_json::to_string(&resp) {
                 Ok(j) => j,
                 Err(e) => { tracing::error!("Failed to serialize response: {}", e); continue; }
             };
-            if let Err(e) = transport::write_message(&mut out, &json) {
+            if let Err(e) = transport::write_message(&mut out, &json, fmt) {
                 tracing::error!("stdout write error: {}", e);
                 break;
             }
@@ -401,7 +422,7 @@ async fn run_stdio_loop(engine: Arc<CoreEngine>) {
     }
 }
 
-async fn handle_message(engine: &Arc<CoreEngine>, line: &str) -> Option<Response> {
+async fn handle_message(engine: Option<&Arc<CoreEngine>>, line: &str) -> Option<Response> {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -413,24 +434,33 @@ async fn handle_message(engine: &Arc<CoreEngine>, line: &str) -> Option<Response
     tracing::debug!("← {}", req.method);
 
     match req.method.as_str() {
-        "initialize" => Some(Response::ok(
-            req.id,
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {},
-                    "resources": {}
-                },
-                "serverInfo": {
-                    "name": "codesurgeon",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "instructions": "codesurgeon provides graph-based context from your codebase. \
-                    Call run_pipeline before editing code. \
-                    Call get_impact_graph before refactoring. \
-                    Call save_observation to persist insights across sessions."
-            }),
-        )),
+        "initialize" => {
+            // Echo back the client's requested protocol version so any version
+            // of the Claude client (old or new) sees a match and doesn't reject us.
+            let protocol_version = req
+                .params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("2024-11-05");
+            Some(Response::ok(
+                req.id,
+                json!({
+                    "protocolVersion": protocol_version,
+                    "capabilities": {
+                        "tools": {},
+                        "resources": {}
+                    },
+                    "serverInfo": {
+                        "name": "codesurgeon",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "instructions": "codesurgeon provides graph-based context from your codebase. \
+                        Call run_pipeline before editing code. \
+                        Call get_impact_graph before refactoring. \
+                        Call save_observation to persist insights across sessions."
+                }),
+            ))
+        }
 
         "notifications/initialized" => {
             // Notification — no response
@@ -441,6 +471,9 @@ async fn handle_message(engine: &Arc<CoreEngine>, line: &str) -> Option<Response
         "resources/list" => Some(Response::ok(req.id, json!({ "resources": [] }))),
         "resources/templates/list" => Some(Response::ok(req.id, json!({ "resourceTemplates": [] }))),
 
+        // Prompts — we expose no prompts; return empty list so newer clients don't disconnect.
+        "prompts/list" => Some(Response::ok(req.id, json!({ "prompts": [] }))),
+
         "tools/list" => Some(Response::ok(req.id, tool_list())),
 
         "tools/call" => {
@@ -450,6 +483,15 @@ async fn handle_message(engine: &Arc<CoreEngine>, line: &str) -> Option<Response
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
+
+            let Some(engine) = engine else {
+                return Some(Response::ok(
+                    req.id,
+                    json!({ "content": [{ "type": "text", "text":
+                        "⏳ Engine still initializing (loading index + embedding model). \
+                         Retry in a few seconds or call `index_status` to check." }] }),
+                ));
+            };
 
             let result = dispatch_tool(engine, name, &args).await;
 

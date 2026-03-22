@@ -8,16 +8,26 @@
 //!   \r\n
 //!   <N bytes of UTF-8 JSON>
 //!
-//! As a convenience, bare NDJSON (newline-terminated JSON with no headers) is
-//! also accepted on the *read* side so Claude Code keeps working.
-//! All *writes* are framed so both clients are happy.
+//! Claude Code CLI sends bare NDJSON (newline-terminated JSON) and expects
+//! NDJSON responses.  Codex sends and expects Content-Length framing.
+//!
+//! The server mirrors the client: if a message arrives as NDJSON, the response
+//! is NDJSON; if it arrives Content-Length-framed, the response is framed.
 
 use std::io::{BufRead, Write};
 
+/// Wire format detected from an incoming message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Format {
+    ContentLength,
+    Ndjson,
+}
+
 /// Read one JSON-RPC message from `reader`.
 ///
-/// Returns `None` on clean EOF.  Errors are returned as `Err`.
-pub fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
+/// Returns `None` on clean EOF.  The `Format` indicates how the message was
+/// framed so the caller can reply in kind.
+pub fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<(String, Format)>> {
     loop {
         let mut first_line = String::new();
         match reader.read_line(&mut first_line)? {
@@ -52,21 +62,28 @@ pub fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<String>
 
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body)?;
-            return Ok(Some(
+            return Ok(Some((
                 String::from_utf8(body).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                 })?,
-            ));
+                Format::ContentLength,
+            )));
         } else {
             // ── NDJSON (bare JSON line) ───────────────────────────────────────
-            return Ok(Some(trimmed.to_string()));
+            return Ok(Some((trimmed.to_string(), Format::Ndjson)));
         }
     }
 }
 
-/// Write one JSON-RPC message to `writer` using Content-Length framing.
-pub fn write_message(writer: &mut impl Write, json: &str) -> std::io::Result<()> {
-    write!(writer, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
+/// Write one JSON-RPC message to `writer`, mirroring the client's wire format.
+///
+/// - `Format::ContentLength` → `Content-Length: N\r\n\r\n{json}` (required by Codex)
+/// - `Format::Ndjson`        → `{json}\n`                          (required by Claude Code CLI)
+pub fn write_message(writer: &mut impl Write, json: &str, format: Format) -> std::io::Result<()> {
+    match format {
+        Format::ContentLength => write!(writer, "Content-Length: {}\r\n\r\n{}", json.len(), json)?,
+        Format::Ndjson => writeln!(writer, "{}", json)?,
+    }
     writer.flush()
 }
 
@@ -88,7 +105,9 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
         let bytes = framed(json);
         let mut r = BufReader::new(bytes.as_slice());
-        assert_eq!(read_message(&mut r).unwrap().unwrap(), json);
+        let (msg, fmt) = read_message(&mut r).unwrap().unwrap();
+        assert_eq!(msg, json);
+        assert_eq!(fmt, Format::ContentLength);
     }
 
     #[test]
@@ -96,7 +115,9 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
         let input = format!("{}\n", json);
         let mut r = BufReader::new(input.as_bytes());
-        assert_eq!(read_message(&mut r).unwrap().unwrap(), json);
+        let (msg, fmt) = read_message(&mut r).unwrap().unwrap();
+        assert_eq!(msg, json);
+        assert_eq!(fmt, Format::Ndjson);
     }
 
     #[test]
@@ -104,7 +125,7 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let input = format!("\n\n{}\n", json);
         let mut r = BufReader::new(input.as_bytes());
-        assert_eq!(read_message(&mut r).unwrap().unwrap(), json);
+        assert_eq!(read_message(&mut r).unwrap().unwrap().0, json);
     }
 
     #[test]
@@ -114,8 +135,8 @@ mod tests {
         let mut input = framed(a);
         input.extend(framed(b));
         let mut r = BufReader::new(input.as_slice());
-        assert_eq!(read_message(&mut r).unwrap().unwrap(), a);
-        assert_eq!(read_message(&mut r).unwrap().unwrap(), b);
+        assert_eq!(read_message(&mut r).unwrap().unwrap().0, a);
+        assert_eq!(read_message(&mut r).unwrap().unwrap().0, b);
     }
 
     #[test]
@@ -127,7 +148,7 @@ mod tests {
             json
         );
         let mut r = BufReader::new(raw.as_bytes());
-        assert_eq!(read_message(&mut r).unwrap().unwrap(), json);
+        assert_eq!(read_message(&mut r).unwrap().unwrap().0, json);
     }
 
     #[test]
@@ -139,10 +160,10 @@ mod tests {
     // ── write_message ────────────────────────────────────────────────────────
 
     #[test]
-    fn write_produces_content_length_header() {
+    fn write_clf_produces_content_length_header() {
         let json = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         let mut buf = Vec::new();
-        write_message(&mut buf, json).unwrap();
+        write_message(&mut buf, json, Format::ContentLength).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(
             s.starts_with(&format!("Content-Length: {}\r\n\r\n", json.len())),
@@ -153,11 +174,20 @@ mod tests {
     }
 
     #[test]
-    fn write_then_read_roundtrip() {
+    fn write_ndjson_produces_newline_terminated_json() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let mut buf = Vec::new();
+        write_message(&mut buf, json, Format::Ndjson).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, format!("{}\n", json));
+    }
+
+    #[test]
+    fn write_clf_then_read_roundtrip() {
         let json = r#"{"jsonrpc":"2.0","id":42,"result":{"ok":true}}"#;
         let mut buf = Vec::new();
-        write_message(&mut buf, json).unwrap();
+        write_message(&mut buf, json, Format::ContentLength).unwrap();
         let mut r = BufReader::new(buf.as_slice());
-        assert_eq!(read_message(&mut r).unwrap().unwrap(), json);
+        assert_eq!(read_message(&mut r).unwrap().unwrap().0, json);
     }
 }

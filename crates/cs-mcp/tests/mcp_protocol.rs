@@ -233,10 +233,10 @@ fn parallel_connections_both_complete_handshake() {
     );
 }
 
-/// Bare NDJSON input (no Content-Length headers) must also be accepted.
-/// Claude Code sends messages this way.
+/// When the client sends NDJSON, the server must respond with NDJSON (mirroring).
+/// Claude Code CLI sends and expects NDJSON.
 #[test]
-fn ndjson_input_is_accepted() {
+fn ndjson_input_gets_ndjson_response() {
     let dir = tempfile::tempdir().unwrap();
     let mut child = Command::new(BIN)
         .env("CS_WORKSPACE", dir.path())
@@ -251,17 +251,33 @@ fn ndjson_input_is_accepted() {
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     // Send NDJSON — no Content-Length header.
-    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"claude-code","version":"2.1.81"}}}"#;
     writeln!(stdin, "{}", msg).unwrap();
     stdin.flush().unwrap();
 
-    // Response must still be framed.
-    let resp = decode_framed(&mut stdout);
+    // Response must be NDJSON (a single JSON line), NOT Content-Length framed.
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("failed to read response line");
+    assert!(!line.starts_with("Content-Length:"), "expected NDJSON response, got CLF: {line}");
+    let resp: Value = serde_json::from_str(line.trim()).expect("response is not valid JSON");
     assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
     assert!(resp["error"].is_null(), "initialize via NDJSON returned error: {resp}");
+    assert_eq!(resp["result"]["protocolVersion"].as_str(), Some("2025-11-25"), "{resp}");
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// When the client sends Content-Length framed input, the server must respond with CLF.
+/// This is required by Codex.
+#[test]
+fn ndjson_input_is_accepted() {
+    // Alias kept for naming consistency — now verifies CLF-in → CLF-out.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new_in(&dir);
+    // Session.send() uses Content-Length framing; decode_framed() asserts CLF response.
+    let resp = s.handshake();
+    assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
 }
 
 /// `ping` must return an empty result (not an error).
