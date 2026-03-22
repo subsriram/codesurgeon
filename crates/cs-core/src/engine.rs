@@ -10,6 +10,7 @@ use crate::indexer::{
 use crate::memory::{new_session_id, MemoryStore};
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
+use crate::language::Language;
 use crate::symbol::{Symbol, SymbolKind};
 use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
@@ -332,6 +333,11 @@ impl CoreEngine {
                             s.docstring.as_deref().unwrap_or(""),
                             body_preview
                         )
+                    } else if s.language == Language::Markdown {
+                        // For markdown sections, embed the full section body so paragraph content
+                        // is semantically searchable, not just the heading text.
+                        let body_preview = &s.body[..s.body.len().min(1000)];
+                        format!("{} {}", s.signature, body_preview)
                     } else {
                         format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
                     }
@@ -436,6 +442,9 @@ impl CoreEngine {
                             s.docstring.as_deref().unwrap_or(""),
                             body_preview
                         )
+                    } else if s.language == Language::Markdown {
+                        let body_preview = &s.body[..s.body.len().min(1000)];
+                        format!("{} {}", s.signature, body_preview)
                     } else {
                         format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
                     }
