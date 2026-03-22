@@ -74,21 +74,35 @@ Multiplies each BM25 score by a boost factor `b` (starts at 1.0):
 |--------|-------|
 | Query term appears in symbol name | +2.0 per term |
 | Query term appears in signature | +1.0 per term |
+| Query term appears in body | +0.3 per term |
 | File path contains "test"/"spec"/"mock"/"uitest" | × 0.25 |
 | Filename starts with check-/run-/setup/generate/gen-/build-/deploy- | × 0.30 |
 | Structural/Explore intent + type definition (`is_type_definition()`) | × 2.5 |
 | Structural/Explore intent + impl block | × 1.5 |
 | Structural/Explore intent + callable (non-test) | × 0.6 |
+| Symbol language is Markdown | × 1.5 |
 
 **Why test penalty on scores not adjacents (originally):** Test files have high BM25 scores
 because they contain the exact method names and domain terms they exercise. Without the
 penalty they flood the top-10 for almost every query.
 
+**Why body term boost:** Markdown section bodies contain prose that matches conceptual
+queries ("BM25 rerank centrality") but those terms don't appear in headings/signatures.
+Without body credit, BM25 score alone isn't enough to beat code symbols with matching names.
+
+**Why Markdown × 1.5:** Documentation is preferred over code for conceptual queries.
+Combined with the centrality bypass below, this ensures docs compete on content rather
+than graph connectivity.
+
 ### 3b. Centrality boost + embeddings blend (`engine.rs:760`)
 
 ```
+# Code symbols:
 centrality = centrality_score(id)          # (in*2 + out) / (in*2 + out + 15)
 bm25_final = bm25_reranked * (1 + centrality * 3)
+
+# Markdown symbols — centrality bypass:
+bm25_final = bm25_reranked * 2.5
 
 # metal/embeddings build only:
 if semantic_score > 0:
@@ -99,6 +113,15 @@ else:
 
 `centrality_score` uses the symbol's own in+out degree (not family), appropriate for the
 general boost since it applies to all symbol kinds equally.
+
+**Why markdown bypasses centrality:** Markdown symbols have no graph edges (docs are never
+imported or called), so `centrality_score` is always 0. Without the bypass, a markdown
+section that BM25-matches well would score flat while `Symbol` or `CoreEngine` (centrality
+≈ 0.5) get ×2.5 amplification. The fixed 2.5 multiplier puts a well-matching doc section
+on equal footing with a moderately-central code symbol.
+
+**Embedding text for markdown:** Section bodies use a 1000-char preview (vs 500 for code
+type definitions) so that prose content — not just heading text — is semantically indexed.
 
 ### 3c. Structural re-sort (`engine.rs:785`)
 
@@ -202,6 +225,10 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | Utility script penalty | × 0.30 | `search.rs:185` |
 | Type definition boost (Structural) | × 2.5 | `search.rs:192` |
 | Callable penalty (Structural) | × 0.6 | `search.rs:196` |
+| Markdown language boost (rerank) | × 1.5 | `search.rs` |
+| Body term match boost | +0.3 per term | `search.rs` |
+| Markdown centrality bypass | × 2.5 fixed | `engine.rs` |
+| Markdown embedding body preview | 1000 chars | `engine.rs` |
 | max_pivots | 8 | `engine.rs:44` |
 | max_adjacent | 20 | `engine.rs:46` |
 | max_blast_radius_depth | 5 | `engine.rs:47` |
