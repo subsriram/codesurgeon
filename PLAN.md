@@ -283,6 +283,8 @@ codesurgeon/
   silently overwrites the stale file; no manual cleanup needed (invariant #4 in CLAUDE.md)
 - [ ] Troubleshooting section in README (MCP not connecting, index not ready, second instance
   read-only mode, binary not on PATH after `cargo build`)
+- [ ] Privacy statement in README — explicitly document: no network calls, no telemetry, no
+  cloud dependencies; index lives in `.codesurgeon/` locally; embeddings run on-device
 - [ ] Published CLI via `cargo install` or Homebrew (deferred — fastembed/ort native deps need crates.io compat check)
 
 ### Phase 7 — Language enrichment: type stubs, toolchain integration, library APIs
@@ -651,22 +653,25 @@ effort, risk, dogfooding opportunity (can codesurgeon benefit on itself immediat
 | 2 | 9a Tool call auto-capture | Low | Builds cross-session picture without manual saves; high value, tiny change |
 | 3 | 7a Stub indexing | Low-med | Highest ROI on enrichment; fixes hallucinated library signatures |
 | 4 | 7f Shell/SQL edges | Low | Quick win; contained tree-sitter changes; no new deps |
-| 5 | 9b Session TTL + compression | Low-med | Prevents unbounded growth; lifecycle for auto vs manual observations |
-| 6 | 7b `cargo-expand` | Med | Macro blind spot; codesurgeon dogfoods on itself immediately |
-| 7 | 7b `rustdoc` JSON | Med | Resolved types for Rust; follows from `cargo-expand` work |
-| 8 | 8b `search_memory` + 9c L1/L2/L3 | Low-med | Build together — detail levels should be in from the start |
-| 9 | 8c `submit_lsp_edges` | Med | Smarter than 7c/7d for IDE users; edges pushed from running LSP |
-| 10 | 9d Memory consolidation | Med | Deduplicates auto-observations; depends on 9b compression being in place |
-| 11 | 7d pyright | Low-med | Fallback for non-IDE Python users after `submit_lsp_edges` lands |
-| 12 | 9e Richer AST change categories | Med | Improves observation quality; depends on 9a auto-capture |
-| 13 | 10a Manifest + 10c opt-out | Low | Incremental rebuild on clone; almost free given existing blake3/files table |
-| 14 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity |
-| 15 | 7c TS compiler shim | Med | Lower priority — `submit_lsp_edges` covers VS Code TS users |
-| 16 | 10b Git merge driver | Med | Union merge for manifest.json; most useful once distributed |
-| 17 | Multi-root workspace | High | Wait until enrichment + memory solid; schema migration risk |
-| 18 | 9f Project rules | High | Powerful but complex; needs 9b + 9d as foundation |
-| 19 | 8d `workspace_setup` | Low | Nice to have; `generate_module_docs` already covers onboarding |
+| 5 | 11a+b Secrets exclusion + `.codesurgeonignore` | Low | Security gap; prevents secrets leaking into capsules |
+| 6 | 9b Session TTL + compression | Low-med | Prevents unbounded growth; lifecycle for auto vs manual observations |
+| 7 | 7b `cargo-expand` | Med | Macro blind spot; codesurgeon dogfoods on itself immediately |
+| 8 | 7b `rustdoc` JSON | Med | Resolved types for Rust; follows from `cargo-expand` work |
+| 9 | 8b `search_memory` + 9c L1/L2/L3 | Low-med | Build together — detail levels should be in from the start |
+| 10 | 8c `submit_lsp_edges` | Med | Smarter than 7c/7d for IDE users; edges pushed from running LSP |
+| 11 | 9d Memory consolidation | Med | Deduplicates auto-observations; depends on 9b compression being in place |
+| 12 | 7d pyright | Low-med | Fallback for non-IDE Python users after `submit_lsp_edges` lands |
+| 13 | 9e Richer AST change categories | Med | Improves observation quality; depends on 9a auto-capture |
+| 14 | 10a Manifest + 10c opt-out | Low | Incremental rebuild on clone; almost free given existing blake3/files table |
+| 15 | 11c+d Local observability (stats CLI + `get_stats`) | Low | `query_log` table + `codesurgeon stats`; makes token savings concrete and visible |
+| 16 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity |
+| 17 | 7c TS compiler shim | Med | Lower priority — `submit_lsp_edges` covers VS Code TS users |
+| 18 | 10b Git merge driver | Med | Union merge for manifest.json; most useful once distributed |
+| 19 | Multi-root workspace | High | Wait until enrichment + memory solid; schema migration risk |
+| 20 | 9f Project rules | High | Powerful but complex; needs 9b + 9d as foundation |
+| 21 | 8d `workspace_setup` | Low | Nice to have; `generate_module_docs` already covers onboarding |
 | ∞ | metal-candle upgrade | High risk | `fastembed` works; single-author crate; defer indefinitely |
+| ∞ | MCP resources | Med | Browsable index URI scheme; useful for client UI; defer until tools mature |
 
 ---
 
@@ -713,7 +718,25 @@ sprint as 7a.
 
 ---
 
-**#5 — 9b Session TTL + compression** · Low-med effort
+**#5 — 11a+b Secrets exclusion + `.codesurgeonignore`** · Low effort
+Two small indexer changes that close a real security gap.
+
+**11a — Secrets exclusion**: auto-skip files matching sensitive patterns during indexing.
+Never index these as pivots or skeletons; log them as excluded at index time:
+- `**/.env`, `**/.env.*`, `**/.env.local`, `**/.env.production`, `**/.env.development`
+- `**/*secret*`, `**/*credential*`, `**/*password*`
+- Files whose first 20 lines match common API key patterns (e.g. `[A-Z0-9]{20,}`)
+
+Uses the `ignore` crate (already a transitive dep via tree-sitter tooling). Prevents secrets
+leaking into capsule output handed to the agent — and by extension into Claude's context window.
+
+**11b — `.codesurgeonignore`**: project-level exclusion file using gitignore syntax, layered
+on top of `.gitignore`. Lets users exclude `fixtures/`, `testdata/`, `vendor/`, generated
+files, or anything else they don't want in the index. Parsed by the same `ignore` crate pass.
+
+---
+
+**#6 — 9b Session TTL + compression** · Low-med effort
 Prevents the observation store growing unbounded. Auto-compress sessions idle for 2+ hours
 into structural summaries; expire auto-observations; delete sessions older than 90 days;
 manual observations persist permanently. Needs to land before 9d (consolidation) since
@@ -721,7 +744,7 @@ compression is when merging happens.
 
 ---
 
-**#6 — 7b `cargo-expand`** · Med effort
+**#7 — 7b `cargo-expand`** · Med effort
 Solves the most painful Rust blind spot: macro-generated symbols (`#[derive(...)]`, `tokio::main`,
 proc macros) are invisible to tree-sitter. Output is Rust source, so the existing `walk_rust()`
 pass reuses with no new parsing logic. codesurgeon can dogfood the result on its own codebase
@@ -729,14 +752,14 @@ immediately — serde/tokio derives become visible in the graph.
 
 ---
 
-**#7 — 7b `rustdoc` JSON** · Med effort
+**#8 — 7b `rustdoc` JSON** · Med effort
 Natural follow-on once `enricher.rs` is in place from #4. `cargo rustdoc --output-format json`
 gives resolved types and full trait impl lists; deserialise with the `rustdoc-types` crate
 (native Rust, no subprocess parsing). Annotates existing symbols rather than adding new ones.
 
 ---
 
-**#8 — 8b `search_memory` + 9c L1/L2/L3 detail levels** · Low-med effort
+**#9 — 8b `search_memory` + 9c L1/L2/L3 detail levels** · Low-med effort
 Build together — retrofitting detail levels after the fact is harder than starting with them.
 `search_memory` reuses the existing BM25 + embeddings stack scoped to the `observations`
 table. Results at three token levels: L1 (~20 tokens, headline only), L2 (~50 tokens,
@@ -745,7 +768,7 @@ default L2.
 
 ---
 
-**#9 — 8c `submit_lsp_edges`** · Med effort
+**#10 — 8c `submit_lsp_edges`** · Med effort
 The smartest enrichment architecture: IDE users push type-resolved edges from the language
 server already running in their editor, rather than codesurgeon spawning subprocesses.
 For VS Code users this replaces 7c (TS shim) and 7d (pyright) entirely. New `EdgeKind::LspResolved`
@@ -754,7 +777,7 @@ needed (separate repo).
 
 ---
 
-**#10 — 9d Memory consolidation** · Med effort
+**#11 — 9d Memory consolidation** · Med effort
 Cluster semantically similar auto-observations at session compression time using the existing
 embeddings stack (cosine similarity ~0.92 threshold). Replace each cluster with a single
 consolidated entry. Requires 9b (compression) to be in place first. Manual observations
@@ -762,14 +785,14 @@ never merge.
 
 ---
 
-**#11 — 7d pyright** · Low-med effort
+**#12 — 7d pyright** · Low-med effort
 Fallback for Python users not running VS Code (where `submit_lsp_edges` isn't available).
 Subprocess pattern established by #4/#5; mostly wiring. Lower value after 7a covers `.pyi`
 stubs — only adds inferred types for unannotated user-defined code.
 
 ---
 
-**#12 — 9e Richer AST change categories** · Med effort
+**#13 — 9e Richer AST change categories** · Med effort
 Classify file watcher events into Added / Removed / Renamed / SignatureChanged / BodyChanged
 by comparing new symbol list against the previous DB snapshot in `reindex_file()`. Enriches
 auto-captured observations (9a) and `get_diff_capsule` output. Depends on 9a being in place
@@ -777,7 +800,7 @@ so there's something to enrich.
 
 ---
 
-**#13 — 10a Manifest + 10c opt-out** · Low effort
+**#14 — 10a Manifest + 10c opt-out** · Low effort
 Serialise the existing `files` table to `.codesurgeon/manifest.json` after each index pass.
 On a fresh clone with no `index.db`, read the manifest and re-index only files whose hashes
 differ — seconds instead of a full re-index. `CS_TRACK_MANIFEST=false` to opt out. Almost
@@ -785,28 +808,90 @@ entirely free given blake3 hashing and incremental re-indexing are already in pl
 
 ---
 
-**#14 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
+**#15 — 11c+d Local observability** · Low effort
+Persist per-query metrics in a `query_log` SQLite table and expose them via CLI and MCP tool.
+Makes codesurgeon's value concrete and measurable without any data leaving the machine.
+
+**Schema — `query_log` table:**
+```sql
+CREATE TABLE query_log (
+  id                    INTEGER PRIMARY KEY,
+  timestamp             TEXT    NOT NULL,
+  task                  TEXT,
+  intent                TEXT,
+  pivot_count           INTEGER,
+  skeleton_count        INTEGER,
+  total_tokens          INTEGER,
+  budget_tokens         INTEGER,
+  candidate_file_tokens INTEGER,   -- sum of full-file tokens for files with returned symbols
+  workspace_tokens      INTEGER,   -- total workspace tokens (cached at index time)
+  latency_ms            INTEGER,
+  bm25_ms               INTEGER,
+  graph_ms              INTEGER,
+  embed_ms              INTEGER,
+  assembly_ms           INTEGER,
+  memory_hit            INTEGER,   -- 1 if any memory appeared in capsule
+  languages_hit         TEXT       -- JSON array e.g. ["rust","typescript"]
+);
+```
+
+**Token savings baselines (all three tracked per query):**
+- *Candidate-file*: `(candidate_file_tokens - total_tokens) / candidate_file_tokens` — most honest; "files you'd have read to find this code"
+- *Workspace*: `(workspace_tokens - total_tokens) / workspace_tokens` — matches README benchmark claim
+- *Skeletonisation*: `(adjacent_full_tokens - adjacent_skeleton_tokens) / adjacent_full_tokens` — compression contribution only
+
+**`codesurgeon stats` CLI output:**
+```
+── Query stats (last 30 days) ──────────────────────────
+  Total queries:        47
+  Total tokens saved:   182,400
+  Avg savings/query:    90.3%  (candidate-file baseline)
+  Estimated cost saved: $0.55  (@ claude-sonnet-4 pricing)
+
+── Latency ─────────────────────────────────────────────
+  Median:    180ms    p95: 420ms
+
+── Intent breakdown ────────────────────────────────────
+  debug 38%  ·  add 30%  ·  refactor 21%  ·  explore 11%
+
+── Language distribution ───────────────────────────────
+  Rust 62%  ·  TypeScript 28%  ·  SQL 8%  ·  Python 2%
+
+── Session memory ──────────────────────────────────────
+  Observations: 12  ·  Hit rate: 58%  ·  Stale: 2
+
+── Index health ────────────────────────────────────────
+  Symbols: 1,247  ·  Files: 89  ·  Parse errors: 0  ·  Freshness: 100%
+```
+
+**`get_stats` MCP tool (11d):** thin wrapper over `query_log` aggregates, identical output to
+`codesurgeon stats`. Lets the agent surface stats in conversation: `get_stats(days=30)`.
+Also feeds a one-liner into `get_session_context`: "12 queries this session · ~8,400 tokens saved · avg latency 210ms".
+
+---
+
+**#16 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
 Doesn't improve context quality — only discoverability and adoption friction. The blocker is
 `fastembed`/`ort` native deps that need crates.io compat work. Worth tackling once the
 enrichment story is solid enough to be worth distributing.
 
 ---
 
-**#15 — 7c TypeScript compiler shim** · Med effort
+**#17 — 7c TypeScript compiler shim** · Med effort
 Demoted from #7 to #10 because `submit_lsp_edges` covers the same gap for VS Code TS users
 with better architecture. Remains useful as a standalone option for non-VS Code environments.
 FQN alignment between tree-sitter and the TypeScript compiler is still the main risk.
 
 ---
 
-**#16 — 10b Git merge driver** · Med effort
+**#18 — 10b Git merge driver** · Med effort
 `codesurgeon merge-manifest` CLI subcommand + `.gitattributes` registration via
 `codesurgeon git-setup`. Takes union of file hashes across base/ours/theirs versions.
 Most valuable once distributed (#14) and teams are actively using the manifest.
 
 ---
 
-**#17 — Multi-root workspace support** · High effort
+**#19 — Multi-root workspace support** · High effort
 High real-world value (most non-trivial projects span frontend + backend + shared libs), but
 architecturally significant: schema migration (`root` column, FQN namespacing), PID lock
 rethink, `EngineConfig` overhaul. Do this after enrichment is stable so the SQLite schema
@@ -822,7 +907,7 @@ Design is informed by vexp's multi-repo model (see deferred section below):
 
 ---
 
-**#18 — 9f Project rules** · High effort
+**#20 — 9f Project rules** · High effort
 When 3+ similar observations recur in the same scope, auto-generate rule candidates and
 inject them as standing conventions into capsule responses. Requires 9b (compression) and
 9d (consolidation) as foundations — rules are derived from consolidated observation clusters.
@@ -830,7 +915,7 @@ Rules start as `pending` and are promoted to `active` only after agent/user conf
 
 ---
 
-**#19 — 8d `workspace_setup`** · Low effort, low priority
+**#21 — 8d `workspace_setup`** · Low effort, low priority
 Onboarding tool that generates config templates. `generate_module_docs` already covers the
 CLAUDE.md onboarding case. Add this when distribution (#9) is done and new-user friction
 becomes the main concern.
@@ -931,6 +1016,106 @@ and the `.codesurgeon/` directory is not expected to be git-tracked.
 
 ---
 
+### Phase 11 — Privacy, security & local observability
+
+Goal: close the security gap around secrets in the index, give users control over index scope,
+and make codesurgeon's value measurable without any data leaving the machine.
+
+---
+
+#### 11a — Secrets exclusion (Low effort)
+
+Auto-skip files matching sensitive patterns during the indexer's file walk. These files are
+never indexed as pivots or skeletons, never appear in capsule output, and are logged as
+excluded in `index_status`.
+
+Patterns excluded by default:
+- `.env`, `.env.*`, `.env.local`, `.env.production`, `.env.development`
+- `*secret*`, `*credential*`, `*password*` (basename match)
+- Files whose first 20 lines contain a bare API key pattern: `[A-Z0-9_]{20,}=`
+
+Uses the `ignore` crate (already in the dependency tree) for glob matching.
+A new `CS_ALLOW_SECRETS=1` env var opt-out for users who deliberately want `.env` files indexed
+(e.g. non-sensitive development configs).
+
+---
+
+#### 11b — `.codesurgeonignore` (Low effort)
+
+Project-level exclusion file using gitignore syntax, layered on top of `.gitignore`.
+Parsed by the same `ignore` crate pass as 11a.
+
+```
+# .codesurgeonignore
+fixtures/
+testdata/
+vendor/
+**/*.generated.ts
+migrations/
+```
+
+Useful for: large generated files that bloat the index, test fixtures that distort rankings,
+vendored copies of third-party code that shouldn't be treated as project symbols.
+
+---
+
+#### 11c — Local observability: `query_log` + `codesurgeon stats` (Low effort)
+
+Persist per-query metrics in a `query_log` SQLite table written at the end of every
+`run_pipeline` and `get_context_capsule` call. All data stays local.
+
+Schema:
+```sql
+CREATE TABLE query_log (
+  id                    INTEGER PRIMARY KEY,
+  timestamp             TEXT    NOT NULL,
+  task                  TEXT,
+  intent                TEXT,
+  pivot_count           INTEGER,
+  skeleton_count        INTEGER,
+  total_tokens          INTEGER,
+  budget_tokens         INTEGER,
+  candidate_file_tokens INTEGER,  -- sum of full-file tokens for files with returned symbols
+  workspace_tokens      INTEGER,  -- cached at index time
+  latency_ms            INTEGER,
+  bm25_ms               INTEGER,
+  graph_ms              INTEGER,
+  embed_ms              INTEGER,
+  assembly_ms           INTEGER,
+  memory_hit            INTEGER,  -- 1 if any memory appeared in capsule
+  languages_hit         TEXT      -- JSON array
+);
+```
+
+`codesurgeon stats` CLI command: reads from `query_log` and prints a human-readable summary
+covering token savings, latency, intent breakdown, language distribution, memory hit rate,
+and index health. Makes the README's `~90%` benchmark claim verifiable per-workspace.
+
+Token savings uses three baselines (all stored per query):
+- **Candidate-file** (headline): files containing returned symbols — most honest baseline
+- **Workspace**: total workspace tokens — matches README claim, most dramatic
+- **Skeletonisation**: adjacent full-body vs skeleton — measures compression contribution alone
+
+---
+
+#### 11d — `get_stats` MCP tool (Low effort)
+
+Thin wrapper over `query_log` aggregates, returns the same summary as `codesurgeon stats`.
+Lets the agent surface stats inline: `get_stats(days=30)`.
+
+Also injects a one-liner into `get_session_context` output:
+`"12 queries this session · ~8,400 tokens saved · avg 180ms latency"`
+
+---
+
+#### Build order within Phase 11
+
+1. **11a + 11b** — secrets exclusion + ignore file (single indexer PR, no schema change)
+2. **11c** — `query_log` schema + write path + `codesurgeon stats` CLI
+3. **11d** — `get_stats` MCP tool (add after CLI is working and numbers look right)
+
+---
+
 ### Post-Phase-6 — Multi-root workspace support (deferred)
 Currently each `codesurgeon-mcp` instance serves one workspace. Multiple codebases are handled
 by running one server per codebase with distinct MCP server names:
@@ -1001,6 +1186,27 @@ Design informed by vexp's multi-repo model:
 - `files` table gains `repo_alias TEXT` column; FQNs prefixed: `backend::src/auth.rs::validate`
 - `run_pipeline` accepts optional `repos: Vec<String>` to scope or fan-out queries
 - CLI: `codesurgeon index --workspace workspace.json`
+
+### Post-Phase-11 — MCP resources: browsable index URI scheme (deferred)
+
+Currently codesurgeon stubs out `resources/list` with an empty array (protocol compliance,
+invariant #3). A future resources implementation would make the index machine-readable and
+enable client UI integrations beyond what tools expose.
+
+Proposed URI scheme:
+| Resource URI | Contents |
+|---|---|
+| `codesurgeon://metrics` | Live stats snapshot (subscribable for dashboard UIs) |
+| `codesurgeon://symbols/{fqn}` | Full symbol record for a given FQN |
+| `codesurgeon://files/{path}` | All symbols extracted from a file |
+| `codesurgeon://observations` | All session memory entries |
+| `codesurgeon://index/status` | Index health snapshot |
+
+Requires: removing the empty-list stub, adding URI routing, designing the resource schema.
+Non-trivial architecture change — defer until MCP client tooling (Claude Desktop, Codex) makes
+meaningful use of resources beyond what tool calls already provide.
+
+---
 
 ### Post-Phase-6 — Embeddings: metal-candle upgrade (deferred)
 Consider swapping `fastembed` for `metal-candle` (`embeddings` feature) after Phase 6 ships:

@@ -275,6 +275,18 @@ was detected.
 For Xcode < 26 or SPM-only projects: [XcodeBuildMCP](https://github.com/cameroncooke/XcodeBuildMCP)
 or [xcode-mcp-server](https://github.com/r-huijts/xcode-mcp-server).
 
+## Privacy
+
+codesurgeon is fully local-first. Your code never leaves your machine.
+
+- **No network calls** — zero outbound connections during indexing, search, or capsule assembly
+- **No telemetry** — no usage metrics are sent anywhere, ever
+- **No cloud dependencies** — no API keys, no external services, no subscriptions
+- **Local index** — the symbol graph lives in `.codesurgeon/index.db` alongside your project (gitignored by default)
+- **On-device embeddings** — semantic search uses a local model (nomic-embed-text-v1.5) running entirely on your CPU or Apple Silicon GPU
+
+The only binary that runs is `codesurgeon-mcp`, started by your MCP client (Claude Code / Codex) as a subprocess over stdio. It reads your source files, builds a local index, and responds to tool calls — nothing else.
+
 ## Troubleshooting
 
 ### MCP server not connecting (Claude Code / Codex)
