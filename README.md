@@ -275,6 +275,85 @@ was detected.
 For Xcode < 26 or SPM-only projects: [XcodeBuildMCP](https://github.com/cameroncooke/XcodeBuildMCP)
 or [xcode-mcp-server](https://github.com/r-huijts/xcode-mcp-server).
 
+## Troubleshooting
+
+### MCP server not connecting (Claude Code / Codex)
+
+**Symptom:** Tools like `run_pipeline` are not available, or Claude reports the MCP server failed to start.
+
+1. Confirm `CS_WORKSPACE` points to an existing directory:
+   ```bash
+   echo $CS_WORKSPACE
+   ls "$CS_WORKSPACE"
+   ```
+2. Run the binary directly to see startup errors:
+   ```bash
+   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}' \
+     | CS_WORKSPACE=/path/to/project timeout 5 ./target/release/codesurgeon-mcp
+   ```
+   A healthy server replies with an `initialize` response on stdout. Any error on stderr explains the failure.
+3. Re-check the server entry in `~/.claude.json` (Claude Code CLI v2.x):
+   ```bash
+   claude mcp list
+   ```
+
+---
+
+### Index not ready / stale results
+
+**Symptom:** `index_status()` returns 0 symbols, or results look stale after editing files.
+
+- The index builds in the background on first start. Give it a few seconds, then call `index_status()` again to confirm.
+- To force a full re-index:
+  ```bash
+  CS_WORKSPACE=/path/to/project codesurgeon index
+  ```
+- Check how many files were indexed:
+  ```bash
+  CS_WORKSPACE=/path/to/project codesurgeon status
+  ```
+
+---
+
+### Second instance running in read-only mode
+
+**Symptom:** A second Claude Code window or parallel Codex probe connects but sees no results, or logs show "serving read-only".
+
+This is expected behaviour. Only one `codesurgeon-mcp` instance per workspace runs background indexing (the first one to acquire the PID lock). Subsequent instances serve the existing index read-only — they won't write new embeddings or trigger re-indexing. This is intentional to avoid concurrent index writes.
+
+If you want the new instance to become the primary, stop the existing one first:
+```bash
+kill $(cat /path/to/project/.codesurgeon/mcp.pid)
+```
+
+---
+
+### Stale PID file after a crash
+
+**Symptom:** After a hard kill or power loss, new instances unexpectedly enter read-only mode.
+
+codesurgeon auto-detects this: on startup it reads the existing PID file and runs `kill -0 <pid>` to check whether that process is actually alive. If it's dead, the stale file is overwritten automatically and the new instance becomes primary. **No manual cleanup is needed in normal cases.**
+
+If for some reason this fails (e.g. the PID was reused by a system process), delete the file manually:
+```bash
+rm /path/to/project/.codesurgeon/mcp.pid
+```
+
+---
+
+### Binary not found after `cargo build`
+
+**Symptom:** `codesurgeon` or `codesurgeon-mcp` command not found.
+
+The binaries are placed in `target/release/`, not on your `PATH` automatically. Either use the full path:
+```bash
+/path/to/codesurgeon/target/release/codesurgeon-mcp
+```
+Or add the release directory to your PATH, or symlink:
+```bash
+ln -s /path/to/codesurgeon/target/release/codesurgeon /usr/local/bin/codesurgeon
+```
+
 ## License
 
 MIT

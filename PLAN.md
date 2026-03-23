@@ -279,6 +279,10 @@ codesurgeon/
 - [x] CI — `.github/workflows/ci.yml`: cargo test + clippy (-D warnings) + rustfmt --check
 - [x] README with benchmark table vs baseline and vs vexp
 - [x] `docs/ranking.md` — full ranking pipeline documentation
+- [x] Stale PID file after crash — `acquire_pid_lock` uses `kill -0` to detect dead processes and
+  silently overwrites the stale file; no manual cleanup needed (invariant #4 in CLAUDE.md)
+- [ ] Troubleshooting section in README (MCP not connecting, index not ready, second instance
+  read-only mode, binary not on PATH after `cargo build`)
 - [ ] Published CLI via `cargo install` or Homebrew (deferred — fastembed/ort native deps need crates.io compat check)
 
 ### Phase 7 — Language enrichment: type stubs, toolchain integration, library APIs
