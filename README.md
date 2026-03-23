@@ -10,11 +10,10 @@ codesurgeon parses your codebase into a symbol dependency graph, then serves tok
 |--------|------------------------|-------------|
 | Tokens per query (30-file project) | ~30,000 | ~3,000 |
 | Token reduction | — | **~90%** |
-| Estimated cost per task (Claude Sonnet) | ~$1.80 | ~$0.60 |
 | Relevant pivots surfaced | all files | 8 symbols |
 | Setup | none | `cargo install` + 1 config line |
 
-> Cost savings compound at scale — 500 tasks × $1.20 saved = ~$600. Tracked locally per workspace by `codesurgeon stats`.
+> Token figures are from vexp's published results (the project that inspired this). codesurgeon will report your actual per-workspace savings via `codesurgeon stats` once Phase 11 ships.
 
 ### SWE-bench Verified
 
