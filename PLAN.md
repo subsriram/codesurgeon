@@ -328,6 +328,20 @@ codesurgeon/
 - [ ] Document `RUST_LOG` env var in README troubleshooting section — e.g.
   `RUST_LOG=debug CS_WORKSPACE=. ./codesurgeon-mcp` for verbose daemon output. Currently
   undocumented; first thing to reach for when diagnosing MCP connection issues.
+- [ ] CLI parity with MCP tools — makes core features accessible without an AI agent;
+  primary use case is debugging what agents receive:
+  - `codesurgeon context "<task>"` — prints the exact capsule Claude would receive for a
+    given task; best tool for tuning index quality and `config.toml` settings
+  - `codesurgeon impact <fqn>` — prints caller/dependent tree; pre-refactor analysis
+    without needing Claude open
+  - `codesurgeon skeleton <file>` — prints file API surface; quick inspection of what
+    skeleton adjacent symbols show
+- [ ] `codesurgeon config show` — prints the effective merged config (workspace
+  `.codesurgeon/config.toml` + user `~/.config/codesurgeon/config.toml`) with source
+  annotation per key. Standard "what is actually active?" debugging pattern.
+- [ ] `codesurgeon index --force` flag — explicit full rebuild regardless of blake3 hash
+  state. Once incremental is the visible default, `--force` makes the force-reindex use
+  case unambiguous.
 
 ### Phase 7 — Language enrichment: type stubs, toolchain integration, library APIs
 
