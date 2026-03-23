@@ -132,5 +132,24 @@ The search/ranking logic is documented in `docs/ranking.md`.
 | Shell (bash/zsh) | tree-sitter | Function extraction |
 | HTML | tree-sitter | Script/style blocks |
 | Rust | tree-sitter | Full AST incl. impl/trait |
-| Swift | tree-sitter | Full AST — class/struct/enum/extension/protocol/func/method |
+| Swift | tree-sitter + Xcode MCP (optional) | Full AST — class/struct/enum/extension/protocol/func/method; Xcode MCP adds resolved types |
 | SQL | tree-sitter (tree-sitter-sequel) | CREATE TABLE/VIEW/FUNCTION/INDEX/TYPE |
+
+## Swift enrichment — how it works (implementation note)
+
+codesurgeon has no Swift files itself, so this section is for understanding the feature,
+not for using it here.
+
+Swift-project agents receive Xcode MCP guidance through two automatic channels:
+
+1. **`generate_module_docs`** — when run against a project with Swift files, injects a
+   Swift enrichment section into every generated per-directory CLAUDE.md, and prepends a
+   workspace-level note to the combined output. The injected text adapts to the current
+   machine: different message when `xcrun mcpbridge` is found vs. not found.
+   See `swift_enrichment_hint()` and `detect_xcode_mcp()` in `crates/cs-core/src/engine.rs`.
+
+2. **`run_pipeline`** — appends the same hint inline whenever any pivot or skeleton in
+   the returned capsule is a `.swift` file. Covers projects that haven't run `generate_module_docs`.
+
+`detect_xcode_mcp()` probes `xcrun --find mcpbridge` once per process via `OnceLock`.
+`IndexStats.xcode_mcp_available` surfaces the result through `index_status`.

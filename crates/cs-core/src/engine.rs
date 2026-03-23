@@ -21,6 +21,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        s
+    } else {
+        let mut boundary = max_bytes;
+        while !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        &s[..boundary]
+    }
+}
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -69,6 +81,11 @@ pub struct IndexStats {
     pub edge_count: u64,
     pub file_count: u64,
     pub session_id: String,
+    /// Whether Xcode 26+ MCP bridge (`xcrun mcpbridge`) was detected on this machine.
+    /// When true, agents working on Swift files should prefer Xcode MCP for resolved
+    /// types and live diagnostics; codesurgeon remains the fallback for semantic search
+    /// and session memory.
+    pub xcode_mcp_available: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -326,7 +343,7 @@ impl CoreEngine {
                         // This allows semantic queries like "coordinator for documents and lists"
                         // to match a class whose signature is just "class PDFLibrary: ObservableObject"
                         // but whose body declares `@Published var documents`, `var lists`, etc.
-                        let body_preview = &s.body[..s.body.len().min(500)];
+                        let body_preview = utf8_truncate(&s.body, 500);
                         format!(
                             "{} {} {}",
                             s.signature,
@@ -336,7 +353,7 @@ impl CoreEngine {
                     } else if s.language == Language::Markdown {
                         // For markdown sections, embed the full section body so paragraph content
                         // is semantically searchable, not just the heading text.
-                        let body_preview = &s.body[..s.body.len().min(1000)];
+                        let body_preview = utf8_truncate(&s.body, 1000);
                         format!("{} {}", s.signature, body_preview)
                     } else {
                         format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
@@ -435,7 +452,7 @@ impl CoreEngine {
                     if s.signature.is_empty() {
                         s.name.clone()
                     } else if s.kind.is_type_definition() || s.kind == SymbolKind::Impl {
-                        let body_preview = &s.body[..s.body.len().min(500)];
+                        let body_preview = utf8_truncate(&s.body, 500);
                         format!(
                             "{} {} {}",
                             s.signature,
@@ -443,7 +460,7 @@ impl CoreEngine {
                             body_preview
                         )
                     } else if s.language == Language::Markdown {
-                        let body_preview = &s.body[..s.body.len().min(1000)];
+                        let body_preview = utf8_truncate(&s.body, 1000);
                         format!("{} {}", s.signature, body_preview)
                     } else {
                         format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
@@ -484,7 +501,24 @@ impl CoreEngine {
         tracing::debug!("run_pipeline: intent={:?}, task={}", intent, task);
 
         let capsule = self.build_context_capsule(task, budget, &intent)?;
-        Ok(format_capsule(&capsule))
+        let mut out = format_capsule(&capsule);
+
+        // Append Swift enrichment hint when Swift symbols appear in results.
+        // Points agents toward Xcode MCP if available, or documents the fallback
+        // so they don't assume the tree-sitter results are complete.
+        let has_swift = capsule
+            .pivots
+            .iter()
+            .any(|p| p.file_path.ends_with(".swift"))
+            || capsule
+                .skeletons
+                .iter()
+                .any(|s| s.file_path.ends_with(".swift"));
+        if has_swift {
+            out.push_str(&swift_enrichment_hint(detect_xcode_mcp()));
+        }
+
+        Ok(out)
     }
 
     /// Get context capsule for a query.
@@ -614,6 +648,7 @@ impl CoreEngine {
             edge_count: db.edge_count()?,
             file_count: db.file_count()?,
             session_id: self.config.session_id.clone(),
+            xcode_mcp_available: detect_xcode_mcp(),
         })
     }
 
@@ -742,12 +777,34 @@ impl CoreEngine {
             by_dir.entry(dir).or_default().push(sym);
         }
 
+        // Check once whether this workspace has any Swift files at all.
+        let workspace_has_swift = graph
+            .all_symbols()
+            .any(|s| s.language == Language::Swift);
+        let xcode_available = if workspace_has_swift {
+            detect_xcode_mcp()
+        } else {
+            false
+        };
+
         let mut all_docs = String::new();
+
+        // Prepend a workspace-level Swift note to the combined output so agents reading
+        // the full generate_module_docs result see it regardless of which directory they
+        // navigate to first.
+        if workspace_has_swift {
+            all_docs.push_str("## Swift enrichment\n\n");
+            all_docs.push_str(swift_enrichment_hint(xcode_available).trim_start_matches('\n'));
+            all_docs.push_str("\n\n---\n\n");
+        }
 
         for (dir, symbols) in &by_dir {
             if symbols.len() < 3 {
                 continue; // Skip tiny directories
             }
+
+            // Check whether this specific directory contains Swift files.
+            let dir_has_swift = symbols.iter().any(|s| s.language == Language::Swift);
 
             // Group by kind for the summary
             let mut fns: Vec<&&Symbol> = symbols.iter().filter(|s| s.kind.is_callable()).collect();
@@ -803,6 +860,16 @@ impl CoreEngine {
                         sym.name, sym.file_path, sym.start_line, doc_line
                     ));
                 }
+                doc.push('\n');
+            }
+
+            // Append Swift enrichment note to per-directory docs that contain Swift files.
+            // This is the primary channel for session-start context in other projects —
+            // agents read their project's CLAUDE.md before any tool calls, so the failover
+            // instructions need to live here, not just in run_pipeline hints.
+            if dir_has_swift {
+                doc.push_str("## Swift enrichment\n\n");
+                doc.push_str(swift_enrichment_hint(xcode_available).trim_start_matches('\n'));
                 doc.push('\n');
             }
 
@@ -1277,5 +1344,43 @@ fn sym_ref(s: &Symbol) -> SymbolRef {
         file_path: s.file_path.clone(),
         start_line: s.start_line,
         kind: s.kind.to_string(),
+    }
+}
+
+/// Probe for Xcode 26+ MCP bridge availability. Result is cached after the first call
+/// so repeated `run_pipeline` or `index_status` calls pay the subprocess cost only once.
+fn detect_xcode_mcp() -> bool {
+    use std::sync::OnceLock;
+    static XCODE_MCP: OnceLock<bool> = OnceLock::new();
+    *XCODE_MCP.get_or_init(|| {
+        std::process::Command::new("xcrun")
+            .args(["--find", "mcpbridge"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Human-readable hint appended to capsule output when Swift symbols are present.
+/// Tells the agent which enrichment path is available and what the fallback is,
+/// so it never silently operates on incomplete type information.
+fn swift_enrichment_hint(xcode_mcp_available: bool) -> String {
+    if xcode_mcp_available {
+        "\n> **Swift symbols detected.** \
+         Xcode MCP is available — call its tools for resolved types and live build diagnostics. \
+         codesurgeon results reflect tree-sitter parsing and remain available for semantic search \
+         and session memory.\n"
+            .to_string()
+    } else {
+        "\n> **Swift symbols detected.** \
+         Xcode MCP was not found — results are based on tree-sitter parsing only (no resolved types, \
+         no macro-expanded symbols). \
+         To enable full Swift enrichment: install Xcode 26+ and turn on \
+         Settings → Intelligence → Enable Model Context Protocol, \
+         then wire it up with `xcrun mcpbridge`. \
+         codesurgeon's graph is still usable for semantic search and session memory.\n"
+            .to_string()
     }
 }

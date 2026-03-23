@@ -624,15 +624,25 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
         "index_status" => {
             let indexing = engine.is_indexing();
             let stats = engine.index_stats()?;
+            let xcode_line = if stats.xcode_mcp_available {
+                "- Swift enrichment: Xcode MCP available (Xcode 26+) — use it for resolved types and diagnostics\n"
+            } else {
+                "- Swift enrichment: Xcode MCP not detected — tree-sitter only (see README for setup)\n"
+            };
             Ok(format!(
                 "## codesurgeon index status\n\
                  - Indexing: {}\n\
                  - Symbols: {}\n\
                  - Edges: {}\n\
                  - Files: {}\n\
-                 - Session: {}\n",
+                 - Session: {}\n\
+                 {}",
                 if indexing { "in progress" } else { "ready" },
-                stats.symbol_count, stats.edge_count, stats.file_count, stats.session_id
+                stats.symbol_count,
+                stats.edge_count,
+                stats.file_count,
+                stats.session_id,
+                xcode_line,
             ))
         }
 

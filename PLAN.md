@@ -281,6 +281,254 @@ codesurgeon/
 - [x] `docs/ranking.md` — full ranking pipeline documentation
 - [ ] Published CLI via `cargo install` or Homebrew (deferred — fastembed/ort native deps need crates.io compat check)
 
+### Phase 7 — Language enrichment: type stubs, toolchain integration, library APIs
+
+Goal: close the gap between what codesurgeon's tree-sitter pass can see and what agents actually
+need — resolved types, macro-generated symbols, and third-party library APIs — without introducing
+heavy runtime dependencies.
+
+Enrichment runs as an **opt-in indexing-time pass** after the base tree-sitter index is built.
+Results are stored in the existing SQLite schema (new `resolved_type`, `expanded_body` columns on
+`symbols`; new `library` partition flag on `files`). The `content_hash` per symbol drives
+incremental re-enrichment — only changed symbols are re-processed.
+
+---
+
+#### 7a — Tier 1: Index type stubs already on disk (all languages, near-zero effort)
+
+No new tools required. Extend the indexer to treat these paths as a low-weight `library`
+partition: indexed as skeletons only, never returned as pivots, lower ranking weight.
+Fixes the most common agent failure mode: hallucinated library signatures.
+
+| Language | Stub files to index |
+|----------|---------------------|
+| TypeScript / JS | `node_modules/@types/**/*.d.ts`, `node_modules/**/index.d.ts` |
+| Python | `site-packages/**/*.pyi`, typeshed stubs (if pyright/mypy installed) |
+| Swift | `.swiftinterface` files in Xcode toolchain + SPM package caches |
+| Rust | `rustdoc --output-format json` (see 7b) covers this more completely |
+| SQL | No stubs needed — schemas are self-describing |
+| Shell | No type system — skip |
+| HTML | Piggybacks on JS/TS stub indexing for inline scripts |
+
+Implementation notes:
+- Add `is_library: bool` column to `files` table; library symbols get ranking weight ×0.3
+- Respect `.gitignore` but add explicit include rules for `node_modules/@types` and `site-packages`
+- `EngineConfig` gains `index_stubs: bool` (default: true) and `stub_paths: Vec<PathBuf>` override
+
+---
+
+#### 7b — Tier 2: Rust toolchain enrichment (`cargo-expand` + `rustdoc` JSON)
+
+Solves the two biggest Rust-specific blind spots: macro-generated symbols and resolved public types.
+
+**`cargo-expand` — macro expansion**
+- Run `cargo expand <module>` at index time for each Rust file
+- Output is expanded Rust source — re-feed through the existing `walk_rust()` tree-sitter extractor
+- Adds visibility into: `#[derive(Serialize, Debug, Clone)]` generated impls, `tokio::main` expansion,
+  builder macros, proc macros
+- Only re-run when the file's `content_hash` changes
+- Requires `cargo-expand` installed (`cargo install cargo-expand`); skip gracefully if absent
+
+**`rustdoc --output-format json` — resolved public API types**
+- Run `cargo rustdoc -- --output-format json` once per crate at index time
+- Deserialize with the `rustdoc-types` crate (native Rust, no subprocess parsing)
+- Annotate existing symbols with `resolved_type` and trait impl lists from rustdoc output
+- Covers: generic instantiations, associated types, full trait impl lists
+- Gate behind `--features rustdoc-enrichment` to avoid mandatory `cargo rustdoc` on every workspace
+
+Implementation notes:
+- New `enricher.rs` in `cs-core/src/` — `RustEnricher` struct with `expand_macros()` and
+  `annotate_from_rustdoc()` methods
+- `Symbol` gains optional `resolved_type: Option<String>` and `expanded: bool` fields
+- `engine.rs` runs enrichment pass after base indexing completes, async so MCP server stays responsive
+
+---
+
+#### 7c — Tier 2: TypeScript/JavaScript enrichment (`typescript` npm package)
+
+The `typescript` package is already present in most TS/JS projects as a dev dependency.
+A small Node.js shim invoked at index time uses `ts.createProgram()` + `TypeChecker` to annotate
+symbols with their resolved types — no new installs for the user.
+
+```
+codesurgeon indexer
+  → detects tsconfig.json in workspace
+  → spawns: node enrich-ts.js <workspace>          ← shim bundled with codesurgeon
+  → ts.createProgram() over tsconfig.json
+  → for each symbol: checker.getTypeAtLocation()
+  → outputs NDJSON: { fqn, resolved_type, declaration_file, declaration_line }
+  → codesurgeon annotates symbol graph
+```
+
+- Works for plain JS too (`allowJs: true` in shim's compiler options)
+- JSDoc types in JS files resolved correctly
+- `node_modules/@types/**/*.d.ts` resolution is automatic (TypeScript handles it)
+- Skip gracefully if `node` not available or no `tsconfig.json` found
+- Gate behind `--features ts-enrichment`
+
+---
+
+#### 7d — Tier 2: Python enrichment (`pyright --outputjson`)
+
+Run `pyright --outputjson` at index time to annotate Python symbols with inferred types.
+Lower priority than Tier 1 stub indexing (which covers library APIs already); adds value for
+inferred types on user-defined code where annotations are absent.
+
+- `pyright --outputjson` produces structured JSON with per-symbol type info and diagnostics
+- Parse output and annotate matching symbols in the graph by file + line range
+- Skip gracefully if `pyright` not on PATH
+- Gate behind `--features pyright-enrichment`
+
+---
+
+#### 7e — Tier 3: Swift enrichment via Xcode MCP ✅
+
+Apple ships a built-in MCP server in Xcode 26 (Settings → Intelligence → "Enable MCP").
+Rather than codesurgeon reimplementing Swift type resolution, agents use Xcode MCP alongside
+codesurgeon MCP: codesurgeon for semantic search + session memory, Xcode MCP for precise
+Swift type and build information.
+
+For non-Xcode Swift projects (SPM-only), fall back to `.swiftinterface` stub indexing (7a).
+Community options if Xcode 26 unavailable:
+- XcodeBuildMCP (https://github.com/cameroncooke/XcodeBuildMCP) — build/test/debug via MCP
+- xcode-mcp-server (https://github.com/r-huijts/xcode-mcp-server) — project structure + SPM
+
+**Implemented:**
+- `detect_xcode_mcp()` — probes `xcrun --find mcpbridge` once at startup via `OnceLock`;
+  result cached for the process lifetime
+- `swift_enrichment_hint()` — two-path message: "Xcode MCP available, use it" vs
+  "not found, tree-sitter only — here's how to fix it"
+- `run_pipeline` — appends hint when any pivot or skeleton is a `.swift` file
+- `index_status` — reports Xcode MCP availability as a status line
+- `IndexStats.xcode_mcp_available: bool` — serialised in JSON output
+- `CLAUDE.md` — agent-facing failover instructions (try Xcode MCP → fall back to
+  tree-sitter with explicit caveat about missing resolved types)
+- `README.md` — setup instructions + community alternatives for Xcode < 26
+
+---
+
+#### 7f — Shell and SQL: parser-level fixes (no external tools)
+
+**Shell:** The current extractor captures function definitions only. The primary gap is
+`source ./lib.sh` / `. ./util.sh` — file-level import edges that enable graph traversal across
+shell scripts. Fix at the tree-sitter level in `walk_shell()` in `indexer.rs`. No external tool.
+
+**SQL:** Schemas are already self-describing; no type enrichment needed. The gap is cross-schema
+references and stored procedure call graphs (e.g. a procedure calling another procedure).
+Extend `walk_sql()` to extract `CALL` and `EXEC` statements as `Calls` edges.
+
+---
+
+#### Build order within Phase 7
+
+1. **7a** — stub indexing (highest ROI, contained change to indexer + db)
+2. **7b** — `cargo-expand` (re-uses existing tree-sitter pass, additive)
+3. **7b** — `rustdoc JSON` (new `rustdoc-types` dep, annotates existing symbols)
+4. **7f** — shell `source` edges + SQL call edges (parser-level, self-contained)
+5. **7c** — TypeScript shim (requires bundling a Node.js script)
+6. **7d** — pyright (subprocess integration, lowest incremental value given 7a)
+7. **7e** — Xcode MCP (documentation only)
+
+---
+
+---
+
+## Priority queue — what to build next
+
+Criteria: agent value (context quality improvement), breadth (languages/users affected),
+effort, risk, dogfooding opportunity (can codesurgeon benefit on itself immediately).
+
+| Priority | Item | Effort | Key reason |
+|----------|------|--------|------------|
+| ✅ done | 7e Xcode MCP | Zero | Free — guidance auto-injected by `generate_module_docs` |
+| 1 | 7a Stub indexing | Low-med | Highest ROI; fixes hallucinated library signatures across all languages |
+| 2 | 7f Shell/SQL edges | Low | Quick win; contained tree-sitter changes; no new deps |
+| 3 | 7b `cargo-expand` | Med | Macro blind spot; codesurgeon dogfoods this on itself immediately |
+| 4 | 7b `rustdoc` JSON | Med | Resolved types for Rust; follows naturally from `cargo-expand` work |
+| 5 | 7d pyright | Low-med | Easy subprocess add; lower value after 7a covers library stubs |
+| 6 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity, not a quality item |
+| 7 | 7c TS compiler shim | Med | Inferred types for TS user code; incremental gain after 7a covers `@types` |
+| 8 | Multi-root workspace | High | High value for multi-repo projects; wait until enrichment story is solid |
+| ∞ | metal-candle upgrade | High risk | `fastembed` works; metal-candle is single-author (482 downloads); defer indefinitely |
+
+---
+
+**✅ done — 7e Xcode MCP** · Zero effort
+Guidance auto-injected into Swift projects via `generate_module_docs`; `run_pipeline`
+appends inline hint when Swift symbols appear. No code needed in target projects.
+
+---
+
+**#1 — 7a Stub indexing** · Low-med effort
+Highest ROI of any remaining item. Indexes `.d.ts`, `.pyi`, and `.swiftinterface` files
+already on disk — no new tools, no new deps. Fixes the most common agent failure mode
+(hallucinated library signatures) across all supported languages simultaneously.
+Foundational: 7c and 7d both add diminishing value once stubs are indexed.
+
+---
+
+**#2 — 7f Shell `source` edges + SQL `CALL` edges** · Low effort
+Two self-contained changes to `indexer.rs`; no new crates, no schema changes, no subprocess
+integration. `get_impact_graph` and `search_logic_flow` are currently broken for Shell and SQL
+because cross-file/cross-procedure edges are missing. Low enough effort to ship in the same
+sprint as 7a.
+
+---
+
+**#3 — 7b `cargo-expand`** · Med effort
+Solves the most painful Rust blind spot: macro-generated symbols (`#[derive(...)]`, `tokio::main`,
+proc macros) are invisible to tree-sitter. Output is Rust source, so the existing `walk_rust()`
+pass reuses with no new parsing logic. codesurgeon can dogfood the result on its own codebase
+immediately — serde/tokio derives become visible in the graph.
+
+---
+
+**#4 — 7b `rustdoc` JSON** · Med effort
+Natural follow-on once `enricher.rs` is in place from #3. `cargo rustdoc --output-format json`
+gives resolved types and full trait impl lists; deserialise with the `rustdoc-types` crate
+(native Rust, no subprocess parsing). Annotates existing symbols rather than adding new ones.
+
+---
+
+**#5 — 7d pyright** · Low-med effort
+Subprocess pattern is already established by #3/#4, making this mostly wiring. Adds inferred
+types for unannotated Python user code. Lower value than it appears: once 7a indexes `.pyi`
+stubs, library types are already covered — pyright only adds value for user-defined code
+without annotations, which is a narrower benefit.
+
+---
+
+**#6 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
+Doesn't improve context quality — only discoverability and adoption friction. The blocker is
+`fastembed`/`ort` native deps that need crates.io compat work. Worth tackling once the
+enrichment story (7a–7d) is solid enough to be worth distributing.
+
+---
+
+**#7 — 7c TypeScript compiler shim** · Med effort
+After 7a covers `@types` library stubs, this adds inferred types for user-defined TS/JS code.
+The main risk is FQN alignment between codesurgeon's tree-sitter FQNs and the TypeScript
+compiler's symbol paths — worth prototyping that mapping before committing. Introduces a
+Node.js subprocess (opt-in, graceful skip if absent), which cuts against the pure-Rust story
+but is acceptable as a feature-flagged enrichment pass.
+
+---
+
+**#8 — Multi-root workspace support** · High effort
+High real-world value (most non-trivial projects span frontend + backend + shared libs), but
+architecturally significant: schema migration (`root` column, FQN namespacing), PID lock
+rethink, `EngineConfig` overhaul. Do this after enrichment is stable so the SQLite schema
+isn't migrated twice.
+
+---
+
+**∞ — metal-candle embeddings upgrade** · Defer indefinitely
+`fastembed` works. metal-candle is a single-author crate with ~482 downloads (Dec 2025);
+swapping would invalidate all existing user embeddings (full re-index required) for a
+performance gain that only benefits Apple Silicon. Re-evaluate if it gains meaningful adoption.
+
+---
+
 ### Post-Phase-6 — Multi-root workspace support (deferred)
 Currently each `codesurgeon-mcp` instance serves one workspace. Multiple codebases are handled
 by running one server per codebase with distinct MCP server names:

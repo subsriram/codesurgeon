@@ -152,10 +152,29 @@ codesurgeon docs                           # Generate per-module CLAUDE.md files
 | Python | tree-sitter | Full AST |
 | TypeScript / TSX | tree-sitter | Full AST |
 | JavaScript / JSX | tree-sitter | Full AST |
-| Swift | tree-sitter | Full AST — class/struct/enum/extension/protocol/func/method |
+| Swift | tree-sitter + Xcode MCP (optional) | Full AST — class/struct/enum/extension/protocol/func/method; Xcode MCP adds resolved types |
 | Shell (bash/zsh) | tree-sitter | Function extraction |
 | HTML | tree-sitter | Script/style blocks |
 | SQL | tree-sitter | CREATE TABLE/VIEW/FUNCTION/INDEX/TYPE |
+
+## Swift enrichment — Xcode MCP
+
+codesurgeon's tree-sitter pass gives you full Swift symbol structure. For resolved types
+and live build diagnostics, pair it with **Xcode MCP** (Xcode 26+):
+
+```bash
+# Enable in Xcode: Settings → Intelligence → Enable Model Context Protocol
+xcrun mcpbridge install --claude-code
+```
+
+When Xcode MCP is configured, `run_pipeline` on Swift files will note its availability
+and agents can call its tools for type-resolved details. When it's absent, `run_pipeline`
+says so explicitly — the tree-sitter graph remains fully usable for semantic search,
+impact analysis, and session memory. `index_status` always reports whether Xcode MCP
+was detected.
+
+For Xcode < 26 or SPM-only projects: [XcodeBuildMCP](https://github.com/cameroncooke/XcodeBuildMCP)
+or [xcode-mcp-server](https://github.com/r-huijts/xcode-mcp-server).
 
 ## License
 
