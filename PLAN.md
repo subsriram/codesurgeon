@@ -655,11 +655,13 @@ effort, risk, dogfooding opportunity (can codesurgeon benefit on itself immediat
 | 10 | 9d Memory consolidation | Med | Deduplicates auto-observations; depends on 9b compression being in place |
 | 11 | 7d pyright | Low-med | Fallback for non-IDE Python users after `submit_lsp_edges` lands |
 | 12 | 9e Richer AST change categories | Med | Improves observation quality; depends on 9a auto-capture |
-| 13 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity |
-| 14 | 7c TS compiler shim | Med | Lower priority — `submit_lsp_edges` covers VS Code TS users |
-| 15 | Multi-root workspace | High | Wait until enrichment + memory solid; schema migration risk |
-| 16 | 9f Project rules | High | Powerful but complex; needs 9b + 9d as foundation |
-| 17 | 8d `workspace_setup` | Low | Nice to have; `generate_module_docs` already covers onboarding |
+| 13 | 10a Manifest + 10c opt-out | Low | Incremental rebuild on clone; almost free given existing blake3/files table |
+| 14 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity |
+| 15 | 7c TS compiler shim | Med | Lower priority — `submit_lsp_edges` covers VS Code TS users |
+| 16 | 10b Git merge driver | Med | Union merge for manifest.json; most useful once distributed |
+| 17 | Multi-root workspace | High | Wait until enrichment + memory solid; schema migration risk |
+| 18 | 9f Project rules | High | Powerful but complex; needs 9b + 9d as foundation |
+| 19 | 8d `workspace_setup` | Low | Nice to have; `generate_module_docs` already covers onboarding |
 | ∞ | metal-candle upgrade | High risk | `fastembed` works; single-author crate; defer indefinitely |
 
 ---
@@ -771,21 +773,36 @@ so there's something to enrich.
 
 ---
 
-**#13 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
+**#13 — 10a Manifest + 10c opt-out** · Low effort
+Serialise the existing `files` table to `.codesurgeon/manifest.json` after each index pass.
+On a fresh clone with no `index.db`, read the manifest and re-index only files whose hashes
+differ — seconds instead of a full re-index. `CS_TRACK_MANIFEST=false` to opt out. Almost
+entirely free given blake3 hashing and incremental re-indexing are already in place.
+
+---
+
+**#14 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
 Doesn't improve context quality — only discoverability and adoption friction. The blocker is
 `fastembed`/`ort` native deps that need crates.io compat work. Worth tackling once the
 enrichment story is solid enough to be worth distributing.
 
 ---
 
-**#14 — 7c TypeScript compiler shim** · Med effort
+**#15 — 7c TypeScript compiler shim** · Med effort
 Demoted from #7 to #10 because `submit_lsp_edges` covers the same gap for VS Code TS users
 with better architecture. Remains useful as a standalone option for non-VS Code environments.
 FQN alignment between tree-sitter and the TypeScript compiler is still the main risk.
 
 ---
 
-**#15 — Multi-root workspace support** · High effort
+**#16 — 10b Git merge driver** · Med effort
+`codesurgeon merge-manifest` CLI subcommand + `.gitattributes` registration via
+`codesurgeon git-setup`. Takes union of file hashes across base/ours/theirs versions.
+Most valuable once distributed (#14) and teams are actively using the manifest.
+
+---
+
+**#17 — Multi-root workspace support** · High effort
 High real-world value (most non-trivial projects span frontend + backend + shared libs), but
 architecturally significant: schema migration (`root` column, FQN namespacing), PID lock
 rethink, `EngineConfig` overhaul. Do this after enrichment is stable so the SQLite schema
@@ -793,7 +810,7 @@ isn't migrated twice.
 
 ---
 
-**#16 — 9f Project rules** · High effort
+**#18 — 9f Project rules** · High effort
 When 3+ similar observations recur in the same scope, auto-generate rule candidates and
 inject them as standing conventions into capsule responses. Requires 9b (compression) and
 9d (consolidation) as foundations — rules are derived from consolidated observation clusters.
@@ -801,7 +818,7 @@ Rules start as `pending` and are promoted to `active` only after agent/user conf
 
 ---
 
-**#17 — 8d `workspace_setup`** · Low effort, low priority
+**#19 — 8d `workspace_setup`** · Low effort, low priority
 Onboarding tool that generates config templates. `generate_module_docs` already covers the
 CLAUDE.md onboarding case. Add this when distribution (#9) is done and new-user friction
 becomes the main concern.
@@ -812,6 +829,93 @@ becomes the main concern.
 `fastembed` works. metal-candle is a single-author crate with ~482 downloads (Dec 2025);
 swapping would invalidate all existing user embeddings (full re-index required) for a
 performance gain that only benefits Apple Silicon. Re-evaluate if it gains meaningful adoption.
+
+---
+
+### Phase 10 — Git integration: manifest-based incremental rebuild
+
+Goal: make codesurgeon team- and multi-machine-friendly by tracking a lightweight manifest
+in git. New clones and pulls rebuild only changed files rather than re-indexing from scratch.
+
+The core infrastructure is already in place — `blake3` hashing on every file, a `files`
+table in SQLite with paths and hashes, and incremental re-indexing logic that already skips
+unchanged files. The manifest is effectively the `files` table serialised to JSON.
+
+---
+
+#### 10a — Manifest file: `.codesurgeon/manifest.json` (Low effort)
+
+After each index pass, write a `manifest.json` alongside `index.db`:
+
+```json
+{
+  "version": 1,
+  "workspace": "/projects/myapp",
+  "updated_at": "2026-03-23T17:00:00Z",
+  "files": {
+    "src/main.rs":    "a3f1c2d4...",
+    "src/engine.rs":  "b7e9a1f2...",
+    ...
+  }
+}
+```
+
+- Serialised from the `files` table after `index_workspace_inner()` completes
+- `index.db` stays gitignored; `manifest.json` is git-tracked
+- On startup, if `manifest.json` exists but `index.db` is absent or empty: read manifest,
+  compare hashes against local files, re-index only changed files — incremental rebuild in
+  seconds on a fresh clone
+- `index_status` reports manifest age and file count
+
+Implementation: new `write_manifest()` + `read_manifest()` in `engine.rs`; called at the
+end of `index_workspace_inner()` and at the start of `CoreEngine::new()`.
+
+---
+
+#### 10b — Git merge driver for `manifest.json` (Med effort)
+
+When two branches each update different source files, their `manifest.json` entries don't
+conflict — the correct merge is the union of all file hashes (newest hash wins per file).
+Without a merge driver, git treats this as a text conflict requiring manual resolution.
+
+Register a custom merge driver via `.gitattributes`:
+
+```
+# .gitattributes
+.codesurgeon/manifest.json merge=codesurgeon-manifest
+```
+
+And in `.gitconfig` (or the project-level `.git/config`):
+
+```
+[merge "codesurgeon-manifest"]
+  name = codesurgeon manifest merge driver
+  driver = codesurgeon merge-manifest %O %A %B %P
+```
+
+The `merge-manifest` CLI subcommand reads the three versions (base, ours, theirs), takes
+the union of file entries (theirs wins on conflict for any given file), and writes the merged
+result to `%A`. Exit 0 on success, 1 if it cannot resolve.
+
+- New `codesurgeon merge-manifest` subcommand in `cs-cli`
+- Only registers if the user runs `codesurgeon git-setup` (opt-in, not forced on install)
+- `codesurgeon git-setup` also adds the `.gitattributes` entry if not already present
+
+---
+
+#### 10c — `vexp.autoCommitIndex` equivalent: `CS_TRACK_MANIFEST` (Low effort)
+
+Environment variable (default: `true`) to opt out of manifest tracking — for users who
+prefer to gitignore `.codesurgeon/` entirely. When `false`, `write_manifest()` is skipped
+and the `.codesurgeon/` directory is not expected to be git-tracked.
+
+---
+
+#### Build order within Phase 10
+
+1. **10a** — manifest write/read (highest ROI, almost free given existing infrastructure)
+2. **10c** — opt-out env var (one-liner, add alongside 10a)
+3. **10b** — git merge driver (separate sprint; most useful once distributed)
 
 ---
 
