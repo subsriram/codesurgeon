@@ -431,6 +431,93 @@ Extend `walk_sql()` to extract `CALL` and `EXEC` statements as `Calls` edges.
 
 ---
 
+### Phase 8 — vexp parity + tool improvements
+
+Gaps identified by reviewing vexp.dev/docs. Split into quick wins (parameter additions to
+existing tools) and new tools.
+
+---
+
+#### 8a — Quick wins: parameter additions to existing tools (Low effort)
+
+Four small additions that close the most visible gaps with vexp. No new tools, no schema
+changes — all are additive parameters with backward-compatible defaults.
+
+**`observation` param on `run_pipeline`**
+Auto-save an observation as part of the pipeline call, saving a round-trip.
+```
+run_pipeline(task="...", observation="discovered that X always retries 3 times")
+```
+
+**`include_tests` param on `run_pipeline` / `get_context_capsule`**
+Currently test files are penalised 0.25× in ranking with no override. Add `include_tests: bool`
+(default `false`) to let callers opt in when working on tests directly.
+
+**`format` param on `get_impact_graph`**
+Add `format: "list" | "tree" | "mermaid"` (default `"list"`). The Mermaid option outputs a
+diagram that renders in Claude's markdown — useful for visualising blast radius at a glance.
+
+**`max_paths` on `search_logic_flow`**
+Currently returns only the shortest path. Add `max_paths: u32` (default `1`) to return
+multiple parallel call chains — useful when there are several routes between A and B.
+
+---
+
+#### 8b — `search_memory` tool (Low-med effort)
+
+A dedicated hybrid memory search tool, separate from `get_session_context`. vexp uses
+text relevance + semantic similarity + recency + code-graph proximity. codesurgeon currently
+only surfaces memories passively through `run_pipeline` or chronologically via
+`get_session_context` — there is no way to directly query past observations.
+
+```
+search_memory(query="how does the retry backoff work", max_results=10)
+```
+
+Implementation: reuse the existing BM25 + embeddings stack already in `search.rs`, scoped
+to the `observations` table rather than the symbol table. The memory store already has
+`content` and `symbol_fqn` fields that are indexable.
+
+---
+
+#### 8c — `submit_lsp_edges` tool (Med effort)
+
+The most architecturally interesting gap. vexp accepts type-resolved call edges submitted
+from a VS Code Language Server extension, supplementing static analysis with precise type
+information. This is the "thin LSP-client bridge" approach: rather than codesurgeon spawning
+language servers (Phase 7b–7d), IDE users push edges *to* codesurgeon from the language
+server that's already running in their editor.
+
+```
+submit_lsp_edges(edges=[
+  {"caller": "src/main.rs::handle_request", "callee": "src/db.rs::Database::query"},
+  ...
+])
+```
+
+Edges are stored in the graph DB as `EdgeKind::LspResolved` (new variant), weighted higher
+than tree-sitter-inferred `Calls` edges in `get_impact_graph` and `search_logic_flow`.
+
+**Why this matters:** For VS Code users, this would replace the need for 7c (TS shim) and 7d
+(pyright) entirely — the language server already running in the editor provides the resolved
+edges without codesurgeon needing to spawn subprocesses. For non-VS Code users, 7c/7d remain
+the fallback.
+
+Implementation notes:
+- New `EdgeKind::LspResolved` variant in `symbol.rs`
+- `submit_lsp_edges` stores edges by FQN pair; tolerates unknown FQNs gracefully (skips, logs)
+- Edges expire after configurable TTL (default: 24h) since LSP state can become stale
+- A companion VS Code extension (separate repo) would wire `vscode.languages` call-hierarchy
+  provider → codesurgeon MCP on file save
+
+---
+
+#### 8d — `workspace_setup` tool (Low effort, low priority)
+
+Onboarding tool that detects the agent type, generates a `workspace.json` config template,
+and returns setup instructions. Reduces friction for new users. Low priority vs. the above
+since codesurgeon's `generate_module_docs` already covers the CLAUDE.md onboarding case.
+
 ---
 
 ## Priority queue — what to build next
@@ -441,15 +528,19 @@ effort, risk, dogfooding opportunity (can codesurgeon benefit on itself immediat
 | Priority | Item | Effort | Key reason |
 |----------|------|--------|------------|
 | ✅ done | 7e Xcode MCP | Zero | Free — guidance auto-injected by `generate_module_docs` |
-| 1 | 7a Stub indexing | Low-med | Highest ROI; fixes hallucinated library signatures across all languages |
-| 2 | 7f Shell/SQL edges | Low | Quick win; contained tree-sitter changes; no new deps |
-| 3 | 7b `cargo-expand` | Med | Macro blind spot; codesurgeon dogfoods this on itself immediately |
-| 4 | 7b `rustdoc` JSON | Med | Resolved types for Rust; follows naturally from `cargo-expand` work |
-| 5 | 7d pyright | Low-med | Easy subprocess add; lower value after 7a covers library stubs |
-| 6 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity, not a quality item |
-| 7 | 7c TS compiler shim | Med | Inferred types for TS user code; incremental gain after 7a covers `@types` |
-| 8 | Multi-root workspace | High | High value for multi-repo projects; wait until enrichment story is solid |
-| ∞ | metal-candle upgrade | High risk | `fastembed` works; metal-candle is single-author (482 downloads); defer indefinitely |
+| 1 | 8a Quick wins | Low | Four parameter additions; closes most visible vexp gaps immediately |
+| 2 | 7a Stub indexing | Low-med | Highest ROI; fixes hallucinated library signatures across all languages |
+| 3 | 7f Shell/SQL edges | Low | Quick win; contained tree-sitter changes; no new deps |
+| 4 | 7b `cargo-expand` | Med | Macro blind spot; codesurgeon dogfoods this on itself immediately |
+| 5 | 7b `rustdoc` JSON | Med | Resolved types for Rust; follows from `cargo-expand` work |
+| 6 | 8b `search_memory` | Low-med | Reuses existing BM25+embeddings stack; fills memory query gap |
+| 7 | 8c `submit_lsp_edges` | Med | Smarter than 7c/7d for IDE users; edges pushed from running LSP |
+| 8 | 7d pyright | Low-med | Fallback for non-IDE Python users after `submit_lsp_edges` lands |
+| 9 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity |
+| 10 | 7c TS compiler shim | Med | Now lower priority — `submit_lsp_edges` covers VS Code TS users |
+| 11 | Multi-root workspace | High | Wait until enrichment story is solid; schema migration risk |
+| 12 | 8d `workspace_setup` | Low | Nice to have; `generate_module_docs` already covers onboarding |
+| ∞ | metal-candle upgrade | High risk | `fastembed` works; single-author crate; defer indefinitely |
 
 ---
 
@@ -459,7 +550,15 @@ appends inline hint when Swift symbols appear. No code needed in target projects
 
 ---
 
-**#1 — 7a Stub indexing** · Low-med effort
+**#1 — 8a Quick wins (parameter additions)** · Low effort
+Four backward-compatible additions to existing tools that close the most visible gaps
+with vexp in a single sprint: `observation` on `run_pipeline`, `include_tests` flag,
+`format`/Mermaid on `get_impact_graph`, `max_paths` on `search_logic_flow`. No new
+infrastructure, no schema changes.
+
+---
+
+**#2 — 7a Stub indexing** · Low-med effort
 Highest ROI of any remaining item. Indexes `.d.ts`, `.pyi`, and `.swiftinterface` files
 already on disk — no new tools, no new deps. Fixes the most common agent failure mode
 (hallucinated library signatures) across all supported languages simultaneously.
@@ -467,7 +566,7 @@ Foundational: 7c and 7d both add diminishing value once stubs are indexed.
 
 ---
 
-**#2 — 7f Shell `source` edges + SQL `CALL` edges** · Low effort
+**#3 — 7f Shell `source` edges + SQL `CALL` edges** · Low effort
 Two self-contained changes to `indexer.rs`; no new crates, no schema changes, no subprocess
 integration. `get_impact_graph` and `search_logic_flow` are currently broken for Shell and SQL
 because cross-file/cross-procedure edges are missing. Low enough effort to ship in the same
@@ -475,7 +574,7 @@ sprint as 7a.
 
 ---
 
-**#3 — 7b `cargo-expand`** · Med effort
+**#4 — 7b `cargo-expand`** · Med effort
 Solves the most painful Rust blind spot: macro-generated symbols (`#[derive(...)]`, `tokio::main`,
 proc macros) are invisible to tree-sitter. Output is Rust source, so the existing `walk_rust()`
 pass reuses with no new parsing logic. codesurgeon can dogfood the result on its own codebase
@@ -483,42 +582,63 @@ immediately — serde/tokio derives become visible in the graph.
 
 ---
 
-**#4 — 7b `rustdoc` JSON** · Med effort
-Natural follow-on once `enricher.rs` is in place from #3. `cargo rustdoc --output-format json`
+**#5 — 7b `rustdoc` JSON** · Med effort
+Natural follow-on once `enricher.rs` is in place from #4. `cargo rustdoc --output-format json`
 gives resolved types and full trait impl lists; deserialise with the `rustdoc-types` crate
 (native Rust, no subprocess parsing). Annotates existing symbols rather than adding new ones.
 
 ---
 
-**#5 — 7d pyright** · Low-med effort
-Subprocess pattern is already established by #3/#4, making this mostly wiring. Adds inferred
-types for unannotated Python user code. Lower value than it appears: once 7a indexes `.pyi`
-stubs, library types are already covered — pyright only adds value for user-defined code
-without annotations, which is a narrower benefit.
+**#6 — 8b `search_memory`** · Low-med effort
+Dedicated hybrid memory search. Reuses the existing BM25 + embeddings stack in `search.rs`,
+scoped to the `observations` table. Currently the only way to find a past observation is
+`get_session_context` (chronological dump) or hoping `run_pipeline` surfaces it. A direct
+query interface fills a real gap as the observation store grows.
 
 ---
 
-**#6 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
+**#7 — 8c `submit_lsp_edges`** · Med effort
+The smartest enrichment architecture: IDE users push type-resolved edges from the language
+server already running in their editor, rather than codesurgeon spawning subprocesses.
+For VS Code users this replaces 7c (TS shim) and 7d (pyright) entirely. New `EdgeKind::LspResolved`
+variant, TTL-based expiry, graceful handling of unknown FQNs. Companion VS Code extension
+needed (separate repo).
+
+---
+
+**#8 — 7d pyright** · Low-med effort
+Fallback for Python users not running VS Code (where `submit_lsp_edges` isn't available).
+Subprocess pattern established by #4/#5; mostly wiring. Lower value after 7a covers `.pyi`
+stubs — only adds inferred types for unannotated user-defined code.
+
+---
+
+**#9 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
 Doesn't improve context quality — only discoverability and adoption friction. The blocker is
 `fastembed`/`ort` native deps that need crates.io compat work. Worth tackling once the
-enrichment story (7a–7d) is solid enough to be worth distributing.
+enrichment story is solid enough to be worth distributing.
 
 ---
 
-**#7 — 7c TypeScript compiler shim** · Med effort
-After 7a covers `@types` library stubs, this adds inferred types for user-defined TS/JS code.
-The main risk is FQN alignment between codesurgeon's tree-sitter FQNs and the TypeScript
-compiler's symbol paths — worth prototyping that mapping before committing. Introduces a
-Node.js subprocess (opt-in, graceful skip if absent), which cuts against the pure-Rust story
-but is acceptable as a feature-flagged enrichment pass.
+**#10 — 7c TypeScript compiler shim** · Med effort
+Demoted from #7 to #10 because `submit_lsp_edges` covers the same gap for VS Code TS users
+with better architecture. Remains useful as a standalone option for non-VS Code environments.
+FQN alignment between tree-sitter and the TypeScript compiler is still the main risk.
 
 ---
 
-**#8 — Multi-root workspace support** · High effort
+**#11 — Multi-root workspace support** · High effort
 High real-world value (most non-trivial projects span frontend + backend + shared libs), but
 architecturally significant: schema migration (`root` column, FQN namespacing), PID lock
 rethink, `EngineConfig` overhaul. Do this after enrichment is stable so the SQLite schema
 isn't migrated twice.
+
+---
+
+**#12 — 8d `workspace_setup`** · Low effort, low priority
+Onboarding tool that generates config templates. `generate_module_docs` already covers the
+CLAUDE.md onboarding case. Add this when distribution (#9) is done and new-user friction
+becomes the main concern.
 
 ---
 
