@@ -296,6 +296,16 @@ codesurgeon/
 - [ ] Platform targets: macOS Intel + Apple Silicon (already tested), Linux x64 + ARM64 (musl),
   Windows x64 (`x86_64-pc-windows-gnu`) — Windows is low priority for current audience but
   ARM Linux matters for CI runners and server deployments
+- [ ] Auto-write `.codesurgeon/.gitignore` on first index — contains `*.db`, `*.pid`,
+  `*.lock`, `embeddings/`; prevents accidental SQLite index commit which bloats repos.
+  Trivial change: write the file if absent at the start of the indexing pass.
+- [ ] Indexing progress to stderr — `eprintln!` at index start
+  (`[codesurgeon] indexing N files…`) and completion (`[codesurgeon] ready — N symbols,
+  N edges in Xms`). Gives Claude Code's MCP panel enough signal to show state; currently
+  indexing is completely silent and users can't tell if it's running, done, or stuck.
+- [ ] `.cursor/rules` and `.windsurf/rules` generation in `generate_module_docs` and
+  `codesurgeon setup` — mirrors what vexp generates for `.claude/CLAUDE.md`. Low effort,
+  broadens supported agent surface to Cursor and Windsurf users without new architecture.
 
 ### Phase 7 — Language enrichment: type stubs, toolchain integration, library APIs
 
