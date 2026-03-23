@@ -119,17 +119,116 @@ After solving hard problem: save_observation(content="retry uses exponential bac
 
 ## MCP tools
 
-| Tool | Description |
+### Quick reference
+
+| Tool | When to use |
 |------|-------------|
-| `run_pipeline` | **Primary tool.** Auto-detects intent, returns context + impact in one call |
-| `get_context_capsule` | Lightweight context search bounded to token budget |
-| `get_impact_graph` | Blast-radius: what breaks if this symbol changes |
-| `get_skeleton` | File API surface — signatures + docstrings, no bodies |
-| `search_logic_flow` | Trace execution path between two functions |
-| `get_diff_capsule` | Context for a git diff — changed symbols + callers + tests |
-| `index_status` | Health check: symbol/edge/file counts |
-| `get_session_context` | Cross-session observations with stale flags |
-| `save_observation` | Persist an insight linked to a symbol |
+| `run_pipeline` | **Before every edit** — primary tool |
+| `get_context_capsule` | Lightweight search for a specific query |
+| `get_impact_graph` | **Before any refactor** — see what breaks |
+| `get_skeleton` | Understand a file's shape without reading bodies |
+| `search_logic_flow` | Trace how A calls B |
+| `get_diff_capsule` | Context for a PR or patch |
+| `index_status` | Health check / Xcode MCP availability |
+| `get_session_context` | Catch up at the start of a session |
+| `save_observation` | Persist an insight across sessions |
+| `generate_module_docs` | Write per-directory CLAUDE.md files |
+
+### Tool reference
+
+**`run_pipeline`** — your primary tool
+Call this before every edit. Give it a plain-English task description. It auto-detects intent (debug / refactor / add / explore / structural), runs BM25 + graph centrality + semantic search, and returns a token-budgeted capsule: full source for the 8 most relevant symbols, signatures-only for up to 20 adjacent ones, plus anything remembered from previous sessions.
+```
+run_pipeline(task="fix the retry logic in the HTTP client")
+```
+
+---
+
+**`get_context_capsule`** — lightweight search
+Same search engine as `run_pipeline` but without intent routing or session memory. Use it when you have a specific query and don't need the full pipeline.
+```
+get_context_capsule(query="token budget assembly")
+```
+
+---
+
+**`get_impact_graph`** — blast radius before a refactor
+Call this before renaming or changing any function or type. Give it a fully-qualified symbol name and it returns all direct and transitive callers — everything that will break.
+```
+get_impact_graph(symbol_fqn="src/http.rs::HttpClient::send")
+```
+
+---
+
+**`get_skeleton`** — file API surface
+Returns all signatures and docstrings from a file with bodies stripped out. Typically 70–90% fewer tokens than the full file. Use it when you need to understand what a file exports without reading everything.
+```
+get_skeleton(file_path="src/engine.rs")
+```
+
+---
+
+**`search_logic_flow`** — trace a path between two functions
+Finds the shortest call-graph path from one symbol to another. Use it to understand how A eventually reaches B, or to debug unexpected call chains.
+```
+search_logic_flow(from_fqn="src/main.rs::handle_request", to_fqn="src/db.rs::query")
+```
+
+---
+
+**`get_diff_capsule`** — context for a PR or patch
+Paste in a `git diff` and it returns the changed symbols, their callers, and related test files — all token-budgeted. Designed for code review.
+```
+get_diff_capsule(diff="<paste unified diff here>")
+```
+
+---
+
+**`index_status`** — health check
+Returns symbol count, edge count, file count, session ID, and Xcode MCP availability. Call it to confirm the index is ready after startup, or to check whether re-indexing is still in progress.
+```
+index_status()
+```
+
+---
+
+**`get_session_context`** — what was learned before
+Returns the last ~50 observations saved across all sessions for this workspace. Use it at the start of a session to catch up on what was discovered previously.
+```
+get_session_context()
+```
+
+---
+
+**`save_observation`** — persist an insight
+Saves a note tied optionally to a specific symbol. Persists across sessions and is surfaced by `run_pipeline` in future sessions. Call it after solving something non-obvious.
+```
+save_observation(content="retry uses exponential backoff, max 3 attempts", symbol_fqn="src/http.rs::HttpClient::send")
+```
+
+---
+
+**`generate_module_docs`** — write CLAUDE.md files per directory
+Generates per-directory CLAUDE.md summaries from the symbol graph — types, functions, and (for Swift directories) Xcode MCP guidance. Pass `write_files=true` to write them to disk.
+```
+generate_module_docs(write_files=true)
+```
+
+---
+
+### Decision guide
+
+| Situation | Tool |
+|-----------|------|
+| About to edit anything | `run_pipeline` |
+| About to rename / move / delete | `get_impact_graph` first |
+| Unfamiliar file, need the shape | `get_skeleton` |
+| Reviewing a PR | `get_diff_capsule` |
+| How does A call B? | `search_logic_flow` |
+| Is the index ready? | `index_status` |
+| Starting a new session | `get_session_context` |
+| Just solved something tricky | `save_observation` |
+| Setting up a new project | `generate_module_docs` |
 
 ## CLI
 
