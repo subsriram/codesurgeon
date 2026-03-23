@@ -21,18 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        s
-    } else {
-        let mut boundary = max_bytes;
-        while !s.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        &s[..boundary]
-    }
-}
-
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -558,14 +546,14 @@ impl CoreEngine {
 
         let direct: Vec<SymbolRef> = graph
             .dependents(target_id)
-            .iter()
-            .map(|s| sym_ref(s))
+            .into_iter()
+            .map(sym_ref)
             .collect();
 
         let transitive: Vec<SymbolRef> = graph
             .blast_radius(target_id, self.config.max_blast_radius_depth)
-            .iter()
-            .map(|s| sym_ref(s))
+            .into_iter()
+            .map(sym_ref)
             .collect();
 
         let total = direct.len() + transitive.len();
@@ -631,7 +619,7 @@ impl CoreEngine {
         let path: Vec<SymbolRef> = path_ids
             .iter()
             .filter_map(|&id| graph.get_symbol(id))
-            .map(|s| sym_ref(s))
+            .map(sym_ref)
             .collect();
 
         Ok(FlowResult {

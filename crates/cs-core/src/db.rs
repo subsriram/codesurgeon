@@ -418,7 +418,7 @@ fn row_to_observation(row: &rusqlite::Row) -> rusqlite::Result<Observation> {
         symbol_hash: row.get(5)?,
         created_at: row.get(6)?,
         is_stale: row.get::<_, i64>(7)? != 0,
-        kind: crate::memory::ObservationKind::from_str(&row.get::<_, String>(8)?),
+        kind: crate::memory::ObservationKind::parse_kind(&row.get::<_, String>(8)?),
     })
 }
 

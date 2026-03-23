@@ -299,7 +299,7 @@ async fn main() -> Result<()> {
     // If another instance is already running we do NOT exit — we still serve this
     // connection (e.g. a parallel Codex probe) — we just skip background work to
     // avoid duplicate index writes.
-    let _pid_path = match acquire_pid_lock(&workspace) {
+    match acquire_pid_lock(&workspace) {
         Ok(p) => {
             // Build the engine in the background so the stdio loop (and the
             // `initialize` handshake) start immediately.  Claude Code and Codex

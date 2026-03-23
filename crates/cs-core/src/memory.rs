@@ -31,7 +31,7 @@ impl ObservationKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_kind(s: &str) -> Self {
         match s {
             "passive" => ObservationKind::Passive,
             "dead_end" => ObservationKind::DeadEnd,
@@ -124,6 +124,7 @@ impl FileThrashTracker {
 /// (something added then immediately removed in the same session).
 struct DeadEndTracker {
     /// symbol_fqn → (added_at, removed_at)
+    #[allow(clippy::type_complexity)]
     events: std::collections::HashMap<
         String,
         (

@@ -30,9 +30,8 @@ pub enum Format {
 pub fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<(String, Format)>> {
     loop {
         let mut first_line = String::new();
-        match reader.read_line(&mut first_line)? {
-            0 => return Ok(None), // EOF
-            _ => {}
+        if reader.read_line(&mut first_line)? == 0 {
+            return Ok(None); // EOF
         }
 
         let trimmed = first_line.trim();

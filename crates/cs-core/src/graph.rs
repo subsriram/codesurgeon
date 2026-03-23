@@ -244,8 +244,8 @@ impl CodeGraph {
                 return path;
             }
             for neighbor in self.graph.neighbors_directed(node, Direction::Outgoing) {
-                if !prev.contains_key(&neighbor) {
-                    prev.insert(neighbor, node);
+                if let std::collections::hash_map::Entry::Vacant(e) = prev.entry(neighbor) {
+                    e.insert(node);
                     queue.push_back(neighbor);
                 }
             }

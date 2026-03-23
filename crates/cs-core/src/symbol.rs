@@ -111,6 +111,7 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         file_path: &str,
         name: &str,

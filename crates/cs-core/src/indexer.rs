@@ -95,7 +95,7 @@ fn extract_imported_names(sym: &Symbol) -> Vec<String> {
             if let Some(rest) = text.strip_prefix("import ") {
                 return rest
                     .split(',')
-                    .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
+                    .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
             }
@@ -109,14 +109,14 @@ fn extract_imported_names(sym: &Symbol) -> Vec<String> {
                     .split(',')
                     .map(|s| {
                         // "foo as bar" → "foo"
-                        s.trim().split_whitespace().next().unwrap_or("").to_string()
+                        s.split_whitespace().next().unwrap_or("").to_string()
                     })
                     .filter(|s| !s.is_empty() && s != "type")
                     .collect();
             }
             // "import Foo from '...'" or "import * as Foo from '...'"
             if let Some(rest) = text.strip_prefix("import ") {
-                let first = rest.trim().split_whitespace().next().unwrap_or("");
+                let first = rest.split_whitespace().next().unwrap_or("");
                 if !first.is_empty() && first != "{" && first != "*" && first != "type" {
                     return vec![first.to_string()];
                 }
@@ -132,7 +132,7 @@ fn extract_imported_names(sym: &Symbol) -> Vec<String> {
                     .split(',')
                     .map(|s| {
                         // "Foo as F" → "Foo"
-                        s.trim().split_whitespace().next().unwrap_or("").to_string()
+                        s.split_whitespace().next().unwrap_or("").to_string()
                     })
                     .filter(|s| !s.is_empty() && s != "*" && s != "self")
                     .collect();
@@ -616,9 +616,10 @@ fn walk_python_node(
                 let (start, end) = node_lines(&child);
                 let text = node_text(&child, source).to_string();
                 // Use the whole import line as name for now
+                let name = text.lines().next().unwrap_or("import").trim().to_string();
                 symbols.push(Symbol::new(
                     file_path,
-                    &text.lines().next().unwrap_or("import").trim().to_string(),
+                    &name,
                     SymbolKind::Import,
                     start,
                     end,
@@ -856,6 +857,7 @@ fn walk_ts_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_ts_symbol(
     node: &Node,
     source: &str,
@@ -1397,9 +1399,10 @@ fn walk_swift(
             "import_declaration" => {
                 let (start, end) = node_lines(&child);
                 let text = node_text(&child, source).to_string();
+                let name = text.trim().to_string();
                 symbols.push(Symbol::new(
                     file_path,
-                    &text.trim().to_string(),
+                    &name,
                     SymbolKind::Import,
                     start,
                     end,
@@ -1539,37 +1542,33 @@ fn heading_text<'a>(node: &Node, source: &'a str) -> &'a str {
 fn walk_markdown(node: Node, source: &str, file_path: &str, symbols: &mut Vec<Symbol>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "section" => {
-                // A section wraps a heading + its content. Walk children to find the heading.
-                let mut inner = child.walk();
-                for inner_child in child.children(&mut inner) {
-                    if inner_child.kind() == "atx_heading" || inner_child.kind() == "setext_heading"
-                    {
-                        let level = heading_level(&inner_child, source).unwrap_or(1);
-                        let name = heading_text(&inner_child, source).trim().to_string();
-                        let (start, _) = node_lines(&inner_child);
-                        let (_, end) = node_lines(&child);
-                        let sig = format!("{} {}", "#".repeat(level as usize), name);
-                        let body = node_text(&child, source).to_string();
-                        symbols.push(Symbol::new(
-                            file_path,
-                            &name,
-                            SymbolKind::Module,
-                            start,
-                            end,
-                            sig,
-                            None,
-                            body,
-                            Language::Markdown,
-                        ));
-                        break;
-                    }
+        if child.kind() == "section" {
+            // A section wraps a heading + its content. Walk children to find the heading.
+            let mut inner = child.walk();
+            for inner_child in child.children(&mut inner) {
+                if inner_child.kind() == "atx_heading" || inner_child.kind() == "setext_heading" {
+                    let level = heading_level(&inner_child, source).unwrap_or(1);
+                    let name = heading_text(&inner_child, source).trim().to_string();
+                    let (start, _) = node_lines(&inner_child);
+                    let (_, end) = node_lines(&child);
+                    let sig = format!("{} {}", "#".repeat(level as usize), name);
+                    let body = node_text(&child, source).to_string();
+                    symbols.push(Symbol::new(
+                        file_path,
+                        &name,
+                        SymbolKind::Module,
+                        start,
+                        end,
+                        sig,
+                        None,
+                        body,
+                        Language::Markdown,
+                    ));
+                    break;
                 }
-                // Recurse into section for nested sections
-                walk_markdown(child, source, file_path, symbols);
             }
-            _ => {}
+            // Recurse into section for nested sections
+            walk_markdown(child, source, file_path, symbols);
         }
     }
 }

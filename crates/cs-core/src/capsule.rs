@@ -254,7 +254,7 @@ pub fn chunk_for_query(body: &str, query: &str, max_tokens: u32) -> String {
     while start < lines.len() {
         let mut end = start;
         let mut chars = 0;
-        while end < lines.len() && chars + lines[end].len() + 1 <= max_chars {
+        while end < lines.len() && chars + lines[end].len() < max_chars {
             chars += lines[end].len() + 1;
             end += 1;
         }
