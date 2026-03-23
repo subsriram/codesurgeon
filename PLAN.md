@@ -285,7 +285,17 @@ codesurgeon/
   read-only mode, binary not on PATH after `cargo build`)
 - [ ] Privacy statement in README — explicitly document: no network calls, no telemetry, no
   cloud dependencies; index lives in `.codesurgeon/` locally; embeddings run on-device
-- [ ] Published CLI via `cargo install` or Homebrew (deferred — fastembed/ort native deps need crates.io compat check)
+- [ ] `codesurgeon setup` command — writes `codesurgeon-mcp` entry to `~/.claude.json` via
+  `claude mcp add`, runs `generate_module_docs` in the current workspace, prints next steps.
+  Single command replaces the current multi-step README process. Gate behind binary distribution.
+- [ ] Published binary distribution — `cargo install`, Homebrew tap, or `curl | sh` install
+  script (deferred — `fastembed`/`ort` native deps need crates.io compat check)
+- [ ] Static musl builds for Linux — `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl`; no GLIBC dependency, works on any kernel, CI runners, minimal
+  server images. The `fastembed`/`ort` musl compat is the same blocker as crates.io publishing.
+- [ ] Platform targets: macOS Intel + Apple Silicon (already tested), Linux x64 + ARM64 (musl),
+  Windows x64 (`x86_64-pc-windows-gnu`) — Windows is low priority for current audience but
+  ARM Linux matters for CI runners and server deployments
 
 ### Phase 7 — Language enrichment: type stubs, toolchain integration, library APIs
 
@@ -532,6 +542,11 @@ Implementation notes:
 Onboarding tool that detects the agent type, generates a `workspace.json` config template,
 and returns setup instructions. Reduces friction for new users. Low priority vs. the above
 since codesurgeon's `generate_module_docs` already covers the CLAUDE.md onboarding case.
+
+> **Note:** The core setup experience (`codesurgeon setup` CLI command writing MCP config +
+> generating CLAUDE.md) has been promoted to Phase 6 distribution. The `8d` MCP tool variant
+> (agent-callable workspace config generator) remains here as a lower-priority addition for
+> agent-driven onboarding flows.
 
 ---
 
@@ -1031,8 +1046,10 @@ Rules start as `pending` and are promoted to `active` only after agent/user conf
 ---
 
 **#21 — 8d `workspace_setup`** · Low effort, low priority
-Onboarding tool that generates config templates. `generate_module_docs` already covers the
-CLAUDE.md onboarding case. Add this when distribution (#9) is done and new-user friction
+Agent-callable onboarding tool that generates `workspace.json` config templates.
+`generate_module_docs` already covers the CLAUDE.md onboarding case. The `codesurgeon setup`
+CLI command (Phase 6) covers the human-facing onboarding case. This MCP tool variant is for
+agent-driven onboarding flows — add it when distribution is done and agent onboarding friction
 becomes the main concern.
 
 ---
