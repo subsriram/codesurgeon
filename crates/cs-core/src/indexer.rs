@@ -1544,7 +1544,8 @@ fn walk_markdown(node: Node, source: &str, file_path: &str, symbols: &mut Vec<Sy
                 // A section wraps a heading + its content. Walk children to find the heading.
                 let mut inner = child.walk();
                 for inner_child in child.children(&mut inner) {
-                    if inner_child.kind() == "atx_heading" || inner_child.kind() == "setext_heading" {
+                    if inner_child.kind() == "atx_heading" || inner_child.kind() == "setext_heading"
+                    {
                         let level = heading_level(&inner_child, source).unwrap_or(1);
                         let name = heading_text(&inner_child, source).trim().to_string();
                         let (start, _) = node_lines(&inner_child);
@@ -1704,17 +1705,16 @@ Basic usage.
 "#;
         let symbols = extract_markdown("README.md", src).expect("md parse");
         assert!(
-            symbols.iter().any(|s| s.name == "Introduction" && s.kind == SymbolKind::Module),
+            symbols
+                .iter()
+                .any(|s| s.name == "Introduction" && s.kind == SymbolKind::Module),
             "expected h1"
         );
         assert!(
             symbols.iter().any(|s| s.name == "Installation"),
             "expected h2"
         );
-        assert!(
-            symbols.iter().any(|s| s.name == "Advanced"),
-            "expected h3"
-        );
+        assert!(symbols.iter().any(|s| s.name == "Advanced"), "expected h3");
         assert!(
             symbols.iter().any(|s| s.name == "Usage"),
             "expected second h2"
@@ -1748,15 +1748,21 @@ $$ LANGUAGE plpgsql;
 "#;
         let symbols = extract_sql("schema.sql", src).expect("sql parse");
         assert!(
-            symbols.iter().any(|s| s.name == "users" && s.kind == SymbolKind::Struct),
+            symbols
+                .iter()
+                .any(|s| s.name == "users" && s.kind == SymbolKind::Struct),
             "expected users table"
         );
         assert!(
-            symbols.iter().any(|s| s.name == "active_users" && s.kind == SymbolKind::TypeAlias),
+            symbols
+                .iter()
+                .any(|s| s.name == "active_users" && s.kind == SymbolKind::TypeAlias),
             "expected active_users view"
         );
         assert!(
-            symbols.iter().any(|s| s.name == "get_user" && s.kind == SymbolKind::Function),
+            symbols
+                .iter()
+                .any(|s| s.name == "get_user" && s.kind == SymbolKind::Function),
             "expected get_user function"
         );
     }

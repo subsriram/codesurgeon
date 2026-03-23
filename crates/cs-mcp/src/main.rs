@@ -363,7 +363,10 @@ async fn main() -> Result<()> {
         Err(e) => {
             // Another instance owns the index — serve this connection read-only
             // (no background indexing or file watching) so parallel probes still work.
-            tracing::warn!("PID lock held by another instance ({}); serving read-only", e);
+            tracing::warn!(
+                "PID lock held by another instance ({}); serving read-only",
+                e
+            );
         }
     };
 
@@ -399,8 +402,11 @@ async fn run_stdio_loop(cell: EngineCell) {
     loop {
         let (message, fmt) = match transport::read_message(&mut stdin_reader) {
             Ok(Some(m)) => m,
-            Ok(None) => break,  // EOF — client closed the connection
-            Err(e) => { tracing::error!("stdin read error: {}", e); break; }
+            Ok(None) => break, // EOF — client closed the connection
+            Err(e) => {
+                tracing::error!("stdin read error: {}", e);
+                break;
+            }
         };
 
         if message.is_empty() {
@@ -412,7 +418,10 @@ async fn run_stdio_loop(cell: EngineCell) {
         if let Some(resp) = response {
             let json = match serde_json::to_string(&resp) {
                 Ok(j) => j,
-                Err(e) => { tracing::error!("Failed to serialize response: {}", e); continue; }
+                Err(e) => {
+                    tracing::error!("Failed to serialize response: {}", e);
+                    continue;
+                }
             };
             if let Err(e) = transport::write_message(&mut out, &json, fmt) {
                 tracing::error!("stdout write error: {}", e);
@@ -469,7 +478,9 @@ async fn handle_message(engine: Option<&Arc<CoreEngine>>, line: &str) -> Option<
 
         // Resources — we expose no resources but must respond so Codex probes succeed.
         "resources/list" => Some(Response::ok(req.id, json!({ "resources": [] }))),
-        "resources/templates/list" => Some(Response::ok(req.id, json!({ "resourceTemplates": [] }))),
+        "resources/templates/list" => {
+            Some(Response::ok(req.id, json!({ "resourceTemplates": [] })))
+        }
 
         // Prompts — we expose no prompts; return empty list so newer clients don't disconnect.
         "prompts/list" => Some(Response::ok(req.id, json!({ "prompts": [] }))),
@@ -538,11 +549,9 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
     if INDEX_DEPENDENT_TOOLS.contains(&name) && engine.is_indexing() {
         let stats = engine.index_stats().unwrap_or_default();
         if stats.symbol_count == 0 {
-            return Ok(
-                "⏳ Index build in progress — no symbols yet. \
+            return Ok("⏳ Index build in progress — no symbols yet. \
                  Retry in a few seconds or call `index_status` to monitor."
-                    .to_string(),
-            );
+                .to_string());
         }
         // Warm index available: fall through and serve results.
         // Re-indexing is finishing in the background; output reflects last-known state.

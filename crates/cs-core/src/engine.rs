@@ -7,10 +7,10 @@ use crate::indexer::{
     extract_call_edges, extract_impl_edges, extract_import_edges, extract_type_flow_edges,
     index_file,
 };
+use crate::language::Language;
 use crate::memory::{new_session_id, MemoryStore};
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
-use crate::language::Language;
 use crate::symbol::{Symbol, SymbolKind};
 use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
@@ -364,9 +364,7 @@ impl CoreEngine {
             {
                 let db = self.db.lock().unwrap();
                 db.begin_transaction()?;
-                for (chunk_syms, chunk_texts) in
-                    all_symbols.chunks(64).zip(skeletons.chunks(64))
-                {
+                for (chunk_syms, chunk_texts) in all_symbols.chunks(64).zip(skeletons.chunks(64)) {
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
                     match emb.embed_batch(&refs) {
                         Ok(vecs) => {
@@ -399,9 +397,13 @@ impl CoreEngine {
         tracing::debug!("Re-indexing file: {} ({:?})", rel, kind);
 
         // Phase 1: Remove stale db rows (brief, independent db lock).
-        { self.db.lock().unwrap().delete_file_symbols(&rel)?; }
+        {
+            self.db.lock().unwrap().delete_file_symbols(&rel)?;
+        }
         // Phase 2: Remove from in-memory graph (brief, independent graph lock).
-        { self.graph.write().unwrap().remove_file(&rel); }
+        {
+            self.graph.write().unwrap().remove_file(&rel);
+        }
 
         if kind == ChangeKind::Removed {
             return Ok(());
@@ -778,9 +780,7 @@ impl CoreEngine {
         }
 
         // Check once whether this workspace has any Swift files at all.
-        let workspace_has_swift = graph
-            .all_symbols()
-            .any(|s| s.language == Language::Swift);
+        let workspace_has_swift = graph.all_symbols().any(|s| s.language == Language::Swift);
         let xcode_available = if workspace_has_swift {
             detect_xcode_mcp()
         } else {
@@ -1182,7 +1182,10 @@ impl CoreEngine {
         // Deduplicate adjacent IDs (same symbol may be reachable from multiple pivots).
         let adjacent_ids: Vec<u64> = {
             let mut seen = std::collections::HashSet::new();
-            adjacent_ids.into_iter().filter(|id| seen.insert(*id)).collect()
+            adjacent_ids
+                .into_iter()
+                .filter(|id| seen.insert(*id))
+                .collect()
         };
 
         // 6. Resolve IDs → Symbols

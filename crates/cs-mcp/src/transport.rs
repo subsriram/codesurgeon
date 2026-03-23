@@ -31,13 +31,13 @@ pub fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<(String
     loop {
         let mut first_line = String::new();
         match reader.read_line(&mut first_line)? {
-            0 => return Ok(None),  // EOF
+            0 => return Ok(None), // EOF
             _ => {}
         }
 
         let trimmed = first_line.trim();
         if trimmed.is_empty() {
-            continue;  // skip blank lines between messages
+            continue; // skip blank lines between messages
         }
 
         if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
@@ -63,9 +63,8 @@ pub fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<(String
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body)?;
             return Ok(Some((
-                String::from_utf8(body).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?,
+                String::from_utf8(body)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
                 Format::ContentLength,
             )));
         } else {

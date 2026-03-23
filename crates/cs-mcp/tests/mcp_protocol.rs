@@ -180,7 +180,10 @@ fn resources_list_returns_empty_array() {
     s.send(r#"{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{}}"#);
     let resp = s.recv();
     assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
-    assert!(resp["error"].is_null(), "resources/list returned error: {resp}");
+    assert!(
+        resp["error"].is_null(),
+        "resources/list returned error: {resp}"
+    );
     assert!(
         resp["result"]["resources"].is_array(),
         "resources/list result missing 'resources' array: {resp}"
@@ -193,12 +196,13 @@ fn resources_templates_list_returns_empty_array() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Session::new_in(&dir);
     s.handshake();
-    s.send(
-        r#"{"jsonrpc":"2.0","id":2,"method":"resources/templates/list","params":{}}"#,
-    );
+    s.send(r#"{"jsonrpc":"2.0","id":2,"method":"resources/templates/list","params":{}}"#);
     let resp = s.recv();
     assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
-    assert!(resp["error"].is_null(), "resources/templates/list returned error: {resp}");
+    assert!(
+        resp["error"].is_null(),
+        "resources/templates/list returned error: {resp}"
+    );
     assert!(
         resp["result"]["resourceTemplates"].is_array(),
         "resources/templates/list result missing 'resourceTemplates': {resp}"
@@ -257,12 +261,24 @@ fn ndjson_input_gets_ndjson_response() {
 
     // Response must be NDJSON (a single JSON line), NOT Content-Length framed.
     let mut line = String::new();
-    stdout.read_line(&mut line).expect("failed to read response line");
-    assert!(!line.starts_with("Content-Length:"), "expected NDJSON response, got CLF: {line}");
+    stdout
+        .read_line(&mut line)
+        .expect("failed to read response line");
+    assert!(
+        !line.starts_with("Content-Length:"),
+        "expected NDJSON response, got CLF: {line}"
+    );
     let resp: Value = serde_json::from_str(line.trim()).expect("response is not valid JSON");
     assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
-    assert!(resp["error"].is_null(), "initialize via NDJSON returned error: {resp}");
-    assert_eq!(resp["result"]["protocolVersion"].as_str(), Some("2025-11-25"), "{resp}");
+    assert!(
+        resp["error"].is_null(),
+        "initialize via NDJSON returned error: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["protocolVersion"].as_str(),
+        Some("2025-11-25"),
+        "{resp}"
+    );
 
     let _ = child.kill();
     let _ = child.wait();
