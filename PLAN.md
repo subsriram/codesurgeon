@@ -641,7 +641,9 @@ Implementation:
 
 ---
 
-## Benchmark target — SWE-bench Verified
+## Benchmark plan
+
+### B1 — SWE-bench Verified (external, end-to-end quality)
 
 The gold-standard external validation for coding agents is
 [SWE-bench Verified](https://swebench.com) — 100 real GitHub issues, same model and cost
@@ -657,15 +659,94 @@ cap across all agents. vexp's published results (Claude Opus 4.5, $3/task cap, 2
 - **astropy: 80% (vexp) vs 40% (competitors)** — import-heavy, interconnected dependencies;
   exactly the pattern a symbol dependency graph is built for
 - **matplotlib: 43% (vexp) vs 86% (Sonar Foundation)** — rendering/procedural logic; less
-  amenable to symbolic traversal, more about visual algorithm understanding
+  amenable to symbolic traversal, more about symbolic graph traversal
 
 This maps onto codesurgeon's expected profile: strong on Rust (trait/impl graphs), Python
 backend (deep import chains), TypeScript (module boundaries); weaker on procedural/numerical
 code with few call-graph edges.
 
-**Target:** run codesurgeon against the same 100-task subset once Phase 8 (vexp tool parity)
-and Phase 9 (session memory) are stable. The benchmark is open-source and runs in under
-10 minutes. SWE-bench pass@1 is the metric to cite alongside `codesurgeon stats` cost figures.
+**When to run:** once Phase 8 (vexp tool parity) and Phase 9 (session memory) are stable.
+The benchmark is open-source and runs in under 10 minutes.
+
+**What to measure:**
+- Pass@1 on the same 100-task subset with the same model (Claude Opus) and cost cap ($3/task)
+- $/task with codesurgeon vs without (bare Claude Code, same task set)
+- Per-repo breakdown to identify where the symbol graph helps and where it doesn't
+- Comparison row against vexp's published numbers
+
+**Setup:** `pip install swebench` → clone the 100-task subset → run Claude Code with
+codesurgeon MCP enabled → record pass/fail and token cost per task.
+
+---
+
+### B2 — Token savings micro-benchmark (local, per-workspace)
+
+Measures actual token reduction on real codebases without a full agent run.
+Run this before and after ranking changes to catch regressions.
+
+**Method:**
+1. Take a fixed set of 20 representative queries against a known codebase (e.g. codesurgeon itself)
+2. Record `total_tokens`, `candidate_file_tokens`, and `workspace_tokens` per query (from `query_log`)
+3. Compute candidate-file savings %, workspace savings %, skeletonisation savings %
+4. Compare against a baseline snapshot committed to `benches/token_baseline.json`
+
+**Script:** `cargo bench --bench token_savings` — runs the 20 queries headlessly against
+the codesurgeon workspace, writes results to `benches/token_savings_latest.json`, diffs
+against baseline, fails CI if candidate-file savings drop below 70%.
+
+**Queries to include (codesurgeon self-benchmark):**
+- "fix the retry logic" → should pivot on engine.rs + capsule.rs
+- "add a new language parser" → should pivot on parser/ + symbol.rs
+- "token budget assembly" → should pivot on capsule.rs
+- "how does BM25 search work" → should pivot on search.rs
+- "session memory observations" → should pivot on memory.rs / observations table
+
+---
+
+### B3 — Index performance benchmark (local, throughput)
+
+Measures indexing speed and query latency. Run in CI on every merge to catch performance
+regressions.
+
+**Metrics:**
+- Index build time: files/sec and symbols/sec for a mid-size repo (codesurgeon itself ~30 files)
+- Query latency: BM25 time, graph centrality time, embedding time, capsule assembly time
+- Memory usage: peak RSS during index build and during query
+
+**Script:** `cargo bench --bench indexing` — uses `criterion` for statistical latency
+measurements. Baseline committed; CI fails if p95 query latency exceeds 500ms or indexing
+throughput drops below 50 files/sec.
+
+---
+
+### B4 — Ranking quality spot-checks (manual, periodic)
+
+Automated benchmarks can't easily measure "did the right symbol end up as a pivot?" Run
+these manually after any change to `engine.rs`, `search.rs`, or `graph.rs`.
+
+**Spot-check queries (codesurgeon self-index):**
+
+| Query | Expected top pivot | Pass? |
+|---|---|---|
+| "token budget" | `capsule::build_capsule` | |
+| "BM25 search" | `search::bm25_search` | |
+| "graph centrality" | `graph::centrality_scores` | |
+| "session memory stale" | `memory::mark_stale` | |
+| "PID lock second instance" | `main::acquire_pid_lock` | |
+
+Record results in `benches/ranking_spotchecks.md` after each manual run. If a spot-check
+fails, investigate before merging — ranking regressions are hard to catch automatically.
+
+---
+
+### When to run each benchmark
+
+| Benchmark | When |
+|---|---|
+| B1 SWE-bench | After Phase 8 + Phase 9 ship; re-run after major ranking changes |
+| B2 Token savings | Every merge via CI; baseline update requires explicit approval |
+| B3 Index performance | Every merge via CI; regression = build failure |
+| B4 Ranking spot-checks | Manually after any change to `engine.rs`, `search.rs`, `graph.rs` |
 
 ---
 
