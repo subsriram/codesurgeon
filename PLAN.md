@@ -529,6 +529,112 @@ since codesurgeon's `generate_module_docs` already covers the CLAUDE.md onboardi
 
 ---
 
+### Phase 9 — Memory system improvements
+
+Goal: close the gap between codesurgeon's basic observation store and vexp's more
+sophisticated session memory. Ordered from highest to lowest value/effort ratio.
+
+---
+
+#### 9a — Auto-capture tool calls as observations (Low effort, high value)
+
+Currently codesurgeon only passively captures file-change events. vexp records every
+`run_pipeline` and `get_context_capsule` call as a compact observation (task + top pivot FQNs).
+This builds a picture of what the agent has explored across sessions without any manual saves —
+the most common case where session context is actually useful.
+
+Implementation:
+- After each `run_pipeline` / `get_context_capsule` call, auto-save a compact observation:
+  `ObservationKind::Auto` with content = task description + top 3 pivot FQNs
+- Gate behind a dedupe check: if an identical task was recorded in the last 30 minutes, skip
+- No new schema changes — `ObservationKind::Auto` already exists or is a one-line addition
+
+---
+
+#### 9b — Session TTL + compression (Low-med effort, high value)
+
+The observation store currently grows unbounded. vexp auto-compresses sessions after 2 hours
+of inactivity into structural summaries and enforces:
+- Auto-observations: expire after session compression
+- Manual observations: persist permanently
+- Sessions older than 90 days: fully deleted
+
+Implementation:
+- Add `compressed_at: Option<DateTime>` and `expires_at: Option<DateTime>` to the `observations`
+  table
+- Background task (runs on startup) compresses inactive sessions: extract key paths, FQNs, and
+  terms into a single `ObservationKind::Summary` entry; mark auto-observations as expired
+- Manual observations (`ObservationKind::Manual`) never get an `expires_at`
+- Prune observations where `expires_at < now()` on each startup
+
+---
+
+#### 9c — L1 / L2 / L3 detail levels for `search_memory` (Low effort)
+
+Build this into `search_memory` (Phase 8b) from the start rather than retrofitting later.
+vexp surfaces results at three token levels:
+- **L1** (~20 tokens): headline only — symbol name + one-line summary
+- **L2** (~50 tokens): standard — includes linked symbol signature
+- **L3** (~100 tokens): full observation content
+
+The caller specifies the level; default is L2. Prevents memory results from eating the token
+budget when a capsule already contains the relevant code.
+
+---
+
+#### 9d — Memory consolidation (Med effort)
+
+Semantically similar auto-observations are merged into a single consolidated entry.
+codesurgeon currently accumulates duplicates — e.g. 20 `run_pipeline` calls on the same
+module produce 20 near-identical observations.
+
+Implementation:
+- On session compression (9b), cluster auto-observations by embedding cosine similarity
+  (threshold ~0.92) using the existing embeddings stack
+- Replace each cluster with a single `ObservationKind::Consolidated` entry whose content
+  merges the unique terms across the cluster
+- Manual observations never merge
+
+---
+
+#### 9e — Richer AST change categories (Med effort)
+
+vexp's file watcher classifies changes into 6 specific categories:
+`Added`, `Removed`, `Renamed`, `SignatureChanged`, `BodyChanged`, `VisibilityChanged`.
+codesurgeon detects that a file changed and counts re-indexed symbols, but doesn't
+classify the change type.
+
+Implementation:
+- In `reindex_file()`, compare the new symbol list against the previous DB snapshot:
+  - symbol present in new but not old → `Added`
+  - symbol present in old but not new → `Removed`
+  - same `start_line`, different `name` → `Renamed`
+  - same FQN, different `signature` → `SignatureChanged`
+  - same FQN + signature, different `body` → `BodyChanged`
+  - (visibility change requires language-specific parsing — defer)
+- Store change category in the auto-captured observation (9a) for richer session context
+- Surface in `get_diff_capsule` output
+
+---
+
+#### 9f — Project rules (High effort, lower priority)
+
+When 3+ similar observations recur in the same scope, vexp auto-generates rule candidates
+and injects them as standing conventions into capsule responses — e.g. "this codebase always
+uses `anyhow::Result`" stops being a repeated observation and becomes a rule.
+
+Implementation:
+- After each session compression (9b), scan consolidated observations for recurring patterns
+  by scope (directory or symbol namespace)
+- Candidate rules require: 3+ similar observations, recency within 30 days, no contradicting
+  observations
+- Rules stored as `ObservationKind::Rule`; injected at the top of `format_capsule` output
+  when the query scope matches
+- Manual review step: rules start as `pending` and are promoted to `active` only after the
+  agent (or user) confirms them via `save_observation(kind="rule", ...)`
+
+---
+
 ## Priority queue — what to build next
 
 Criteria: agent value (context quality improvement), breadth (languages/users affected),
@@ -538,17 +644,22 @@ effort, risk, dogfooding opportunity (can codesurgeon benefit on itself immediat
 |----------|------|--------|------------|
 | ✅ done | 7e Xcode MCP | Zero | Free — guidance auto-injected by `generate_module_docs` |
 | 1 | 8a Quick wins | Low | Four parameter additions; closes most visible vexp gaps immediately |
-| 2 | 7a Stub indexing | Low-med | Highest ROI; fixes hallucinated library signatures across all languages |
-| 3 | 7f Shell/SQL edges | Low | Quick win; contained tree-sitter changes; no new deps |
-| 4 | 7b `cargo-expand` | Med | Macro blind spot; codesurgeon dogfoods this on itself immediately |
-| 5 | 7b `rustdoc` JSON | Med | Resolved types for Rust; follows from `cargo-expand` work |
-| 6 | 8b `search_memory` | Low-med | Reuses existing BM25+embeddings stack; fills memory query gap |
-| 7 | 8c `submit_lsp_edges` | Med | Smarter than 7c/7d for IDE users; edges pushed from running LSP |
-| 8 | 7d pyright | Low-med | Fallback for non-IDE Python users after `submit_lsp_edges` lands |
-| 9 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity |
-| 10 | 7c TS compiler shim | Med | Now lower priority — `submit_lsp_edges` covers VS Code TS users |
-| 11 | Multi-root workspace | High | Wait until enrichment story is solid; schema migration risk |
-| 12 | 8d `workspace_setup` | Low | Nice to have; `generate_module_docs` already covers onboarding |
+| 2 | 9a Tool call auto-capture | Low | Builds cross-session picture without manual saves; high value, tiny change |
+| 3 | 7a Stub indexing | Low-med | Highest ROI on enrichment; fixes hallucinated library signatures |
+| 4 | 7f Shell/SQL edges | Low | Quick win; contained tree-sitter changes; no new deps |
+| 5 | 9b Session TTL + compression | Low-med | Prevents unbounded growth; lifecycle for auto vs manual observations |
+| 6 | 7b `cargo-expand` | Med | Macro blind spot; codesurgeon dogfoods on itself immediately |
+| 7 | 7b `rustdoc` JSON | Med | Resolved types for Rust; follows from `cargo-expand` work |
+| 8 | 8b `search_memory` + 9c L1/L2/L3 | Low-med | Build together — detail levels should be in from the start |
+| 9 | 8c `submit_lsp_edges` | Med | Smarter than 7c/7d for IDE users; edges pushed from running LSP |
+| 10 | 9d Memory consolidation | Med | Deduplicates auto-observations; depends on 9b compression being in place |
+| 11 | 7d pyright | Low-med | Fallback for non-IDE Python users after `submit_lsp_edges` lands |
+| 12 | 9e Richer AST change categories | Med | Improves observation quality; depends on 9a auto-capture |
+| 13 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity |
+| 14 | 7c TS compiler shim | Med | Lower priority — `submit_lsp_edges` covers VS Code TS users |
+| 15 | Multi-root workspace | High | Wait until enrichment + memory solid; schema migration risk |
+| 16 | 9f Project rules | High | Powerful but complex; needs 9b + 9d as foundation |
+| 17 | 8d `workspace_setup` | Low | Nice to have; `generate_module_docs` already covers onboarding |
 | ∞ | metal-candle upgrade | High risk | `fastembed` works; single-author crate; defer indefinitely |
 
 ---
@@ -560,6 +671,12 @@ appends inline hint when Swift symbols appear. No code needed in target projects
 ---
 
 **#1 — 8a Quick wins (parameter additions)** · Low effort
+Four backward-compatible additions in one sprint before anything else — highest ratio of
+agent value to implementation cost in the entire backlog.
+
+---
+
+**#2 — 9a Tool call auto-capture** · Low effort
 Four backward-compatible additions to existing tools that close the most visible gaps
 with vexp in a single sprint: `observation` on `run_pipeline`, `include_tests` flag,
 `format`/Mermaid on `get_impact_graph`, `max_paths` on `search_logic_flow`. No new
@@ -567,7 +684,14 @@ infrastructure, no schema changes.
 
 ---
 
-**#2 — 7a Stub indexing** · Low-med effort
+Every `run_pipeline` and `get_context_capsule` call auto-saved as a compact observation
+(task + top pivot FQNs). Builds cross-session exploration history without any manual saves.
+Tiny change — one `save_observation` call at the end of each tool dispatch with a 30-minute
+dedupe guard.
+
+---
+
+**#3 — 7a Stub indexing** · Low-med effort
 Highest ROI of any remaining item. Indexes `.d.ts`, `.pyi`, and `.swiftinterface` files
 already on disk — no new tools, no new deps. Fixes the most common agent failure mode
 (hallucinated library signatures) across all supported languages simultaneously.
@@ -575,7 +699,7 @@ Foundational: 7c and 7d both add diminishing value once stubs are indexed.
 
 ---
 
-**#3 — 7f Shell `source` edges + SQL `CALL` edges** · Low effort
+**#4 — 7f Shell `source` edges + SQL `CALL` edges** · Low effort
 Two self-contained changes to `indexer.rs`; no new crates, no schema changes, no subprocess
 integration. `get_impact_graph` and `search_logic_flow` are currently broken for Shell and SQL
 because cross-file/cross-procedure edges are missing. Low enough effort to ship in the same
@@ -583,7 +707,15 @@ sprint as 7a.
 
 ---
 
-**#4 — 7b `cargo-expand`** · Med effort
+**#5 — 9b Session TTL + compression** · Low-med effort
+Prevents the observation store growing unbounded. Auto-compress sessions idle for 2+ hours
+into structural summaries; expire auto-observations; delete sessions older than 90 days;
+manual observations persist permanently. Needs to land before 9d (consolidation) since
+compression is when merging happens.
+
+---
+
+**#6 — 7b `cargo-expand`** · Med effort
 Solves the most painful Rust blind spot: macro-generated symbols (`#[derive(...)]`, `tokio::main`,
 proc macros) are invisible to tree-sitter. Output is Rust source, so the existing `walk_rust()`
 pass reuses with no new parsing logic. codesurgeon can dogfood the result on its own codebase
@@ -591,22 +723,23 @@ immediately — serde/tokio derives become visible in the graph.
 
 ---
 
-**#5 — 7b `rustdoc` JSON** · Med effort
+**#7 — 7b `rustdoc` JSON** · Med effort
 Natural follow-on once `enricher.rs` is in place from #4. `cargo rustdoc --output-format json`
 gives resolved types and full trait impl lists; deserialise with the `rustdoc-types` crate
 (native Rust, no subprocess parsing). Annotates existing symbols rather than adding new ones.
 
 ---
 
-**#6 — 8b `search_memory`** · Low-med effort
-Dedicated hybrid memory search. Reuses the existing BM25 + embeddings stack in `search.rs`,
-scoped to the `observations` table. Currently the only way to find a past observation is
-`get_session_context` (chronological dump) or hoping `run_pipeline` surfaces it. A direct
-query interface fills a real gap as the observation store grows.
+**#8 — 8b `search_memory` + 9c L1/L2/L3 detail levels** · Low-med effort
+Build together — retrofitting detail levels after the fact is harder than starting with them.
+`search_memory` reuses the existing BM25 + embeddings stack scoped to the `observations`
+table. Results at three token levels: L1 (~20 tokens, headline only), L2 (~50 tokens,
+standard + linked symbol signature), L3 (~100 tokens, full content). Caller specifies level;
+default L2.
 
 ---
 
-**#7 — 8c `submit_lsp_edges`** · Med effort
+**#9 — 8c `submit_lsp_edges`** · Med effort
 The smartest enrichment architecture: IDE users push type-resolved edges from the language
 server already running in their editor, rather than codesurgeon spawning subprocesses.
 For VS Code users this replaces 7c (TS shim) and 7d (pyright) entirely. New `EdgeKind::LspResolved`
@@ -615,28 +748,44 @@ needed (separate repo).
 
 ---
 
-**#8 — 7d pyright** · Low-med effort
+**#10 — 9d Memory consolidation** · Med effort
+Cluster semantically similar auto-observations at session compression time using the existing
+embeddings stack (cosine similarity ~0.92 threshold). Replace each cluster with a single
+consolidated entry. Requires 9b (compression) to be in place first. Manual observations
+never merge.
+
+---
+
+**#11 — 7d pyright** · Low-med effort
 Fallback for Python users not running VS Code (where `submit_lsp_edges` isn't available).
 Subprocess pattern established by #4/#5; mostly wiring. Lower value after 7a covers `.pyi`
 stubs — only adds inferred types for unannotated user-defined code.
 
 ---
 
-**#9 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
+**#12 — 9e Richer AST change categories** · Med effort
+Classify file watcher events into Added / Removed / Renamed / SignatureChanged / BodyChanged
+by comparing new symbol list against the previous DB snapshot in `reindex_file()`. Enriches
+auto-captured observations (9a) and `get_diff_capsule` output. Depends on 9a being in place
+so there's something to enrich.
+
+---
+
+**#13 — Phase 6 distribution (`cargo install` / Homebrew)** · Med effort
 Doesn't improve context quality — only discoverability and adoption friction. The blocker is
 `fastembed`/`ort` native deps that need crates.io compat work. Worth tackling once the
 enrichment story is solid enough to be worth distributing.
 
 ---
 
-**#10 — 7c TypeScript compiler shim** · Med effort
+**#14 — 7c TypeScript compiler shim** · Med effort
 Demoted from #7 to #10 because `submit_lsp_edges` covers the same gap for VS Code TS users
 with better architecture. Remains useful as a standalone option for non-VS Code environments.
 FQN alignment between tree-sitter and the TypeScript compiler is still the main risk.
 
 ---
 
-**#11 — Multi-root workspace support** · High effort
+**#15 — Multi-root workspace support** · High effort
 High real-world value (most non-trivial projects span frontend + backend + shared libs), but
 architecturally significant: schema migration (`root` column, FQN namespacing), PID lock
 rethink, `EngineConfig` overhaul. Do this after enrichment is stable so the SQLite schema
@@ -644,7 +793,15 @@ isn't migrated twice.
 
 ---
 
-**#12 — 8d `workspace_setup`** · Low effort, low priority
+**#16 — 9f Project rules** · High effort
+When 3+ similar observations recur in the same scope, auto-generate rule candidates and
+inject them as standing conventions into capsule responses. Requires 9b (compression) and
+9d (consolidation) as foundations — rules are derived from consolidated observation clusters.
+Rules start as `pending` and are promoted to `active` only after agent/user confirmation.
+
+---
+
+**#17 — 8d `workspace_setup`** · Low effort, low priority
 Onboarding tool that generates config templates. `generate_module_docs` already covers the
 CLAUDE.md onboarding case. Add this when distribution (#9) is done and new-user friction
 becomes the main concern.
