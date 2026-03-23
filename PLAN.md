@@ -641,6 +641,34 @@ Implementation:
 
 ---
 
+## Benchmark target — SWE-bench Verified
+
+The gold-standard external validation for coding agents is
+[SWE-bench Verified](https://swebench.com) — 100 real GitHub issues, same model and cost
+cap across all agents. vexp's published results (Claude Opus 4.5, $3/task cap, 250 turns):
+
+| Agent | Pass@1 | $/Task |
+|-------|--------|--------|
+| vexp + Claude Code | **73%** | **$0.67** |
+| OpenHands | 70% | $1.77 |
+| Sonar Foundation | 70% | $1.98 |
+
+**Key insight from per-repo breakdown:**
+- **astropy: 80% (vexp) vs 40% (competitors)** — import-heavy, interconnected dependencies;
+  exactly the pattern a symbol dependency graph is built for
+- **matplotlib: 43% (vexp) vs 86% (Sonar Foundation)** — rendering/procedural logic; less
+  amenable to symbolic traversal, more about visual algorithm understanding
+
+This maps onto codesurgeon's expected profile: strong on Rust (trait/impl graphs), Python
+backend (deep import chains), TypeScript (module boundaries); weaker on procedural/numerical
+code with few call-graph edges.
+
+**Target:** run codesurgeon against the same 100-task subset once Phase 8 (vexp tool parity)
+and Phase 9 (session memory) are stable. The benchmark is open-source and runs in under
+10 minutes. SWE-bench pass@1 is the metric to cite alongside `codesurgeon stats` cost figures.
+
+---
+
 ## Priority queue — what to build next
 
 Criteria: agent value (context quality improvement), breadth (languages/users affected),
@@ -825,6 +853,8 @@ CREATE TABLE query_log (
   budget_tokens         INTEGER,
   candidate_file_tokens INTEGER,   -- sum of full-file tokens for files with returned symbols
   workspace_tokens      INTEGER,   -- total workspace tokens (cached at index time)
+  cost_usd              REAL,      -- total_tokens × configured $/token rate
+  cost_saved_usd        REAL,      -- (candidate_file_tokens - total_tokens) × $/token
   latency_ms            INTEGER,
   bm25_ms               INTEGER,
   graph_ms              INTEGER,
@@ -836,17 +866,21 @@ CREATE TABLE query_log (
 ```
 
 **Token savings baselines (all three tracked per query):**
-- *Candidate-file*: `(candidate_file_tokens - total_tokens) / candidate_file_tokens` — most honest; "files you'd have read to find this code"
+- *Candidate-file* (headline): `(candidate_file_tokens - total_tokens) / candidate_file_tokens` — most honest; "files you'd have read to find this code"
 - *Workspace*: `(workspace_tokens - total_tokens) / workspace_tokens` — matches README benchmark claim
 - *Skeletonisation*: `(adjacent_full_tokens - adjacent_skeleton_tokens) / adjacent_full_tokens` — compression contribution only
 
+**Cost tracking:** `cost_saved_usd = tokens_saved × rate`, where `rate` is configurable via
+`CS_TOKEN_RATE_USD` (default: claude-sonnet-4 input pricing). Consistent with vexp's SWE-bench
+finding that $0.67/task vs $1.98/task is the headline metric users remember — dollar figures
+communicate value more clearly than token percentages.
+
 **`codesurgeon stats` CLI output:**
 ```
-── Query stats (last 30 days) ──────────────────────────
+── Cost savings (last 30 days) ─────────────────────────
   Total queries:        47
-  Total tokens saved:   182,400
-  Avg savings/query:    90.3%  (candidate-file baseline)
-  Estimated cost saved: $0.55  (@ claude-sonnet-4 pricing)
+  Estimated cost saved: $0.55  (@ $3.00/Mtok, candidate-file baseline)
+  Avg token reduction:  90.3%  ·  182,400 tokens saved
 
 ── Latency ─────────────────────────────────────────────
   Median:    180ms    p95: 420ms
@@ -866,7 +900,7 @@ CREATE TABLE query_log (
 
 **`get_stats` MCP tool (11d):** thin wrapper over `query_log` aggregates, identical output to
 `codesurgeon stats`. Lets the agent surface stats in conversation: `get_stats(days=30)`.
-Also feeds a one-liner into `get_session_context`: "12 queries this session · ~8,400 tokens saved · avg latency 210ms".
+Also feeds a one-liner into `get_session_context`: "12 queries this session · ~$0.14 saved · avg 180ms latency".
 
 ---
 
@@ -1077,6 +1111,8 @@ CREATE TABLE query_log (
   budget_tokens         INTEGER,
   candidate_file_tokens INTEGER,  -- sum of full-file tokens for files with returned symbols
   workspace_tokens      INTEGER,  -- cached at index time
+  cost_usd              REAL,     -- total_tokens × CS_TOKEN_RATE_USD
+  cost_saved_usd        REAL,     -- (candidate_file_tokens - total_tokens) × CS_TOKEN_RATE_USD
   latency_ms            INTEGER,
   bm25_ms               INTEGER,
   graph_ms              INTEGER,
@@ -1087,14 +1123,15 @@ CREATE TABLE query_log (
 );
 ```
 
-`codesurgeon stats` CLI command: reads from `query_log` and prints a human-readable summary
-covering token savings, latency, intent breakdown, language distribution, memory hit rate,
-and index health. Makes the README's `~90%` benchmark claim verifiable per-workspace.
+`codesurgeon stats` CLI: reads from `query_log`, leads with **cost saved** (dollar figure)
+rather than token % — consistent with vexp's SWE-bench finding that $/task is the metric
+users internalise. Token % surfaced as secondary. Rate configurable via `CS_TOKEN_RATE_USD`
+(default: claude-sonnet-4 input pricing).
 
-Token savings uses three baselines (all stored per query):
-- **Candidate-file** (headline): files containing returned symbols — most honest baseline
+Token savings baselines (all stored per query):
+- **Candidate-file** (headline): files containing returned symbols — most honest
 - **Workspace**: total workspace tokens — matches README claim, most dramatic
-- **Skeletonisation**: adjacent full-body vs skeleton — measures compression contribution alone
+- **Skeletonisation**: adjacent full-body vs skeleton — compression contribution alone
 
 ---
 
@@ -1104,7 +1141,7 @@ Thin wrapper over `query_log` aggregates, returns the same summary as `codesurge
 Lets the agent surface stats inline: `get_stats(days=30)`.
 
 Also injects a one-liner into `get_session_context` output:
-`"12 queries this session · ~8,400 tokens saved · avg 180ms latency"`
+`"12 queries this session · ~$0.14 saved · avg 180ms latency"`
 
 ---
 
