@@ -306,6 +306,28 @@ codesurgeon/
 - [ ] `.cursor/rules` and `.windsurf/rules` generation in `generate_module_docs` and
   `codesurgeon setup` — mirrors what vexp generates for `.claude/CLAUDE.md`. Low effort,
   broadens supported agent surface to Cursor and Windsurf users without new architecture.
+- [ ] `.codesurgeon/config.toml` — project-level config file, git-tracked alongside code,
+  replaces env var juggling for per-project settings:
+  ```toml
+  [context]
+  max_tokens = 8000            # token budget per capsule (default 8000)
+  skeleton_detail = "standard" # minimal | standard | detailed (~5% / ~15% / ~30% of body)
+
+  [indexing]
+  exclude = ["fixtures/", "testdata/"]  # additional excludes beyond .gitignore / .codesurgeonignore
+
+  [observability]
+  token_rate_usd = 0.000003    # $/token for cost savings display in codesurgeon stats
+  ```
+  Read at MCP server startup and at CLI invocation. User-level override at
+  `~/.config/codesurgeon/config.toml` (lower precedence than workspace config).
+- [ ] `skeleton_detail` config option — expose existing `build_capsule` skeleton parameter as
+  "minimal" | "standard" | "detailed" levels. No architecture change — it's a tuning knob on
+  the adjacent-symbol body fraction that currently has no user-facing control. Useful for
+  large-context models (detailed) vs tight budgets (minimal).
+- [ ] Document `RUST_LOG` env var in README troubleshooting section — e.g.
+  `RUST_LOG=debug CS_WORKSPACE=. ./codesurgeon-mcp` for verbose daemon output. Currently
+  undocumented; first thing to reach for when diagnosing MCP connection issues.
 
 ### Phase 7 — Language enrichment: type stubs, toolchain integration, library APIs
 
