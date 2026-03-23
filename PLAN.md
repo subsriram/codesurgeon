@@ -346,6 +346,11 @@ Implementation notes:
 
 #### 7c — Tier 2: TypeScript/JavaScript enrichment (`typescript` npm package)
 
+> **Note:** For VS Code users, `submit_lsp_edges` (Phase 8c) is the preferred path —
+> it uses the language server already running in the editor rather than spawning a
+> separate subprocess. 7c remains the right approach for non-VS Code environments
+> (CI, Codex, other editors) and is now priority #10 vs 8c at #7.
+
 The `typescript` package is already present in most TS/JS projects as a dev dependency.
 A small Node.js shim invoked at index time uses `ts.createProgram()` + `TypeChecker` to annotate
 symbols with their resolved types — no new installs for the user.
@@ -369,6 +374,10 @@ codesurgeon indexer
 ---
 
 #### 7d — Tier 2: Python enrichment (`pyright --outputjson`)
+
+> **Note:** For VS Code users, `submit_lsp_edges` (Phase 8c) covers Python via
+> Pylance's call-hierarchy provider. 7d remains the fallback for non-VS Code
+> environments. Now priority #8 in the queue.
 
 Run `pyright --outputjson` at index time to annotate Python symbols with inferred types.
 Lower priority than Tier 1 stub indexing (which covers library APIs already); adds value for
