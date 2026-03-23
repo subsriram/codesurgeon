@@ -808,6 +808,14 @@ architecturally significant: schema migration (`root` column, FQN namespacing), 
 rethink, `EngineConfig` overhaul. Do this after enrichment is stable so the SQLite schema
 isn't migrated twice.
 
+Design is informed by vexp's multi-repo model (see deferred section below):
+- `workspace.json` declares each repo with `alias`, `path`, `languages`, `role` (consumer/provider), and typed `cross_repo_links` (e.g. `"type": "openapi"` for API contracts)
+- Consumer repos query provider APIs; typed links enable contract-driven cross-boundary resolution instead of heuristic name-matching
+- All observations tagged with `repo_alias` so memory stays scoped when working across repos
+- MCP tools accept optional `repos` parameter to scope or fan-out queries
+- VS Code `.code-workspace` file auto-detection for zero-config multi-root
+- Machine-level shared cross-repo registry (separate from per-repo indexes) for fast cross-root symbol lookup
+
 ---
 
 **#18 — 9f Project rules** · High effort
@@ -942,14 +950,53 @@ Tools are namespaced by server name (`cs-frontend__run_pipeline` etc.) — Claud
 automatically from context. Cross-codebase queries (e.g. "how does frontend call backend's
 auth?") require two tool calls, one per server.
 
-**Future work:** native multi-root support — single server, multiple `CS_WORKSPACE` paths,
+**Future work:** native multi-root support — single server, multiple workspace roots,
 aggregated symbol graph with per-root namespacing in FQNs, cross-root edge resolution.
-Design notes:
-- `EngineConfig` gains `workspace_roots: Vec<PathBuf>`; each root indexed into the same graph
-  with FQNs prefixed by root alias (e.g. `backend::src/auth.rs::validate`)
-- Single SQLite DB aggregates all roots; `files` table gains a `root` column
-- `run_pipeline` accepts optional `root` filter to scope results
-- CLI: `codesurgeon index --root /projects/frontend --root /projects/backend`
+
+Design informed by vexp's multi-repo model:
+
+**Configuration — `workspace.json`**
+```json
+{
+  "repos": [
+    {
+      "alias": "frontend",
+      "path": "/projects/frontend",
+      "languages": ["typescript", "tsx"],
+      "role": "consumer",
+      "cross_repo_links": [
+        { "alias": "backend", "type": "openapi", "spec": "./openapi/backend.yaml" }
+      ]
+    },
+    {
+      "alias": "backend",
+      "path": "/projects/backend",
+      "languages": ["rust"],
+      "role": "provider"
+    }
+  ]
+}
+```
+
+- **Consumer/provider roles**: provider repos expose public APIs; consumer repos query them.
+  Role tagging lets the ranker boost provider symbols when a consumer repo query crosses the boundary.
+- **Typed `cross_repo_links`**: `"type": "openapi"` (or `grpc`, `graphql`, `ts-types`) enables
+  contract-driven cross-boundary resolution — resolves to the actual schema definition rather
+  than heuristic name-matching across repos.
+- **`repos` parameter on MCP tools**: `run_pipeline(task="...", repos=["frontend","backend"])`
+  fans out to both indexes and merges capsules; omitting it defaults to all roots.
+- **`repo_alias` on observations**: every saved observation is tagged with its originating repo
+  alias so `get_session_context` can filter memories to the relevant repo.
+- **VS Code `.code-workspace` auto-detection**: if a `.code-workspace` file exists alongside
+  `workspace.json`, parse its `folders` array for zero-config multi-root setup.
+- **Machine-level cross-repo registry**: separate from per-repo SQLite indexes; holds cross-repo
+  FQN → path mappings so a single lookup resolves symbols without loading all repo indexes.
+
+**Core schema changes:**
+- `EngineConfig` gains `workspace_roots: Vec<(alias: String, path: PathBuf, role: RepoRole)>`
+- `files` table gains `repo_alias TEXT` column; FQNs prefixed: `backend::src/auth.rs::validate`
+- `run_pipeline` accepts optional `repos: Vec<String>` to scope or fan-out queries
+- CLI: `codesurgeon index --workspace workspace.json`
 
 ### Post-Phase-6 — Embeddings: metal-candle upgrade (deferred)
 Consider swapping `fastembed` for `metal-candle` (`embeddings` feature) after Phase 6 ships:
