@@ -416,38 +416,103 @@ async fn main() -> Result<()> {
 /// `Content-Length:` the message is read using LSP framing; otherwise the line
 /// itself is the JSON body.  Responses are **always** written with Content-Length
 /// framing because Codex requires it and Claude Code accepts it per the MCP spec.
+/// How long the server waits for a message before checking if the parent is still alive.
+/// This is NOT an idle timeout — the server only exits if the parent process has died.
+const PARENT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Maximum time with zero messages AND a dead parent before self-terminating.
+/// Protects against orphaned processes when the MCP client crashes.
+const ORPHAN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Check whether our parent process is still alive.
+/// On Unix, when the parent dies we get reparented to PID 1 (init/launchd).
+fn parent_is_alive() -> bool {
+    // Safety: getppid() is always safe on Unix.
+    let ppid = unsafe { libc::getppid() };
+    ppid > 1 // PID 1 = reparented to init → parent is dead
+}
+
 async fn run_stdio_loop(cell: EngineCell) {
-    let mut stdin_reader = std::io::BufReader::new(std::io::stdin());
+    // Move stdin into a dedicated blocking thread. Messages are sent back via a channel.
+    // This lets us add a timeout around reads to detect orphaned processes.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Option<(String, transport::Format)>, std::io::Error>>(8);
+
+    std::thread::spawn(move || {
+        let mut stdin_reader = std::io::BufReader::new(std::io::stdin());
+        loop {
+            let result = transport::read_message(&mut stdin_reader);
+            let is_eof = matches!(&result, Ok(None));
+            let is_err = result.is_err();
+            if tx.blocking_send(result).is_err() {
+                break; // receiver dropped — main loop exited
+            }
+            if is_eof || is_err {
+                break;
+            }
+        }
+    });
+
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut idle_since: Option<tokio::time::Instant> = None;
 
     loop {
-        let (message, fmt) = match transport::read_message(&mut stdin_reader) {
-            Ok(Some(m)) => m,
-            Ok(None) => break, // EOF — client closed the connection
-            Err(e) => {
+        // Wait for the next message with a timeout so we can check parent liveness.
+        let msg = tokio::time::timeout(PARENT_CHECK_INTERVAL, rx.recv()).await;
+
+        match msg {
+            Ok(Some(Ok(Some((message, fmt))))) => {
+                // Got a message — reset idle timer.
+                idle_since = None;
+
+                if message.is_empty() {
+                    continue;
+                }
+
+                let response = handle_message(cell.get(), &message).await;
+
+                if let Some(resp) = response {
+                    let json = match serde_json::to_string(&resp) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            tracing::error!("Failed to serialize response: {}", e);
+                            continue;
+                        }
+                    };
+                    if let Err(e) = transport::write_message(&mut out, &json, fmt) {
+                        tracing::error!("stdout write error: {}", e);
+                        break;
+                    }
+                }
+            }
+            Ok(Some(Ok(None))) => {
+                // EOF — client closed the connection cleanly.
+                break;
+            }
+            Ok(Some(Err(e))) => {
                 tracing::error!("stdin read error: {}", e);
                 break;
             }
-        };
-
-        if message.is_empty() {
-            continue;
-        }
-
-        let response = handle_message(cell.get(), &message).await;
-
-        if let Some(resp) = response {
-            let json = match serde_json::to_string(&resp) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::error!("Failed to serialize response: {}", e);
-                    continue;
-                }
-            };
-            if let Err(e) = transport::write_message(&mut out, &json, fmt) {
-                tracing::error!("stdout write error: {}", e);
+            Ok(None) => {
+                // Channel closed — stdin reader thread exited.
                 break;
+            }
+            Err(_) => {
+                // Timeout — no message received within PARENT_CHECK_INTERVAL.
+                // Check if our parent process is still alive.
+                if !parent_is_alive() {
+                    let idle_start = idle_since.get_or_insert_with(tokio::time::Instant::now);
+                    if idle_start.elapsed() >= ORPHAN_TIMEOUT {
+                        tracing::warn!(
+                            "Parent process dead and no messages for {}s — self-terminating",
+                            ORPHAN_TIMEOUT.as_secs()
+                        );
+                        break;
+                    }
+                } else {
+                    // Parent is alive, just no messages — reset idle timer.
+                    idle_since = None;
+                }
             }
         }
     }
