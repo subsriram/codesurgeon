@@ -132,6 +132,27 @@ impl Drop for Session {
     }
 }
 
+impl Session {
+    /// Poll `index_status` until the engine is ready (response text does not
+    /// contain the "still initializing" sentinel).  Gives up after ~2 seconds.
+    fn wait_for_engine_ready(&mut self) {
+        for _ in 0..40 {
+            self.send(
+                r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"index_status","arguments":{}}}"#,
+            );
+            let resp = self.recv();
+            let text = resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
+            if !text.contains("still initializing") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("engine did not become ready within timeout");
+    }
+}
+
 // ── Invariant tests ───────────────────────────────────────────────────────────
 
 /// Every response must carry `"jsonrpc": "2.0"`.
@@ -336,4 +357,180 @@ fn tools_list_returns_tools() {
     assert!(resp["error"].is_null(), "tools/list returned error: {resp}");
     let tools = resp["result"]["tools"].as_array().expect("no tools array");
     assert!(!tools.is_empty(), "tools/list returned an empty array");
+}
+
+/// Malformed JSON (partial message) must return -32700 Parse error, not crash.
+#[test]
+fn malformed_json_returns_parse_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new_in(&dir);
+    s.handshake();
+    s.send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list" INVALID"#);
+    let resp = s.recv();
+    assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32700),
+        "expected -32700 Parse error for malformed JSON, got: {resp}"
+    );
+}
+
+/// `prompts/list` must return an empty prompts array, not a -32601 error.
+/// Newer MCP clients probe this method on startup.
+#[test]
+fn prompts_list_returns_empty_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new_in(&dir);
+    s.handshake();
+    s.send(r#"{"jsonrpc":"2.0","id":2,"method":"prompts/list","params":{}}"#);
+    let resp = s.recv();
+    assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
+    assert!(
+        resp["error"].is_null(),
+        "prompts/list returned error: {resp}"
+    );
+    assert!(
+        resp["result"]["prompts"].is_array(),
+        "prompts/list result missing 'prompts' array: {resp}"
+    );
+}
+
+/// `tools/call` with an unknown tool name must return an error, not crash.
+#[test]
+fn tools_call_unknown_tool_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new_in(&dir);
+    s.handshake();
+    s.wait_for_engine_ready();
+    s.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#,
+    );
+    let resp = s.recv();
+    assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
+    // Server maps unknown tool to an internal error (-32603).
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32603),
+        "expected -32603 for unknown tool, got: {resp}"
+    );
+}
+
+/// `tools/call` with a missing required argument must return an error, not crash.
+#[test]
+fn tools_call_missing_required_arg_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new_in(&dir);
+    s.handshake();
+    s.wait_for_engine_ready();
+    // `run_pipeline` requires a `task` argument.
+    s.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_pipeline","arguments":{}}}"#,
+    );
+    let resp = s.recv();
+    assert_eq!(resp["jsonrpc"].as_str(), Some("2.0"), "{resp}");
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32603),
+        "expected -32603 for missing 'task' arg, got: {resp}"
+    );
+}
+
+/// Two concurrent sessions against the same workspace must both be able to call
+/// `tools/list` — the second instance must not be killed by the PID lock and must
+/// serve requests normally.
+#[test]
+fn concurrent_sessions_both_serve_tools_list() {
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    let dir_path = dir.path().to_path_buf();
+    let h1 = thread::spawn(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        // Use a separate tempdir so each thread owns its Session.
+        let mut child = std::process::Command::new(BIN)
+            .env("CS_WORKSPACE", &dir_path)
+            .env("CS_LOG", "error")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t1","version":"0"}}}"#;
+        stdin.write_all(&encode_framed(init)).unwrap();
+        stdin.flush().unwrap();
+        let resp1 = decode_framed(&mut stdout);
+
+        stdin
+            .write_all(&encode_framed(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+            ))
+            .unwrap();
+        stdin.flush().unwrap();
+
+        stdin
+            .write_all(&encode_framed(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            ))
+            .unwrap();
+        stdin.flush().unwrap();
+        let resp2 = decode_framed(&mut stdout);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(tmp);
+        (resp1, resp2)
+    });
+
+    let dir_path2 = dir.path().to_path_buf();
+    let h2 = thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(BIN)
+            .env("CS_WORKSPACE", &dir_path2)
+            .env("CS_LOG", "error")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t2","version":"0"}}}"#;
+        stdin.write_all(&encode_framed(init)).unwrap();
+        stdin.flush().unwrap();
+        let resp1 = decode_framed(&mut stdout);
+
+        stdin
+            .write_all(&encode_framed(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+            ))
+            .unwrap();
+        stdin.flush().unwrap();
+
+        stdin
+            .write_all(&encode_framed(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            ))
+            .unwrap();
+        stdin.flush().unwrap();
+        let resp2 = decode_framed(&mut stdout);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(tmp);
+        (resp1, resp2)
+    });
+
+    let (init1, tools1) = h1.join().expect("thread 1 panicked");
+    let (init2, tools2) = h2.join().expect("thread 2 panicked");
+
+    assert_eq!(init1["jsonrpc"].as_str(), Some("2.0"), "session1 init: {init1}");
+    assert_eq!(init2["jsonrpc"].as_str(), Some("2.0"), "session2 init: {init2}");
+    assert!(tools1["result"]["tools"].is_array(), "session1 tools/list: {tools1}");
+    assert!(tools2["result"]["tools"].is_array(), "session2 tools/list: {tools2}");
 }

@@ -1541,28 +1541,69 @@ fn heading_level(node: &Node, source: &str) -> Option<u8> {
 }
 
 fn heading_text<'a>(node: &Node, source: &'a str) -> &'a str {
-    // The inline child holds the heading text
+    // The inline child holds the heading text (ATX headings).
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "inline" {
             return node_text(&child, source);
         }
     }
-    // Fallback: strip the marker prefix from the whole node text
-    let raw = node_text(node, source);
-    raw.trim_start_matches('#').trim()
+    // Setext headings: the text is in the paragraph_content child that precedes
+    // the underline marker. Look for any child that is NOT the underline.
+    let mut cursor2 = node.walk();
+    for child in node.children(&mut cursor2) {
+        match child.kind() {
+            "setext_h1_underline" | "setext_h2_underline" | "atx_h1_marker"
+            | "atx_h2_marker" | "atx_h3_marker" | "atx_h4_marker" | "atx_h5_marker"
+            | "atx_h6_marker" => continue,
+            _ => {
+                let text = node_text(&child, source).trim();
+                if !text.is_empty() {
+                    // Safety: the returned lifetime is tied to `source`, and
+                    // `node_text` returns a slice of `source`. We trim a `&str`
+                    // that borrows `source`, so the cast is valid.
+                    return unsafe {
+                        std::str::from_utf8_unchecked(
+                            &source.as_bytes()[child.start_byte()..child.end_byte()],
+                        )
+                        .trim()
+                    };
+                }
+            }
+        }
+    }
+    // Last-resort fallback: strip ATX marker prefix and any trailing underline line.
+    let raw = node_text(node, source).trim_start_matches('#').trim();
+    // For setext: the underline is the last line; drop it.
+    if let Some(last_newline) = raw.rfind('\n') {
+        let last_line = raw[last_newline + 1..].trim();
+        if last_line.chars().all(|c| c == '=' || c == '-') && !last_line.is_empty() {
+            return raw[..last_newline].trim();
+        }
+    }
+    raw
 }
 
 fn walk_markdown(node: Node, source: &str, file_path: &str, symbols: &mut Vec<Symbol>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "section" {
-            // A section wraps a heading + its content. Walk children to find the heading.
+            // A section wraps a heading + its content.
+            //
+            // ATX headings: each sub-level gets its own nested `section` node, so
+            // only the primary heading of this section appears as a direct child.
+            //
+            // Setext headings: tree-sitter does NOT create nested sections — all
+            // headings in the document appear as siblings inside one flat section.
+            // We therefore process every heading child we encounter (no break).
             let mut inner = child.walk();
             for inner_child in child.children(&mut inner) {
                 if inner_child.kind() == "atx_heading" || inner_child.kind() == "setext_heading" {
                     let level = heading_level(&inner_child, source).unwrap_or(1);
                     let name = heading_text(&inner_child, source).trim().to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
                     let (start, _) = node_lines(&inner_child);
                     let (_, end) = node_lines(&child);
                     let sig = format!("{} {}", "#".repeat(level as usize), name);
@@ -1578,10 +1619,16 @@ fn walk_markdown(node: Node, source: &str, file_path: &str, symbols: &mut Vec<Sy
                         body,
                         Language::Markdown,
                     ));
-                    break;
+                    // For ATX headings, sub-levels live in nested sections that
+                    // walk_markdown will visit via the recursive call below.
+                    // For setext headings, siblings are peers in this section and
+                    // we must NOT break — continue the inner loop.
+                    if inner_child.kind() == "atx_heading" {
+                        break;
+                    }
                 }
             }
-            // Recurse into section for nested sections
+            // Recurse into section for nested ATX sections.
             walk_markdown(child, source, file_path, symbols);
         }
     }
@@ -1777,6 +1824,157 @@ $$ LANGUAGE plpgsql;
                 .iter()
                 .any(|s| s.name == "get_user" && s.kind == SymbolKind::Function),
             "expected get_user function"
+        );
+    }
+
+    // ── extract_args_snippet edge cases ──────────────────────────────────────
+
+    /// The function was previously panicking when a multi-byte UTF-8 character
+    /// straddled the truncation boundary. Verify it now truncates cleanly.
+    #[test]
+    fn args_snippet_truncates_at_utf8_boundary() {
+        // Each CJK character is 3 bytes; with max_chars=5 the boundary falls
+        // in the middle of the second character. The function must not panic
+        // and must produce a valid UTF-8 string shorter than the input.
+        let src = "fn f(你好世界abc) {}";
+        let bytes = src.as_bytes();
+        // Find the '(' position and step past it to get args_start.
+        let args_start = src.find('(').unwrap() + 1;
+        let result = extract_args_snippet(bytes, args_start, 5);
+        // Must not panic and must be valid UTF-8.
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        // Must be no longer than max_chars + the ellipsis.
+        assert!(result.chars().count() <= 6, "snippet too long: {:?}", result);
+    }
+
+    #[test]
+    fn args_snippet_empty_parens() {
+        let src = b"foo()";
+        // args_start points at the char after '('
+        let result = extract_args_snippet(src, 4, 60);
+        assert!(result.is_empty(), "expected empty snippet, got {:?}", result);
+    }
+
+    #[test]
+    fn args_snippet_unclosed_paren_does_not_panic() {
+        // No closing ')' — depth never reaches 0.
+        let src = b"foo(bar, baz";
+        let result = extract_args_snippet(src, 4, 60);
+        // Should return whatever it found without panicking.
+        assert!(!result.is_empty());
+    }
+
+    // ── Empty / whitespace-only files ────────────────────────────────────────
+
+    #[test]
+    fn empty_file_python() {
+        let symbols = extract_python("empty.py", "").expect("python parse");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_python() {
+        let symbols = extract_python("blank.py", "   \n\t\n   ").expect("python parse");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn comments_only_python() {
+        let src = "# This is a comment\n# Another comment\n";
+        let symbols = extract_python("comments.py", src).expect("python parse");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn empty_file_rust() {
+        let symbols = extract_rust("empty.rs", "").expect("rust parse");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn empty_file_shell() {
+        let symbols = extract_shell("empty.sh", "").expect("shell parse");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn empty_file_sql() {
+        let symbols = extract_sql("empty.sql", "").expect("sql parse");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn empty_file_markdown() {
+        let symbols = extract_markdown("empty.md", "").expect("md parse");
+        assert!(symbols.is_empty());
+    }
+
+    // ── Unicode / multi-byte identifiers ─────────────────────────────────────
+
+    /// Python allows Unicode identifiers; ensure the indexer doesn't panic or
+    /// silently drop the symbol.
+    #[test]
+    fn python_unicode_function_name() {
+        let src = "def 処理する(x):\n    return x\n";
+        let symbols = extract_python("unicode.py", src).expect("python parse");
+        assert!(
+            symbols.iter().any(|s| s.name == "処理する"),
+            "expected Unicode function name to be indexed; got: {:?}",
+            symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Rust identifiers can include Unicode letters; ensure no panic.
+    #[test]
+    fn rust_unicode_struct_name() {
+        // Rust supports non-ASCII identifiers (RFC 2457).
+        let src = "pub struct Häuser { pub count: u32 }\n";
+        let symbols = extract_rust("unicode.rs", src).expect("rust parse");
+        assert!(
+            symbols.iter().any(|s| s.name == "Häuser"),
+            "expected Unicode struct name; got: {:?}",
+            symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Call edges where the args string contains multi-byte UTF-8 must not panic.
+    #[test]
+    fn call_edges_with_multibyte_utf8_args() {
+        let src = r#"
+fn caller() {
+    process("你好", 42);
+}
+fn process(s: &str, n: i32) {}
+"#;
+        let symbols = extract_rust("lib.rs", src).expect("rust parse");
+        // extract_call_edges must not panic on multibyte args.
+        let edges = extract_call_edges(&symbols);
+        let process_sym = symbols.iter().find(|s| s.name == "process").unwrap();
+        let caller_sym = symbols.iter().find(|s| s.name == "caller").unwrap();
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.from_id == caller_sym.id && e.to_id == process_sym.id),
+            "expected Calls edge from caller to process"
+        );
+    }
+
+    // ── Markdown setext headings ──────────────────────────────────────────────
+
+    /// Setext-style headings (underlined with `===` or `---`) must be indexed.
+    #[test]
+    fn markdown_setext_headings() {
+        let src = "Top Level\n=========\n\nSome text.\n\nSubsection\n-----------\n\nMore text.\n";
+        let symbols = extract_markdown("setext.md", src).expect("md parse");
+        assert!(
+            symbols.iter().any(|s| s.name == "Top Level"),
+            "expected setext h1 'Top Level'; got: {:?}",
+            symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "Subsection"),
+            "expected setext h2 'Subsection'; got: {:?}",
+            symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
 }

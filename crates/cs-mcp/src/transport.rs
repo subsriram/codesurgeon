@@ -213,4 +213,38 @@ mod tests {
             err
         );
     }
+
+    #[test]
+    fn rejects_non_numeric_content_length() {
+        let raw = b"Content-Length: abc\r\n\r\n{}";
+        let mut r = BufReader::new(&raw[..]);
+        let err = read_message(&mut r).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("Invalid Content-Length"),
+            "expected invalid Content-Length error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_non_utf8_body() {
+        // Body declared as 3 bytes but contains invalid UTF-8.
+        let mut raw = b"Content-Length: 3\r\n\r\n".to_vec();
+        raw.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // not valid UTF-8
+        let mut r = BufReader::new(raw.as_slice());
+        let err = read_message(&mut r).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn eof_mid_body_returns_error() {
+        // Declares 100 bytes but provides only 5.
+        let raw = b"Content-Length: 100\r\n\r\nhello";
+        let mut r = BufReader::new(&raw[..]);
+        assert!(
+            read_message(&mut r).is_err(),
+            "expected error when body is truncated"
+        );
+    }
 }

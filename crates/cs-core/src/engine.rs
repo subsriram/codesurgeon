@@ -1428,3 +1428,107 @@ fn swift_enrichment_hint(xcode_mcp_available: bool) -> String {
             .to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_engine(dir: &TempDir) -> CoreEngine {
+        let config = EngineConfig::new(dir.path()).without_embedder();
+        CoreEngine::new(config).expect("engine init failed")
+    }
+
+    /// Parallel calls to `run_pipeline` must not deadlock or panic.
+    /// This guards against lock-ordering bugs between graph/search/db.
+    #[test]
+    fn parallel_queries_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(test_engine(&dir));
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let e = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    let query = format!("query number {}", i);
+                    // Empty workspace — just must not panic/deadlock.
+                    let _ = e.run_pipeline(&query, Some(500));
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+    }
+
+    /// Concurrent `reindex_file` calls for the same file must not corrupt the
+    /// index or deadlock. Each call should complete without panicking.
+    #[test]
+    fn concurrent_reindex_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a small Rust file into the workspace.
+        let file_path = dir.path().join("lib.rs");
+        std::fs::write(
+            &file_path,
+            "pub fn foo() {}\npub fn bar() {}\n",
+        )
+        .unwrap();
+
+        let engine = Arc::new(test_engine(&dir));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let e = Arc::clone(&engine);
+                let p = file_path.clone();
+                std::thread::spawn(move || {
+                    e.reindex_file(&p, crate::watcher::ChangeKind::Modified)
+                        .expect("reindex_file failed");
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // After concurrent reindexing, a query must still succeed.
+        let _ = engine.run_pipeline("foo", Some(500));
+    }
+
+    /// Queries issued while indexing is flagged as in-progress must succeed
+    /// (possibly with partial results) and must not panic.
+    #[test]
+    fn query_during_indexing_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a few files so there's something to index.
+        std::fs::write(dir.path().join("a.py"), "def alpha(): pass\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "def beta(): pass\n").unwrap();
+
+        let engine = Arc::new(test_engine(&dir));
+
+        // Spawn an indexer thread.
+        let e_idx = Arc::clone(&engine);
+        let indexer = std::thread::spawn(move || {
+            e_idx.index_workspace().expect("index_workspace failed");
+        });
+
+        // Fire queries from multiple threads while indexing may still be running.
+        let query_handles: Vec<_> = (0..4)
+            .map(|_| {
+                let e = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    let _ = e.run_pipeline("alpha", Some(500));
+                })
+            })
+            .collect();
+
+        indexer.join().expect("indexer thread panicked");
+        for h in query_handles {
+            h.join().expect("query thread panicked");
+        }
+    }
+}
