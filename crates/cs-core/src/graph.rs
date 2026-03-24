@@ -9,6 +9,10 @@ pub struct CodeGraph {
     graph: DiGraph<Symbol, EdgeKind>,
     /// Map from Symbol.id → NodeIndex for fast lookup
     id_to_idx: HashMap<u64, NodeIndex>,
+    /// Cached centrality scores (symbol id → score). Invalidated on mutation.
+    centrality_cache: Option<HashMap<u64, f32>>,
+    /// Cached family in-degree scores (symbol id → score). Invalidated on mutation.
+    family_in_degree_cache: Option<HashMap<u64, f32>>,
 }
 
 impl CodeGraph {
@@ -16,7 +20,73 @@ impl CodeGraph {
         CodeGraph {
             graph: DiGraph::new(),
             id_to_idx: HashMap::new(),
+            centrality_cache: None,
+            family_in_degree_cache: None,
         }
+    }
+
+    /// Invalidate cached scores. Called after any graph mutation.
+    fn invalidate_caches(&mut self) {
+        self.centrality_cache = None;
+        self.family_in_degree_cache = None;
+    }
+
+    /// Populate centrality and family in-degree caches in a single O(V+E) pass.
+    pub fn warm_caches(&mut self) {
+        // Centrality cache
+        let centrality: HashMap<u64, f32> = self
+            .id_to_idx
+            .iter()
+            .map(|(&id, &idx)| {
+                let in_deg = self
+                    .graph
+                    .neighbors_directed(idx, Direction::Incoming)
+                    .count() as f32;
+                let out_deg = self
+                    .graph
+                    .neighbors_directed(idx, Direction::Outgoing)
+                    .count() as f32;
+                let raw = in_deg * 2.0 + out_deg;
+                (id, raw / (raw + 15.0))
+            })
+            .collect();
+        self.centrality_cache = Some(centrality);
+
+        // Family in-degree cache: aggregate method in-degrees under parent type
+        // First, compute raw in-degrees for every node
+        let in_degrees: HashMap<u64, u32> = self
+            .id_to_idx
+            .iter()
+            .map(|(&id, &idx)| {
+                let in_deg = self
+                    .graph
+                    .neighbors_directed(idx, Direction::Incoming)
+                    .count() as u32;
+                (id, in_deg)
+            })
+            .collect();
+
+        // Collect type names and their in-degrees
+        let type_names: Vec<(u64, String, u32)> = self
+            .graph
+            .node_weights()
+            .filter(|s| s.kind.is_type_definition() || s.kind == crate::symbol::SymbolKind::Module)
+            .map(|s| (s.id, s.name.clone(), *in_degrees.get(&s.id).unwrap_or(&0)))
+            .collect();
+
+        let mut family_scores: HashMap<u64, f32> = HashMap::new();
+        for (type_id, type_name, own_in) in &type_names {
+            let prefix = format!("{}::", type_name);
+            let method_in: u32 = self
+                .graph
+                .node_weights()
+                .filter(|s| s.name.starts_with(&prefix))
+                .map(|s| in_degrees.get(&s.id).copied().unwrap_or(0))
+                .sum();
+            let total = (*own_in + method_in) as f32;
+            family_scores.insert(*type_id, total / (total + 5.0));
+        }
+        self.family_in_degree_cache = Some(family_scores);
     }
 
     // ── Mutation ──────────────────────────────────────────────────────────────
@@ -25,11 +95,13 @@ impl CodeGraph {
         if let Some(&existing) = self.id_to_idx.get(&symbol.id) {
             // Update in place if re-indexed
             self.graph[existing] = symbol;
+            self.invalidate_caches();
             return existing;
         }
         let id = symbol.id;
         let idx = self.graph.add_node(symbol);
         self.id_to_idx.insert(id, idx);
+        self.invalidate_caches();
         idx
     }
 
@@ -40,6 +112,7 @@ impl CodeGraph {
             // Avoid duplicate edges
             if !self.graph.contains_edge(from_idx, to_idx) {
                 self.graph.add_edge(from_idx, to_idx, kind);
+                self.invalidate_caches();
             }
         }
     }
@@ -72,6 +145,7 @@ impl CodeGraph {
                 }
             }
         }
+        self.invalidate_caches();
     }
 
     // ── Query ─────────────────────────────────────────────────────────────────
@@ -130,9 +204,12 @@ impl CodeGraph {
             .collect()
     }
 
-    /// Compute a simple degree-based centrality score (combined in+out).
-    /// High-centrality nodes are "pivot" candidates.
+    /// Degree-based centrality score (combined in+out).
+    /// Returns cached value if available, otherwise computes on the fly.
     pub fn centrality_score(&self, id: u64) -> f32 {
+        if let Some(cache) = &self.centrality_cache {
+            return cache.get(&id).copied().unwrap_or(0.0);
+        }
         let idx = match self.id_to_idx.get(&id) {
             Some(&i) => i,
             None => return 0.0,
@@ -145,7 +222,6 @@ impl CodeGraph {
             .graph
             .neighbors_directed(idx, Direction::Outgoing)
             .count() as f32;
-        // Sigmoid-like normalization independent of workspace size.
         let raw = in_degree * 2.0 + out_degree;
         raw / (raw + 15.0)
     }
@@ -167,12 +243,11 @@ impl CodeGraph {
     }
 
     /// Family in-degree: in-degree of a type PLUS the in-degrees of all its methods.
-    /// This is the right centrality signal for type definitions because call edges
-    /// go to methods (PDFLibrary::addDocument), not to the class type itself.
-    /// A class with in-degree=11 but whose methods receive 130 calls scores correctly
-    /// as more central than a data model with in-degree=100 but no method callers.
-    /// Matches methods by name prefix: methods of `Foo` have name `Foo::methodName`.
+    /// Returns cached value if available, otherwise computes on the fly.
     pub fn family_in_degree_score(&self, id: u64) -> f32 {
+        if let Some(cache) = &self.family_in_degree_cache {
+            return cache.get(&id).copied().unwrap_or(0.0);
+        }
         let sym = match self.id_to_idx.get(&id).map(|&idx| &self.graph[idx]) {
             Some(s) => s,
             None => return 0.0,
@@ -205,7 +280,6 @@ impl CodeGraph {
             .sum();
 
         let total = (own_in + method_in) as f32;
-        // k=5 consistent with in_degree_score
         total / (total + 5.0)
     }
 

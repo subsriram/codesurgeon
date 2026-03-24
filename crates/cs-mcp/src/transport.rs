@@ -48,6 +48,18 @@ pub fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<(String
                 )
             })?;
 
+            // Guard against unbounded allocation from a malicious or buggy client.
+            const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+            if len > MAX_MESSAGE_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Content-Length {} exceeds maximum allowed message size ({} bytes)",
+                        len, MAX_MESSAGE_SIZE
+                    ),
+                ));
+            }
+
             // Consume remaining headers until the mandatory blank separator line.
             loop {
                 let mut h = String::new();
@@ -187,5 +199,18 @@ mod tests {
         write_message(&mut buf, json, Format::ContentLength).unwrap();
         let mut r = BufReader::new(buf.as_slice());
         assert_eq!(read_message(&mut r).unwrap().unwrap().0, json);
+    }
+
+    #[test]
+    fn rejects_oversized_content_length() {
+        let raw = b"Content-Length: 999999999999\r\n\r\n";
+        let mut r = BufReader::new(&raw[..]);
+        let err = read_message(&mut r).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "expected size limit error, got: {}",
+            err
+        );
     }
 }

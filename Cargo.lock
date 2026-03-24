@@ -649,6 +649,7 @@ dependencies = [
  "fastembed",
  "ignore",
  "notify",
+ "parking_lot",
  "petgraph",
  "rayon",
  "rusqlite",

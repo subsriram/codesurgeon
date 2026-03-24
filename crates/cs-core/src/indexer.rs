@@ -353,7 +353,12 @@ fn extract_args_snippet(bytes: &[u8], start: usize, max_chars: usize) -> String 
     if raw.len() <= max_chars {
         raw.to_string()
     } else {
-        format!("{}…", &raw[..max_chars])
+        // Find a valid UTF-8 char boundary at or before max_chars to avoid panic.
+        let mut boundary = max_chars;
+        while boundary > 0 && !raw.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        format!("{}…", &raw[..boundary])
     }
 }
 
@@ -431,9 +436,18 @@ fn pascal_case_identifiers(text: &str) -> Vec<String> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn make_parser(lang: &Language) -> Option<Parser> {
-    let ts_lang = lang.tree_sitter_language()?;
+    let ts_lang = match lang.tree_sitter_language() {
+        Some(l) => l,
+        None => {
+            tracing::warn!("No tree-sitter grammar available for {:?}", lang);
+            return None;
+        }
+    };
     let mut parser = Parser::new();
-    parser.set_language(&ts_lang).ok()?;
+    if let Err(e) = parser.set_language(&ts_lang) {
+        tracing::warn!("Failed to set tree-sitter language for {:?}: {}", lang, e);
+        return None;
+    }
     Some(parser)
 }
 
@@ -509,7 +523,7 @@ fn walk_python_node(
                     let name_node = func_node.child_by_field_name("name");
                     let name = name_node
                         .map(|n| node_text(&n, source))
-                        .unwrap_or("_unknown");
+                        .unwrap_or("<anonymous>");
 
                     // Check if async
                     let is_async = func_node
@@ -579,7 +593,7 @@ fn walk_python_node(
                 let name_node = child.child_by_field_name("name");
                 let name = name_node
                     .map(|n| node_text(&n, source))
-                    .unwrap_or("_unknown");
+                    .unwrap_or("<anonymous>");
                 let (start, end) = node_lines(&child);
                 let body = node_text(&child, source).to_string();
 
@@ -923,7 +937,7 @@ fn extract_shell(file_path: &str, source: &str) -> Result<Vec<Symbol>> {
             let name = child
                 .child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string())
-                .unwrap_or_else(|| "<func>".to_string());
+                .unwrap_or_else(|| "<anonymous>".to_string());
 
             let (start, end) = node_lines(&child);
             let body = node_text(&child, source).to_string();
@@ -1043,7 +1057,7 @@ fn walk_rust(
                 let name = child
                     .child_by_field_name("name")
                     .map(|n| node_text(&n, source).to_string())
-                    .unwrap_or_else(|| "<fn>".to_string());
+                    .unwrap_or_else(|| "<anonymous>".to_string());
 
                 let qualified = match impl_context {
                     Some(ctx) => format!("{}::{}", ctx, name),

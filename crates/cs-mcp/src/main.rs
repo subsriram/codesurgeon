@@ -20,6 +20,7 @@ use cs_core::{engine::EngineConfig, watcher::FileWatcher, CoreEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -250,7 +251,11 @@ fn tool_list() -> Value {
 /// so the caller can exit cleanly rather than accumulating duplicate processes.
 fn acquire_pid_lock(workspace: &Path) -> Result<PathBuf> {
     let pid_path = workspace.join(".codesurgeon").join("mcp.pid");
-    std::fs::create_dir_all(pid_path.parent().unwrap())?;
+    std::fs::create_dir_all(
+        pid_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("PID path has no parent directory: {:?}", pid_path))?,
+    )?;
 
     if let Ok(existing) = std::fs::read_to_string(&pid_path) {
         if let Ok(existing_pid) = existing.trim().parse::<u32>() {
@@ -301,6 +306,9 @@ async fn main() -> Result<()> {
     // avoid duplicate index writes.
     match acquire_pid_lock(&workspace) {
         Ok(p) => {
+            // Shutdown flag — set by signal handler, checked by file watcher.
+            let shutdown = Arc::new(AtomicBool::new(false));
+
             // Build the engine in the background so the stdio loop (and the
             // `initialize` handshake) start immediately.  Claude Code and Codex
             // both time out if the first response takes more than a few seconds;
@@ -308,6 +316,7 @@ async fn main() -> Result<()> {
             let cell: EngineCell = Arc::new(OnceLock::new());
             let cell_bg = Arc::clone(&cell);
             let workspace_bg = workspace.clone();
+            let shutdown_bg = Arc::clone(&shutdown);
 
             tokio::task::spawn_blocking(move || {
                 let config = EngineConfig::new(&workspace_bg);
@@ -342,13 +351,14 @@ async fn main() -> Result<()> {
                         }
                     };
                     tracing::info!("File watcher started for {}", workspace_bg.display());
-                    loop {
+                    while !shutdown_bg.load(Ordering::Relaxed) {
                         for event in watcher.poll(Duration::from_millis(500)) {
                             if let Err(e) = e3.reindex_file(&event.path, event.kind) {
                                 tracing::warn!("reindex_file failed for {:?}: {}", event.path, e);
                             }
                         }
                     }
+                    tracing::info!("File watcher stopped");
                 });
 
                 // Make the engine available to the stdio loop.
@@ -356,7 +366,19 @@ async fn main() -> Result<()> {
                 tracing::info!("Engine ready");
             });
 
+            // Register signal handler to clean up on SIGTERM/SIGINT.
+            let pid_path = p.clone();
+            let shutdown_signal = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("Received shutdown signal, cleaning up");
+                shutdown_signal.store(true, Ordering::Relaxed);
+                release_pid_lock(&pid_path);
+                std::process::exit(0);
+            });
+
             run_stdio_loop(cell).await;
+            shutdown.store(true, Ordering::Relaxed);
             release_pid_lock(&p);
             return Ok(());
         }

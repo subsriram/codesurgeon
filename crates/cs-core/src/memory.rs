@@ -1,7 +1,8 @@
 use crate::db::Database;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use uuid::Uuid;
 
 // ── Observation ───────────────────────────────────────────────────────────────
@@ -198,7 +199,7 @@ impl MemoryStore {
         if let Some(ref aid) = self.agent_id {
             obs = obs.with_agent(aid);
         }
-        self.db.lock().unwrap().insert_observation(&obs)?;
+        self.db.lock().insert_observation(&obs)?;
         Ok(())
     }
 
@@ -212,7 +213,7 @@ impl MemoryStore {
             None,
             ObservationKind::Passive,
         );
-        self.db.lock().unwrap().insert_observation(&obs)?;
+        self.db.lock().insert_observation(&obs)?;
 
         // Check for file thrashing
         if self.thrash_tracker.record_edit(file_path) {
@@ -227,7 +228,7 @@ impl MemoryStore {
                 None,
                 ObservationKind::FileThrash,
             );
-            self.db.lock().unwrap().insert_observation(&thrash_obs)?;
+            self.db.lock().insert_observation(&thrash_obs)?;
             tracing::warn!("File thrash detected: {}", file_path);
         }
 
@@ -253,7 +254,7 @@ impl MemoryStore {
                 None,
                 ObservationKind::DeadEnd,
             );
-            self.db.lock().unwrap().insert_observation(&obs)?;
+            self.db.lock().insert_observation(&obs)?;
             tracing::warn!("Dead-end exploration detected for: {}", fqn);
         }
         Ok(())
@@ -263,7 +264,6 @@ impl MemoryStore {
     pub fn check_and_mark_stale(&self, symbol_fqn: &str, new_hash: &str) -> Result<u64> {
         self.db
             .lock()
-            .unwrap()
             .mark_stale_by_symbol_hash(symbol_fqn, new_hash)
     }
 
@@ -271,13 +271,12 @@ impl MemoryStore {
     pub fn get_session_observations(&self) -> Result<Vec<Observation>> {
         self.db
             .lock()
-            .unwrap()
             .get_session_observations(&self.session_id)
     }
 
     /// Retrieve recent observations across all sessions (for cross-session context).
     pub fn get_recent_observations(&self, limit: usize) -> Result<Vec<Observation>> {
-        self.db.lock().unwrap().get_recent_observations(limit)
+        self.db.lock().get_recent_observations(limit)
     }
 
     pub fn session_id(&self) -> &str {

@@ -46,6 +46,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Parallel indexing
 rayon = "1"
 
+# Synchronization (non-poisoning, faster than std)
+parking_lot = "0.12"
+
 # File hashing
 blake3 = "1"
 

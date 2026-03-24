@@ -9,6 +9,28 @@ use tantivy::{
     Index, IndexWriter, ReloadPolicy,
 };
 
+// ── Rerank constants ─────────────────────────────────────────────────────────
+// See docs/ranking.md for rationale. Update both when tuning.
+
+/// Boost per query term found in symbol name.
+const NAME_TERM_BOOST: f32 = 2.0;
+/// Boost per query term found in symbol signature.
+const SIG_TERM_BOOST: f32 = 1.0;
+/// Boost per query term found in symbol body.
+const BODY_TERM_BOOST: f32 = 0.3;
+/// Score multiplier for test/spec/mock files.
+const TEST_FILE_PENALTY: f32 = 0.25;
+/// Score multiplier for utility scripts (check-*, run-*, etc.).
+const UTILITY_FILE_PENALTY: f32 = 0.3;
+/// Type definition boost for Structural/Explore intent.
+const TYPE_DEF_BOOST: f32 = 2.5;
+/// Impl block boost for Structural/Explore intent.
+const IMPL_BOOST: f32 = 1.5;
+/// Callable penalty for Structural/Explore intent.
+const CALLABLE_PENALTY: f32 = 0.6;
+/// Markdown language boost.
+const MARKDOWN_BOOST: f32 = 1.5;
+
 /// Wraps a Tantivy in-RAM index for BM25 full-text search over symbols.
 /// Complements the SQLite FTS5 search with richer scoring.
 pub struct SearchIndex {
@@ -158,13 +180,13 @@ impl SearchIndex {
                         let body_lower = sym.body.to_lowercase();
                         for term in &query_terms {
                             if name_lower.contains(term) {
-                                b += 2.0;
+                                b += NAME_TERM_BOOST;
                             }
                             if sig_lower.contains(term) {
-                                b += 1.0;
+                                b += SIG_TERM_BOOST;
                             }
                             if body_lower.contains(term) {
-                                b += 0.3;
+                                b += BODY_TERM_BOOST;
                             }
                         }
 
@@ -174,7 +196,7 @@ impl SearchIndex {
                             || path_lower.contains("mock")
                             || path_lower.contains("uitest");
                         if is_test {
-                            b *= 0.25;
+                            b *= TEST_FILE_PENALTY;
                         }
 
                         // Utility script penalty — check-*, run-*, setup*, generate*, etc.
@@ -186,18 +208,18 @@ impl SearchIndex {
                             || filename.starts_with("build-")
                             || filename.starts_with("deploy-");
                         if is_utility {
-                            b *= 0.3;
+                            b *= UTILITY_FILE_PENALTY;
                         }
 
                         // For Structural/Explore intents: boost type definitions, reduce raw callables
                         match intent {
                             SearchIntent::Structural | SearchIntent::Explore => {
                                 if sym.kind.is_type_definition() {
-                                    b *= 2.5;
+                                    b *= TYPE_DEF_BOOST;
                                 } else if sym.kind == SymbolKind::Impl {
-                                    b *= 1.5; // impl blocks are relevant for structure
+                                    b *= IMPL_BOOST;
                                 } else if sym.kind.is_callable() && !is_test {
-                                    b *= 0.6;
+                                    b *= CALLABLE_PENALTY;
                                 }
                             }
                             _ => {}
@@ -206,7 +228,7 @@ impl SearchIndex {
                         // Markdown docs boost — documentation sections are preferred for
                         // conceptual queries where terms appear in prose, not code names.
                         if sym.language == Language::Markdown {
-                            b *= 1.5;
+                            b *= MARKDOWN_BOOST;
                         }
 
                         b

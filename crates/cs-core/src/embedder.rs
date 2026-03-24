@@ -19,7 +19,7 @@ pub use inner::{cosine_similarity, Embedder};
 mod inner {
     use anyhow::Result;
     use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// Wraps fastembed's `TextEmbedding` behind a `Mutex` because its `embed` method
     /// requires `&mut self` while `CoreEngine` methods take `&self`.
@@ -56,7 +56,6 @@ mod inner {
         pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.model
                 .lock()
-                .unwrap()
                 .embed(texts.to_vec(), None)
                 .map_err(|e| anyhow::anyhow!("embed failed: {e}"))
         }

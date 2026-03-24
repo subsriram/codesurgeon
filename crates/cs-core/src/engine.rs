@@ -16,10 +16,37 @@ use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+
+// ── Ranking constants ────────────────────────────────────────────────────────
+// See docs/ranking.md for rationale. Update both when tuning.
+
+/// BM25 candidate pool size passed to Tantivy.
+const BM25_POOL_SIZE: usize = 50;
+/// Structural injection: score multiplier for injected hub types.
+const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
+/// Centrality boost multiplier applied to BM25 score.
+const CENTRALITY_BOOST: f32 = 3.0;
+/// Fixed boost for markdown symbols (bypasses centrality which is always 0).
+const MARKDOWN_CENTRALITY_BYPASS: f32 = 2.5;
+/// Weight of BM25+centrality in the final blend (when embeddings are available).
+#[cfg(feature = "embeddings")]
+const BM25_BLEND_WEIGHT: f32 = 0.5;
+/// Weight of semantic cosine similarity in the final blend.
+#[cfg(feature = "embeddings")]
+const SEMANTIC_BLEND_WEIGHT: f32 = 0.5;
+/// Structural re-sort: in-degree weight (dominant signal).
+const STRUCTURAL_INDEGREE_WEIGHT: f32 = 20.0;
+/// Structural re-sort: accumulated BM25 weight (tiebreaker).
+const STRUCTURAL_BM25_WEIGHT: f32 = 0.05;
+/// Coordinator bonus per owned seed type.
+const COORDINATOR_BONUS_PER_TYPE: f32 = 5.0;
+/// Minimum owned seed types required to trigger coordinator bonus.
+const COORDINATOR_MIN_OWNED: usize = 2;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 #[cfg(feature = "embeddings")]
 fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
@@ -165,9 +192,9 @@ impl CoreEngine {
         // Warm the in-memory graph and tantivy index from the persisted SQLite DB.
         // Without this, every fresh process starts with 0 pivots on every search.
         {
-            let db_guard = db.lock().unwrap();
-            let mut graph_guard = graph.write().unwrap();
-            let mut search_guard = search.lock().unwrap();
+            let db_guard = db.lock();
+            let mut graph_guard = graph.write();
+            let mut search_guard = search.lock();
 
             let symbols = db_guard.all_symbols()?;
             for sym in &symbols {
@@ -181,6 +208,7 @@ impl CoreEngine {
             }
 
             search_guard.commit()?;
+            graph_guard.warm_caches();
             tracing::info!(
                 "Warmed index: {} symbols, {} edges",
                 symbols.len(),
@@ -212,7 +240,7 @@ impl CoreEngine {
         // Warm the embedding cache from any previously stored embeddings.
         #[cfg(feature = "embeddings")]
         let embedding_cache = {
-            let cached = db.lock().unwrap().all_embeddings().unwrap_or_default();
+            let cached = db.lock().all_embeddings().unwrap_or_default();
             Arc::new(RwLock::new(cached))
         };
 
@@ -293,7 +321,7 @@ impl CoreEngine {
         // Batching into one transaction is 10–50x faster than autocommit per-row
         // and keeps the write lock held for a much shorter total duration.
         {
-            let db = self.db.lock().unwrap();
+            let db = self.db.lock();
             db.begin_transaction()?;
             for (rel, file_hash, symbols) in &file_data {
                 db.upsert_file(rel, file_hash)?;
@@ -313,8 +341,8 @@ impl CoreEngine {
 
         // Update in-memory graph and search index (no db lock held).
         {
-            let mut graph = self.graph.write().unwrap();
-            let mut search = self.search.lock().unwrap();
+            let mut graph = self.graph.write();
+            let mut search = self.search.lock();
             for (rel, _, symbols) in &file_data {
                 graph.remove_file(rel);
                 for sym in symbols {
@@ -326,6 +354,7 @@ impl CoreEngine {
                 graph.add_edge(edge.from_id, edge.to_id, edge.kind.clone());
             }
             search.commit()?;
+            graph.warm_caches();
         } // graph + search locks released here
 
         // Embed symbols in batches of 64 (only when embeddings feature is enabled).
@@ -363,7 +392,7 @@ impl CoreEngine {
                 .collect();
 
             {
-                let db = self.db.lock().unwrap();
+                let db = self.db.lock();
                 db.begin_transaction()?;
                 for (chunk_syms, chunk_texts) in all_symbols.chunks(64).zip(skeletons.chunks(64)) {
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
@@ -399,11 +428,11 @@ impl CoreEngine {
 
         // Phase 1: Remove stale db rows (brief, independent db lock).
         {
-            self.db.lock().unwrap().delete_file_symbols(&rel)?;
+            self.db.lock().delete_file_symbols(&rel)?;
         }
         // Phase 2: Remove from in-memory graph (brief, independent graph lock).
         {
-            self.graph.write().unwrap().remove_file(&rel);
+            self.graph.write().remove_file(&rel);
         }
 
         if kind == ChangeKind::Removed {
@@ -418,7 +447,7 @@ impl CoreEngine {
         // Phase 4: Write new rows to SQLite in one transaction (brief db lock).
         // db lock is acquired fresh here — no overlap with graph/search locks.
         {
-            let db = self.db.lock().unwrap();
+            let db = self.db.lock();
             db.begin_transaction()?;
             db.upsert_file(&rel, &file_hash)?;
             for sym in &symbols {
@@ -430,18 +459,19 @@ impl CoreEngine {
 
         // Phase 5: Update in-memory graph and search (no db lock held).
         {
-            let mut graph = self.graph.write().unwrap();
-            let mut search = self.search.lock().unwrap();
+            let mut graph = self.graph.write();
+            let mut search = self.search.lock();
             for sym in &symbols {
                 graph.add_symbol(sym.clone());
                 search.index_symbol(sym)?;
             }
             search.commit()?;
+            graph.warm_caches();
         }
 
         // Phase 6: Notify memory of the change (brief, independent memory lock).
         {
-            let mut mem = self.memory.lock().unwrap();
+            let mut mem = self.memory.lock();
             let change_summary = format!("{} symbol(s) re-indexed", symbols.len());
             let _ = mem.record_file_edit(&rel, &change_summary);
         }
@@ -471,7 +501,7 @@ impl CoreEngine {
                 })
                 .collect();
             {
-                let db = self.db.lock().unwrap();
+                let db = self.db.lock();
                 db.begin_transaction()?;
                 for (chunk_syms, chunk_texts) in symbols.chunks(64).zip(skeletons.chunks(64)) {
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
@@ -534,7 +564,7 @@ impl CoreEngine {
 
     /// Get impact graph: what breaks if `symbol_fqn` changes?
     pub fn get_impact_graph(&self, symbol_fqn: &str) -> Result<ImpactResult> {
-        let graph = self.graph.read().unwrap();
+        let graph = self.graph.read();
 
         let target = graph.find_by_fqn(symbol_fqn).ok_or_else(|| {
             // Anti-hallucination: suggest similar FQNs when exact match fails
@@ -581,7 +611,7 @@ impl CoreEngine {
 
     /// Get skeleton of a file: all signatures without bodies.
     pub fn get_skeleton(&self, file_path: &str) -> Result<SkeletonResult> {
-        let graph = self.graph.read().unwrap();
+        let graph = self.graph.read();
         let symbols = graph.file_symbols(file_path);
 
         let mut total_tokens = 0u32;
@@ -609,7 +639,7 @@ impl CoreEngine {
 
     /// Trace execution path between two symbols.
     pub fn search_logic_flow(&self, from_fqn: &str, to_fqn: &str) -> Result<FlowResult> {
-        let graph = self.graph.read().unwrap();
+        let graph = self.graph.read();
 
         let from_sym = graph.find_by_fqn(from_fqn);
         let to_sym = graph.find_by_fqn(to_fqn);
@@ -645,7 +675,7 @@ impl CoreEngine {
 
     /// Index statistics and health.
     pub fn index_stats(&self) -> Result<IndexStats> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock();
         Ok(IndexStats {
             symbol_count: db.symbol_count()?,
             edge_count: db.edge_count()?,
@@ -657,20 +687,20 @@ impl CoreEngine {
 
     /// Get session observations (cross-session memory).
     pub fn get_session_context(&self) -> Result<Vec<crate::memory::Observation>> {
-        let mem = self.memory.lock().unwrap();
+        let mem = self.memory.lock();
         mem.get_recent_observations(50)
     }
 
     /// Save a manual observation.
     pub fn save_observation(&self, content: &str, symbol_fqn: Option<&str>) -> Result<()> {
-        let graph = self.graph.read().unwrap();
+        let graph = self.graph.read();
 
         // Resolve symbol hash if an FQN was provided
         let symbol_hash = symbol_fqn
             .and_then(|fqn| graph.find_by_fqn(fqn))
             .map(|sym| sym.content_hash.clone());
 
-        let mem = self.memory.lock().unwrap();
+        let mem = self.memory.lock();
         mem.save(content, symbol_fqn, symbol_hash.as_deref())
     }
 
@@ -684,7 +714,7 @@ impl CoreEngine {
             return Ok("No changed symbols detected in diff.".to_string());
         }
 
-        let graph = self.graph.read().unwrap();
+        let graph = self.graph.read();
 
         // Resolve changed symbol names/ranges → Symbol IDs
         let mut pivot_ids: Vec<u64> = Vec::new();
@@ -739,7 +769,7 @@ impl CoreEngine {
             .filter_map(|id| graph.get_symbol(*id))
             .collect();
 
-        let raw_memories = self.memory.lock().unwrap().get_recent_observations(10)?;
+        let raw_memories = self.memory.lock().get_recent_observations(10)?;
         let memory_entries: Vec<MemoryEntry> = raw_memories
             .into_iter()
             .map(|obs| MemoryEntry {
@@ -763,7 +793,7 @@ impl CoreEngine {
     /// Returns the generated markdown. If `write_files` is true, also writes
     /// CLAUDE.md files into each directory.
     pub fn generate_module_docs(&self, write_files: bool) -> Result<String> {
-        let graph = self.graph.read().unwrap();
+        let graph = self.graph.read();
 
         // Group non-import symbols by directory
         let mut by_dir: std::collections::BTreeMap<String, Vec<&Symbol>> =
@@ -900,8 +930,8 @@ impl CoreEngine {
     /// Called after every index pass so queries never need to hit the db for vectors.
     #[cfg(feature = "embeddings")]
     fn refresh_embedding_cache(&self) {
-        match self.db.lock().unwrap().all_embeddings() {
-            Ok(embs) => *self.embedding_cache.write().unwrap() = embs,
+        match self.db.lock().all_embeddings() {
+            Ok(embs) => *self.embedding_cache.write() = embs,
             Err(e) => tracing::warn!("Failed to refresh embedding cache: {}", e),
         }
     }
@@ -913,38 +943,27 @@ impl CoreEngine {
         intent: &SearchIntent,
     ) -> Result<Capsule> {
         // 1. Search for candidate symbols
-        let mut search_results = self.search.lock().unwrap().search(query, 50)?;
-        let graph = self.graph.read().unwrap();
+        let mut search_results = self.search.lock().search(query, BM25_POOL_SIZE)?;
+        let graph = self.graph.read();
 
-        // Track original BM25 IDs before injection (used for coordinator bonus below).
+        // Track original BM25 IDs before injection (used for coordinator bonus).
         let bm25_ids: std::collections::HashSet<u64> =
             search_results.iter().map(|(id, _)| *id).collect();
 
-        // For Structural intent: augment the BM25 candidate pool with the top hub types ranked
-        // by pure in-degree. BM25 cannot surface types whose names don't lexically match the
-        // query — "PDFLibrary" scores near-zero for "central state coordinator".
-        // Capped at max_pivots: with real call-graph edges, injected scores are meaningful
-        // and more than max_pivots injected types would crowd out legitimate BM25 matches.
+        // 2. Inject high-centrality types for Structural queries (BM25 can't surface them)
         if *intent == SearchIntent::Structural {
-            let mut by_in_degree: Vec<(u64, f32)> = graph
-                .all_symbols()
-                .filter(|s| s.kind.is_type_definition() || s.kind == SymbolKind::Module)
-                .map(|s| (s.id, graph.family_in_degree_score(s.id)))
-                .collect();
-            by_in_degree.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (id, c_in) in by_in_degree.into_iter().take(self.config.max_pivots * 2) {
-                if !search_results.iter().any(|(sid, _)| *sid == id) {
-                    search_results.push((id, c_in * 5.0));
-                }
-            }
+            Self::inject_structural_candidates(
+                &graph,
+                &mut search_results,
+                self.config.max_pivots,
+            );
         }
 
-        // 2. Re-rank by graph centrality + query proximity
+        // 3. Re-rank by query proximity + centrality + optional semantic similarity
         let symbols_for_rerank: Vec<&Symbol> = search_results
             .iter()
             .filter_map(|(id, _)| graph.get_symbol(*id))
             .collect();
-
         let reranked = SearchIndex::rerank_by_query_proximity(
             search_results,
             &symbols_for_rerank,
@@ -952,51 +971,128 @@ impl CoreEngine {
             intent,
         );
 
-        // 3. Boost by graph centrality, then optionally blend semantic similarity.
-        //    Final score = BM25_centraliy * 0.5 + semantic_cosine * 0.5 (when embedder present)
-        //    Falls back to BM25 + centrality only when embeddings feature is off or model failed.
-        #[cfg(feature = "embeddings")]
-        let semantic_scores: std::collections::HashMap<u64, f32> = if let Some(emb) = &self.embedder
-        {
-            match emb.embed_one(query) {
-                Ok(query_vec) => {
-                    // Read from the in-memory cache — no db lock, no contention with indexing.
-                    let cache = self.embedding_cache.read().unwrap();
-                    cache
-                        .iter()
-                        .map(|(id, vec)| (*id, cosine_similarity(&query_vec, vec)))
-                        .collect()
-                }
-                Err(e) => {
-                    tracing::warn!("query embed failed: {}", e);
-                    std::collections::HashMap::new()
-                }
-            }
+        let mut scored = self.apply_centrality_and_semantics(&graph, reranked, query);
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 4. For Structural intent: re-sort by in-degree + coordinator bonus
+        let scored = if *intent == SearchIntent::Structural {
+            Self::apply_structural_resort(&graph, scored, &bm25_ids, query)
         } else {
-            std::collections::HashMap::new()
+            scored
         };
 
-        let mut scored: Vec<(u64, f32)> = reranked
+        // 5. Deduplicate by FQN — keep the highest-scored entry per unique FQN.
+        let scored = Self::dedup_by_fqn(&graph, scored);
+
+        // 6. Select pivots and adjacents
+        let pivot_ids: Vec<u64> = scored
+            .iter()
+            .take(self.config.max_pivots)
+            .map(|(id, _)| *id)
+            .collect();
+        let adjacent_ids =
+            Self::select_adjacents(&graph, &pivot_ids, intent, self.config.max_adjacent);
+
+        // 7. Resolve IDs → Symbols with filtering
+        let filter_adjacents = matches!(intent, SearchIntent::Structural | SearchIntent::Explore);
+        let pivot_syms: Vec<&Symbol> = pivot_ids
+            .iter()
+            .filter_map(|id| graph.get_symbol(*id))
+            .collect();
+        let adjacent_syms = Self::resolve_adjacents(&graph, &adjacent_ids, filter_adjacents);
+
+        // 8. Fetch memories and assemble capsule
+        let raw_memories = self.memory.lock().get_recent_observations(20)?;
+        let memory_entries: Vec<MemoryEntry> = raw_memories
+            .into_iter()
+            .map(|obs| MemoryEntry {
+                content: obs.content,
+                symbol_fqn: obs.symbol_fqn,
+                is_stale: obs.is_stale,
+                created_at: obs.created_at,
+            })
+            .collect();
+
+        Ok(build_capsule(
+            pivot_syms,
+            adjacent_syms,
+            memory_entries,
+            budget,
+            Some(query),
+        ))
+    }
+
+    /// Augment the BM25 candidate pool with top hub types ranked by family in-degree.
+    /// BM25 cannot surface types whose names don't lexically match the query.
+    fn inject_structural_candidates(
+        graph: &CodeGraph,
+        search_results: &mut Vec<(u64, f32)>,
+        max_pivots: usize,
+    ) {
+        let mut by_in_degree: Vec<(u64, f32)> = graph
+            .all_symbols()
+            .filter(|s| s.kind.is_type_definition() || s.kind == SymbolKind::Module)
+            .map(|s| (s.id, graph.family_in_degree_score(s.id)))
+            .collect();
+        by_in_degree.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (id, c_in) in by_in_degree.into_iter().take(max_pivots * 2) {
+            if !search_results.iter().any(|(sid, _)| *sid == id) {
+                search_results.push((id, c_in * STRUCTURAL_INJECTION_SCORE));
+            }
+        }
+    }
+
+    /// Apply centrality boost and optionally blend semantic similarity scores.
+    /// Final = BM25_centrality * 0.5 + semantic_cosine * 0.5 (when embedder present).
+    fn apply_centrality_and_semantics(
+        &self,
+        graph: &CodeGraph,
+        reranked: Vec<(u64, f32)>,
+        query: &str,
+    ) -> Vec<(u64, f32)> {
+        #[cfg(feature = "embeddings")]
+        let semantic_scores: std::collections::HashMap<u64, f32> =
+            if let Some(emb) = &self.embedder {
+                match emb.embed_one(query) {
+                    Ok(query_vec) => {
+                        let cache = self.embedding_cache.read();
+                        cache
+                            .iter()
+                            .map(|(id, vec)| (*id, cosine_similarity(&query_vec, vec)))
+                            .collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!("query embed failed: {}", e);
+                        std::collections::HashMap::new()
+                    }
+                }
+            } else {
+                std::collections::HashMap::new()
+            };
+        // Suppress unused variable warning when embeddings feature is off.
+        #[cfg(not(feature = "embeddings"))]
+        let _ = query;
+
+        reranked
             .into_iter()
             .map(|(id, score)| {
                 let is_markdown = graph
                     .get_symbol(id)
                     .map(|s| s.language == Language::Markdown)
                     .unwrap_or(false);
-                // Markdown symbols have no graph edges so centrality is always 0, which means
-                // they lose badly to high-centrality code symbols (Symbol, CoreEngine, Edge).
+                // Markdown symbols have no graph edges so centrality is always 0.
                 // Apply a fixed documentation boost instead of the centrality multiplier.
                 let centrality = graph.centrality_score(id);
                 let bm25_score = if is_markdown {
-                    score * 2.5
+                    score * MARKDOWN_CENTRALITY_BYPASS
                 } else {
-                    score * (1.0 + centrality * 3.0)
+                    score * (1.0 + centrality * CENTRALITY_BOOST)
                 };
                 #[cfg(feature = "embeddings")]
                 let final_score = {
                     let sem = semantic_scores.get(&id).copied().unwrap_or(0.0);
                     if sem > 0.0 {
-                        bm25_score * 0.5 + sem * 0.5
+                        bm25_score * BM25_BLEND_WEIGHT + sem * SEMANTIC_BLEND_WEIGHT
                     } else {
                         bm25_score
                     }
@@ -1005,122 +1101,100 @@ impl CoreEngine {
                 let final_score = bm25_score;
                 (id, final_score)
             })
+            .collect()
+    }
+
+    /// For Structural intent: re-sort so type definitions ranked by in-degree come first,
+    /// with a coordinator bonus for types that declare BM25-matched types as properties.
+    fn apply_structural_resort(
+        graph: &CodeGraph,
+        scored: Vec<(u64, f32)>,
+        bm25_ids: &std::collections::HashSet<u64>,
+        query: &str,
+    ) -> Vec<(u64, f32)> {
+        let is_hub_type = |id: u64| {
+            graph
+                .get_symbol(id)
+                .map(|s| {
+                    s.kind.is_type_definition()
+                        || s.kind == SymbolKind::Impl
+                        || s.kind == SymbolKind::Module
+                })
+                .unwrap_or(false)
+        };
+
+        let mut type_scored: Vec<(u64, f32)> = scored
+            .iter()
+            .filter(|(id, _)| is_hub_type(*id))
+            .map(|(id, accumulated)| {
+                let c_in = graph.family_in_degree_score(*id);
+                (*id, c_in * STRUCTURAL_INDEGREE_WEIGHT + accumulated * STRUCTURAL_BM25_WEIGHT)
+            })
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // For Structural intent: re-sort so type definitions ranked by centrality come first.
-        // BM25 body-match alone is misleading for "what is the central X" queries — a file
-        // that merely *mentions* documents/categories/state will beat the actual hub type.
-        // Centrality (in-degree) is the right primary signal here.
-        let scored: Vec<(u64, f32)> = if *intent == SearchIntent::Structural {
-            let is_hub_type = |id: u64| {
-                graph
-                    .get_symbol(id)
-                    .map(|s| {
-                        s.kind.is_type_definition()
-                            || s.kind == SymbolKind::Impl
-                            || s.kind == SymbolKind::Module
-                    })
-                    .unwrap_or(false)
-            };
-            let mut type_scored: Vec<(u64, f32)> = scored
-                .iter()
-                .filter(|(id, _)| is_hub_type(*id))
-                .map(|(id, accumulated)| {
-                    // Use pure in-degree as dominant signal. This prevents leaf consumers
-                    // (high out-degree, low in-degree) from beating genuine hub types.
-                    // FileImportCoordinator calls PDFLibrary many times (high out-degree, few
-                    // things call FileImportCoordinator) → low in-degree → loses to PDFLibrary.
-                    let c_in = graph.family_in_degree_score(*id);
-                    (*id, c_in * 20.0 + accumulated * 0.05)
-                })
-                .collect();
-            // Coordinator bonus: find the type that DECLARES the BM25-matched types as
-            // member variables (var/let property declarations), not just classes that
-            // happen to reference them in method bodies. This uniquely identifies the
-            // class that OWNS the data (e.g. PDFLibrary declares `var documents: [PDFDocumentWrapper]`,
-            // `var readingLists: [ReadingList]`, `var categories: [ReadingCategory]`).
-            //
-            // Restricted to BM25-matched types (not centrality-injected) as seed names,
-            // and test/spec files are excluded, to avoid misfires on large utility classes.
-            // Coordinator bonus: query-weighted property ownership.
-            // Only types whose names overlap with query terms become seeds. This ensures
-            // PDFLibrary wins for "documents lists categories" because it DECLARES
-            // ReadingList/PDFDocumentWrapper/ReadingCategory as properties, while
-            // KnowledgeGraphStore (which owns KGNodePayload/KGEdgePayload — not query-relevant)
-            // does not get a boost.
-            // Seeds = types that came from BM25 results (lexically matched the query)
-            // AND whose names overlap with 4-char query stems.
-            // Using BM25-only sources prevents SwiftData ORM models (DocumentModel,
-            // CategoryModel) from matching when the query is about app-layer types
-            // (PDFDocumentWrapper, ReadingCategory) — they'd give a false coordinator
-            // bonus to PersistenceController which manages the ORM layer.
-            let query_stems: Vec<String> = query
-                .split(|c: char| !c.is_alphanumeric())
-                .filter(|t| t.len() > 3)
-                .map(|t| t[..t.len().min(4)].to_lowercase())
-                .collect();
-            let seed_names: Vec<String> = type_scored
-                .iter()
-                .filter_map(|(id, _)| {
-                    // Only BM25-matched types (not centrality-injected) as seeds
-                    if bm25_ids.contains(id) {
-                        graph.get_symbol(*id).map(|s| s.name.clone())
-                    } else {
-                        None
-                    }
-                })
-                .filter(|n| {
-                    n.len() > 4 && {
-                        let nl = n.to_lowercase();
-                        query_stems.iter().any(|stem| nl.contains(stem.as_str()))
-                    }
-                })
-                .collect();
+        // Coordinator bonus: find the type that DECLARES BM25-matched types as member
+        // variables. Seeds = BM25-matched types whose names overlap with 4-char query stems.
+        let query_stems: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() > 3)
+            .map(|t| t[..t.len().min(4)].to_lowercase())
+            .collect();
+        let seed_names: Vec<String> = type_scored
+            .iter()
+            .filter_map(|(id, _)| {
+                if bm25_ids.contains(id) {
+                    graph.get_symbol(*id).map(|s| s.name.clone())
+                } else {
+                    None
+                }
+            })
+            .filter(|n| {
+                n.len() > 4 && {
+                    let nl = n.to_lowercase();
+                    query_stems.iter().any(|stem| nl.contains(stem.as_str()))
+                }
+            })
+            .collect();
 
-            if seed_names.len() >= 2 {
-                for (id, score) in &mut type_scored {
-                    if let Some(sym) = graph.get_symbol(*id) {
-                        let path_lower = sym.file_path.to_lowercase();
-                        if path_lower.contains("test")
-                            || path_lower.contains("spec")
-                            || path_lower.contains("mock")
-                        {
-                            continue;
-                        }
-                        let owned = seed_names
-                            .iter()
-                            .filter(|name| {
-                                *name != &sym.name
-                                    && (sym.body.contains(&format!(": {}", name))
-                                        || sym.body.contains(&format!(": [{}]", name))
-                                        || sym.body.contains(&format!(": {}?", name))
-                                        || sym.body.contains(&format!("[{}]", name)))
-                            })
-                            .count();
-                        if owned >= 2 {
-                            *score += owned as f32 * 5.0;
-                        }
+        if seed_names.len() >= 2 {
+            for (id, score) in &mut type_scored {
+                if let Some(sym) = graph.get_symbol(*id) {
+                    let path_lower = sym.file_path.to_lowercase();
+                    if path_lower.contains("test")
+                        || path_lower.contains("spec")
+                        || path_lower.contains("mock")
+                    {
+                        continue;
+                    }
+                    let owned = seed_names
+                        .iter()
+                        .filter(|name| {
+                            *name != &sym.name
+                                && (sym.body.contains(&format!(": {}", name))
+                                    || sym.body.contains(&format!(": [{}]", name))
+                                    || sym.body.contains(&format!(": {}?", name))
+                                    || sym.body.contains(&format!("[{}]", name)))
+                        })
+                        .count();
+                    if owned >= COORDINATOR_MIN_OWNED {
+                        *score += owned as f32 * COORDINATOR_BONUS_PER_TYPE;
                     }
                 }
             }
+        }
 
-            type_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            // Non-type symbols come after (they become adjacents/skeletons)
-            let others: Vec<(u64, f32)> = scored
-                .into_iter()
-                .filter(|(id, _)| !is_hub_type(*id))
-                .collect();
-            type_scored.into_iter().chain(others).collect()
-        } else {
-            scored
-        };
+        type_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let others: Vec<(u64, f32)> = scored
+            .into_iter()
+            .filter(|(id, _)| !is_hub_type(*id))
+            .collect();
+        type_scored.into_iter().chain(others).collect()
+    }
 
-        // Deduplicate by FQN — keep the highest-scored entry per unique FQN.
-        // Extensions of the same type (e.g. PDFLibrary+Persistence, PDFLibrary+Organization)
-        // have distinct FQNs so they pass through; only true duplicates are collapsed.
+    /// Deduplicate by FQN — keep the highest-scored entry per unique FQN.
+    fn dedup_by_fqn(graph: &CodeGraph, scored: Vec<(u64, f32)>) -> Vec<(u64, f32)> {
         let mut seen_fqns = std::collections::HashSet::new();
-        let scored: Vec<(u64, f32)> = scored
+        scored
             .into_iter()
             .filter(|(id, _)| {
                 graph
@@ -1128,18 +1202,17 @@ impl CoreEngine {
                     .map(|sym| seen_fqns.insert(sym.fqn.clone()))
                     .unwrap_or(true)
             })
-            .collect();
+            .collect()
+    }
 
-        // 4. Top N as pivots
-        let pivot_ids: Vec<u64> = scored
-            .iter()
-            .take(self.config.max_pivots)
-            .map(|(id, _)| *id)
-            .collect();
-
-        // 5. For Debug intent: also include dependents of pivots (error paths)
-        //    For Refactor intent: include blast radius
-        let adjacent_ids: Vec<u64> = match intent {
+    /// Select adjacent symbol IDs based on the search intent.
+    fn select_adjacents(
+        graph: &CodeGraph,
+        pivot_ids: &[u64],
+        intent: &SearchIntent,
+        max_adjacent: usize,
+    ) -> Vec<u64> {
+        let raw: Vec<u64> = match intent {
             SearchIntent::Debug => pivot_ids
                 .iter()
                 .flat_map(|&id| {
@@ -1150,7 +1223,7 @@ impl CoreEngine {
                         .collect::<Vec<_>>()
                 })
                 .filter(|id| !pivot_ids.contains(id))
-                .take(self.config.max_adjacent)
+                .take(max_adjacent)
                 .collect(),
             SearchIntent::Refactor => pivot_ids
                 .iter()
@@ -1162,83 +1235,50 @@ impl CoreEngine {
                         .collect::<Vec<_>>()
                 })
                 .filter(|id| !pivot_ids.contains(id))
-                .take(self.config.max_adjacent)
+                .take(max_adjacent)
                 .collect(),
-            _ => {
-                // For other intents: include both direct deps and dependents
-                pivot_ids
-                    .iter()
-                    .flat_map(|&id| {
-                        let mut adj: Vec<u64> =
-                            graph.dependencies(id).iter().map(|s| s.id).collect();
-                        adj.extend(graph.dependents(id).iter().map(|s| s.id));
-                        adj
-                    })
-                    .filter(|id| !pivot_ids.contains(id))
-                    .take(self.config.max_adjacent)
-                    .collect()
-            }
+            _ => pivot_ids
+                .iter()
+                .flat_map(|&id| {
+                    let mut adj: Vec<u64> =
+                        graph.dependencies(id).iter().map(|s| s.id).collect();
+                    adj.extend(graph.dependents(id).iter().map(|s| s.id));
+                    adj
+                })
+                .filter(|id| !pivot_ids.contains(id))
+                .take(max_adjacent)
+                .collect(),
         };
+        // Deduplicate (same symbol may be reachable from multiple pivots).
+        let mut seen = std::collections::HashSet::new();
+        raw.into_iter().filter(|id| seen.insert(*id)).collect()
+    }
 
-        // Deduplicate adjacent IDs (same symbol may be reachable from multiple pivots).
-        let adjacent_ids: Vec<u64> = {
-            let mut seen = std::collections::HashSet::new();
-            adjacent_ids
-                .into_iter()
-                .filter(|id| seen.insert(*id))
-                .collect()
-        };
-
-        // 6. Resolve IDs → Symbols
-        // For Structural/Explore: filter test files from adjacents — they add noise, not insight.
-        // Also cap at 2 symbols per source file to prevent one test file flooding all slots.
-        let filter_adjacents = matches!(intent, SearchIntent::Structural | SearchIntent::Explore);
-        let pivot_syms: Vec<&Symbol> = pivot_ids
+    /// Resolve adjacent IDs to symbols, filtering test files and capping per-file counts.
+    fn resolve_adjacents<'a>(
+        graph: &'a CodeGraph,
+        adjacent_ids: &[u64],
+        filter_test_files: bool,
+    ) -> Vec<&'a Symbol> {
+        let mut file_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        adjacent_ids
             .iter()
             .filter_map(|id| graph.get_symbol(*id))
-            .collect();
-        let adjacent_syms: Vec<&Symbol> = {
-            let mut file_counts: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
-            adjacent_ids
-                .iter()
-                .filter_map(|id| graph.get_symbol(*id))
-                .filter(|sym| {
-                    if filter_adjacents {
-                        let p = sym.file_path.to_lowercase();
-                        !p.contains("test") && !p.contains("spec") && !p.contains("mock")
-                    } else {
-                        true
-                    }
-                })
-                .filter(|sym| {
-                    let count = file_counts.entry(sym.file_path.as_str()).or_insert(0);
-                    *count += 1;
-                    *count <= 2 // max 2 symbols per file in adjacents
-                })
-                .collect()
-        };
-
-        // 7. Fetch memories
-        let raw_memories = self.memory.lock().unwrap().get_recent_observations(20)?;
-        let memory_entries: Vec<MemoryEntry> = raw_memories
-            .into_iter()
-            .map(|obs| MemoryEntry {
-                content: obs.content,
-                symbol_fqn: obs.symbol_fqn,
-                is_stale: obs.is_stale,
-                created_at: obs.created_at,
+            .filter(|sym| {
+                if filter_test_files {
+                    let p = sym.file_path.to_lowercase();
+                    !p.contains("test") && !p.contains("spec") && !p.contains("mock")
+                } else {
+                    true
+                }
             })
-            .collect();
-
-        // 8. Assemble capsule (pass query for semantic chunking of large bodies)
-        Ok(build_capsule(
-            pivot_syms,
-            adjacent_syms,
-            memory_entries,
-            budget,
-            Some(query),
-        ))
+            .filter(|sym| {
+                let count = file_counts.entry(sym.file_path.as_str()).or_insert(0);
+                *count += 1;
+                *count <= 2 // max 2 symbols per file in adjacents
+            })
+            .collect()
     }
 
     fn collect_source_files(&self) -> Result<Vec<PathBuf>> {
