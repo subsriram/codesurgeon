@@ -278,15 +278,25 @@ impl CoreEngine {
             None
         };
 
-        // Warm the embedding cache and ANN index from any previously stored embeddings.
+        // Warm the embedding cache from previously stored embeddings, then build the
+        // HNSW index on a background thread so startup is not blocked.
+        // Queries fall back to BM25+graph until the index is ready (ann_index = None).
         #[cfg(feature = "embeddings")]
         let (embedding_cache, ann_index) = {
             let cached = db.lock().all_embeddings().unwrap_or_default();
-            let index = build_hnsw_index(&cached);
-            (
-                Arc::new(RwLock::new(cached)),
-                Arc::new(RwLock::new(index)),
-            )
+            let ann_index: Arc<RwLock<Option<HnswMap<EmbeddingPoint, u64>>>> =
+                Arc::new(RwLock::new(None));
+            if !cached.is_empty() {
+                let ann_index_bg = Arc::clone(&ann_index);
+                let cached_bg = cached.clone();
+                std::thread::spawn(move || {
+                    if let Some(index) = build_hnsw_index(&cached_bg) {
+                        *ann_index_bg.write() = Some(index);
+                        tracing::info!("ANN index ready ({} vectors)", cached_bg.len());
+                    }
+                });
+            }
+            (Arc::new(RwLock::new(cached)), ann_index)
         };
 
         Ok(CoreEngine {
@@ -1003,8 +1013,14 @@ impl CoreEngine {
         match self.db.lock().all_embeddings() {
             Ok(embs) => {
                 *self.embedding_cache.write() = embs;
-                let cache = self.embedding_cache.read();
-                *self.ann_index.write() = build_hnsw_index(&cache);
+                let ann_index_bg = Arc::clone(&self.ann_index);
+                let cache_bg = self.embedding_cache.read().clone();
+                std::thread::spawn(move || {
+                    if let Some(index) = build_hnsw_index(&cache_bg) {
+                        *ann_index_bg.write() = Some(index);
+                        tracing::info!("ANN index rebuilt ({} vectors)", cache_bg.len());
+                    }
+                });
             }
             Err(e) => tracing::warn!("Failed to refresh embedding cache: {}", e),
         }
