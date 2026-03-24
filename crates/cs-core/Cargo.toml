@@ -64,12 +64,13 @@ chrono = { version = "0.4", features = ["serde"] }
 # Optional: local embeddings for semantic search (CPU or Apple Silicon Accelerate)
 # Build with: cargo build --features embeddings
 # Build with Accelerate BLAS on Apple Silicon: cargo build --features metal
-fastembed = { version = "5", optional = true }
+fastembed         = { version = "5", optional = true }
+instant-distance  = { version = "0.6.1", optional = true }
 tree-sitter-md-025 = "0.5.4"
 
 [features]
 default    = []
-embeddings = ["dep:fastembed"]
+embeddings = ["dep:fastembed", "dep:instant-distance"]
 metal      = ["embeddings", "fastembed/accelerate"]
 
 [dev-dependencies]

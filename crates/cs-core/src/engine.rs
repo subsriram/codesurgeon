@@ -2,6 +2,8 @@ use crate::capsule::{build_capsule, format_capsule, Capsule, MemoryEntry, DEFAUL
 use crate::db::Database;
 #[cfg(feature = "embeddings")]
 use crate::embedder::{cosine_similarity, Embedder};
+#[cfg(feature = "embeddings")]
+use instant_distance::{Builder as HnswBuilder, HnswMap, Search as HnswSearch};
 use crate::graph::CodeGraph;
 use crate::indexer::{
     extract_call_edges, extract_impl_edges, extract_import_edges, extract_type_flow_edges,
@@ -22,6 +24,13 @@ use rayon::prelude::*;
 
 /// BM25 candidate pool size passed to Tantivy.
 const BM25_POOL_SIZE: usize = 50;
+/// Number of ANN candidates from the HNSW index per query.
+#[cfg(feature = "embeddings")]
+const ANN_CANDIDATES: usize = 25;
+/// Number of graph-neighbor candidates expanded from BM25 seeds per query.
+const GRAPH_CANDIDATES: usize = 25;
+/// RRF rank fusion constant (k=60 from the original paper).
+const RRF_K: f32 = 60.0;
 /// Structural injection: score multiplier for injected hub types.
 const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
 /// Centrality boost multiplier applied to BM25 score.
@@ -155,6 +164,34 @@ pub struct FlowResult {
     pub found: bool,
 }
 
+// ── ANN index ─────────────────────────────────────────────────────────────────
+
+/// Newtype around a 768-dim embedding vector so we can implement `instant_distance::Point`.
+/// Vectors are L2-normalised, so `1.0 - dot_product` gives angular distance.
+#[cfg(feature = "embeddings")]
+#[derive(Clone)]
+struct EmbeddingPoint(Vec<f32>);
+
+#[cfg(feature = "embeddings")]
+impl instant_distance::Point for EmbeddingPoint {
+    fn distance(&self, other: &Self) -> f32 {
+        1.0 - cosine_similarity(&self.0, &other.0)
+    }
+}
+
+/// Build an HNSW index from the embedding cache. Returns `None` when the cache is empty.
+#[cfg(feature = "embeddings")]
+fn build_hnsw_index(
+    cache: &[(u64, Vec<f32>)],
+) -> Option<HnswMap<EmbeddingPoint, u64>> {
+    if cache.is_empty() {
+        return None;
+    }
+    let points: Vec<EmbeddingPoint> = cache.iter().map(|(_, v)| EmbeddingPoint(v.clone())).collect();
+    let values: Vec<u64> = cache.iter().map(|(id, _)| *id).collect();
+    Some(HnswBuilder::default().build(points, values))
+}
+
 // ── CoreEngine ────────────────────────────────────────────────────────────────
 
 pub struct CoreEngine {
@@ -172,6 +209,10 @@ pub struct CoreEngine {
     /// run_pipeline never needs to hit SQLite for embedding lookups.
     #[cfg(feature = "embeddings")]
     embedding_cache: Arc<RwLock<Vec<(u64, Vec<f32>)>>>,
+    /// HNSW index built from the embedding cache for Stage 1.5 ANN retrieval.
+    /// Rebuilt after every reindex pass alongside `embedding_cache`.
+    #[cfg(feature = "embeddings")]
+    ann_index: Arc<RwLock<Option<HnswMap<EmbeddingPoint, u64>>>>,
 }
 
 impl CoreEngine {
@@ -237,11 +278,15 @@ impl CoreEngine {
             None
         };
 
-        // Warm the embedding cache from any previously stored embeddings.
+        // Warm the embedding cache and ANN index from any previously stored embeddings.
         #[cfg(feature = "embeddings")]
-        let embedding_cache = {
+        let (embedding_cache, ann_index) = {
             let cached = db.lock().all_embeddings().unwrap_or_default();
-            Arc::new(RwLock::new(cached))
+            let index = build_hnsw_index(&cached);
+            (
+                Arc::new(RwLock::new(cached)),
+                Arc::new(RwLock::new(index)),
+            )
         };
 
         Ok(CoreEngine {
@@ -255,6 +300,8 @@ impl CoreEngine {
             embedder,
             #[cfg(feature = "embeddings")]
             embedding_cache,
+            #[cfg(feature = "embeddings")]
+            ann_index,
         })
     }
 
@@ -926,12 +973,39 @@ impl CoreEngine {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    /// Reload all embeddings from SQLite into the in-memory cache.
+    /// Stage 1.5: query the HNSW index for the top-K semantically nearest symbols.
+    /// Returns `(symbol_id, cosine_similarity)` pairs, sorted descending by similarity.
+    #[cfg(feature = "embeddings")]
+    fn ann_candidates(&self, query: &str, k: usize) -> Vec<(u64, f32)> {
+        let Some(emb) = &self.embedder else { return vec![] };
+        let query_vec = match emb.embed_one(query) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("ANN query embed failed: {}", e);
+                return vec![];
+            }
+        };
+        let index_guard = self.ann_index.read();
+        let Some(index) = index_guard.as_ref() else { return vec![] };
+        let query_point = EmbeddingPoint(query_vec);
+        let mut search = HnswSearch::default();
+        index
+            .search(&query_point, &mut search)
+            .take(k)
+            .map(|item| (*item.value, 1.0 - item.distance))
+            .collect()
+    }
+
+    /// Reload all embeddings from SQLite into the in-memory cache, then rebuild the ANN index.
     /// Called after every index pass so queries never need to hit the db for vectors.
     #[cfg(feature = "embeddings")]
     fn refresh_embedding_cache(&self) {
         match self.db.lock().all_embeddings() {
-            Ok(embs) => *self.embedding_cache.write() = embs,
+            Ok(embs) => {
+                *self.embedding_cache.write() = embs;
+                let cache = self.embedding_cache.read();
+                *self.ann_index.write() = build_hnsw_index(&cache);
+            }
             Err(e) => tracing::warn!("Failed to refresh embedding cache: {}", e),
         }
     }
@@ -942,13 +1016,29 @@ impl CoreEngine {
         budget: u32,
         intent: &SearchIntent,
     ) -> Result<Capsule> {
-        // 1. Search for candidate symbols
-        let mut search_results = self.search.lock().search(query, BM25_POOL_SIZE)?;
-        let graph = self.graph.read();
+        // ── Stage 1: Candidate Retrieval (BM25 + graph neighbors + ANN) ──────────
+        let bm25_results = self.search.lock().search(query, BM25_POOL_SIZE)?;
 
-        // Track original BM25 IDs before injection (used for coordinator bonus).
+        // Track original BM25 IDs (used for coordinator bonus in structural re-sort).
         let bm25_ids: std::collections::HashSet<u64> =
-            search_results.iter().map(|(id, _)| *id).collect();
+            bm25_results.iter().map(|(id, _)| *id).collect();
+
+        // Graph neighbor expansion: 1-hop neighbors of BM25 seeds, ranked by centrality.
+        let graph_results = {
+            let graph = self.graph.read();
+            Self::graph_candidates(&graph, &bm25_ids, GRAPH_CANDIDATES)
+        };
+
+        // ANN semantic retrieval + RRF fusion across all three sources.
+        #[cfg(feature = "embeddings")]
+        let mut search_results = {
+            let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
+            Self::rrf_merge(&[&bm25_results, &graph_results, &ann_results], RRF_K)
+        };
+        #[cfg(not(feature = "embeddings"))]
+        let mut search_results = Self::rrf_merge(&[&bm25_results, &graph_results], RRF_K);
+
+        let graph = self.graph.read();
 
         // 2. Inject high-centrality types for Structural queries (BM25 can't surface them)
         if *intent == SearchIntent::Structural {
@@ -1022,6 +1112,42 @@ impl CoreEngine {
         ))
     }
 
+    /// Reciprocal Rank Fusion over multiple ranked lists.
+    /// Each list contributes `1 / (k + rank + 1)` to a candidate's score.
+    /// Lists that agree on a candidate amplify its score; unique candidates are preserved.
+    fn rrf_merge(lists: &[&[(u64, f32)]], k: f32) -> Vec<(u64, f32)> {
+        let mut scores: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
+        for list in lists {
+            for (rank, (id, _)) in list.iter().enumerate() {
+                *scores.entry(*id).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
+            }
+        }
+        let mut merged: Vec<(u64, f32)> = scores.into_iter().collect();
+        merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged
+    }
+
+    /// Expand 1-hop graph neighbors of BM25 seed IDs, ranked by centrality.
+    /// Seeds themselves are excluded — they are already in the BM25 list.
+    fn graph_candidates(
+        graph: &CodeGraph,
+        seed_ids: &std::collections::HashSet<u64>,
+        max: usize,
+    ) -> Vec<(u64, f32)> {
+        let mut seen: std::collections::HashSet<u64> = seed_ids.clone();
+        let mut candidates: Vec<(u64, f32)> = Vec::new();
+        for &seed in seed_ids {
+            for neighbor_id in graph.neighbor_ids(seed) {
+                if seen.insert(neighbor_id) {
+                    candidates.push((neighbor_id, graph.centrality_score(neighbor_id)));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(max);
+        candidates
+    }
+
     /// Augment the BM25 candidate pool with top hub types ranked by family in-degree.
     /// BM25 cannot surface types whose names don't lexically match the query.
     fn inject_structural_candidates(
@@ -1055,9 +1181,12 @@ impl CoreEngine {
             if let Some(emb) = &self.embedder {
                 match emb.embed_one(query) {
                     Ok(query_vec) => {
+                        let candidate_ids: std::collections::HashSet<u64> =
+                            reranked.iter().map(|(id, _)| *id).collect();
                         let cache = self.embedding_cache.read();
                         cache
                             .iter()
+                            .filter(|(id, _)| candidate_ids.contains(id))
                             .map(|(id, vec)| (*id, cosine_similarity(&query_vec, vec)))
                             .collect()
                     }

@@ -196,6 +196,19 @@ impl CodeGraph {
             .unwrap_or_default()
     }
 
+    /// All neighbor IDs reachable via any edge in either direction (1-hop).
+    pub fn neighbor_ids(&self, id: u64) -> Vec<u64> {
+        let Some(&idx) = self.id_to_idx.get(&id) else {
+            return vec![];
+        };
+        let incoming = self.graph.neighbors_directed(idx, Direction::Incoming);
+        let outgoing = self.graph.neighbors_directed(idx, Direction::Outgoing);
+        incoming
+            .chain(outgoing)
+            .map(|n| self.graph[n].id)
+            .collect()
+    }
+
     /// Symbols in the same file.
     pub fn file_symbols(&self, file_path: &str) -> Vec<&Symbol> {
         self.graph
