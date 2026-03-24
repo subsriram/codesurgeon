@@ -19,6 +19,8 @@ pub enum ObservationKind {
     FileThrash,
     /// Agent-generated insight about a symbol
     Insight,
+    /// Automatically captured from run_pipeline / get_context_capsule calls
+    Auto,
 }
 
 impl ObservationKind {
@@ -29,6 +31,7 @@ impl ObservationKind {
             ObservationKind::DeadEnd => "dead_end",
             ObservationKind::FileThrash => "file_thrash",
             ObservationKind::Insight => "insight",
+            ObservationKind::Auto => "auto",
         }
     }
 
@@ -38,6 +41,7 @@ impl ObservationKind {
             "dead_end" => ObservationKind::DeadEnd,
             "file_thrash" => ObservationKind::FileThrash,
             "insight" => ObservationKind::Insight,
+            "auto" => ObservationKind::Auto,
             _ => ObservationKind::Manual,
         }
     }
@@ -257,6 +261,40 @@ impl MemoryStore {
             self.db.lock().insert_observation(&obs)?;
             tracing::warn!("Dead-end exploration detected for: {}", fqn);
         }
+        Ok(())
+    }
+
+    /// Auto-capture a tool call as an observation.
+    /// Skips when `pivot_fqns` is empty or an identical task was recorded within 30 minutes.
+    pub fn record_auto_observation(&self, task: &str, pivot_fqns: &[String]) -> Result<()> {
+        if pivot_fqns.is_empty() {
+            return Ok(());
+        }
+
+        let top_fqns = pivot_fqns
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let content = format!("Agent queried: \"{task}\" — pivots: {top_fqns}");
+
+        // Deduplicate: skip if same task recorded in last 30 minutes
+        if self.db.lock().has_recent_auto_observation(task, 30)? {
+            return Ok(());
+        }
+
+        let mut obs = Observation::new(
+            &self.session_id,
+            &content,
+            None,
+            None,
+            ObservationKind::Auto,
+        );
+        if let Some(ref aid) = self.agent_id {
+            obs = obs.with_agent(aid);
+        }
+        self.db.lock().insert_observation(&obs)?;
         Ok(())
     }
 

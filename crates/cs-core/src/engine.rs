@@ -602,6 +602,12 @@ impl CoreEngine {
             out.push_str(&swift_enrichment_hint(detect_xcode_mcp()));
         }
 
+        // Auto-capture this tool call as an observation for cross-session memory.
+        let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
+        if let Err(e) = self.memory.lock().record_auto_observation(task, &pivot_fqns) {
+            tracing::warn!("auto-observation failed: {}", e);
+        }
+
         Ok(out)
     }
 
@@ -616,6 +622,13 @@ impl CoreEngine {
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(query);
         let capsule = self.build_context_capsule(query, budget, &intent, None, None, max_results, min_score)?;
+
+        // Auto-capture this tool call as an observation for cross-session memory.
+        let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
+        if let Err(e) = self.memory.lock().record_auto_observation(query, &pivot_fqns) {
+            tracing::warn!("auto-observation failed: {}", e);
+        }
+
         Ok(format_capsule(&capsule))
     }
 

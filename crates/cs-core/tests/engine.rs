@@ -202,6 +202,80 @@ fn get_skeleton_max_depth_filters_nested_symbols() {
     }
 }
 
+/// `run_pipeline` must write an `auto` observation when pivots are found.
+#[test]
+fn run_pipeline_writes_auto_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir);
+    engine.run_pipeline("rust fn", Some(4000), None, None).expect("run_pipeline failed");
+
+    let observations = engine.get_session_context().expect("get_session_context failed");
+    let auto_obs: Vec<_> = observations
+        .iter()
+        .filter(|o| o.kind.as_str() == "auto")
+        .collect();
+    assert!(!auto_obs.is_empty(), "expected at least one auto observation after run_pipeline");
+    assert!(
+        auto_obs[0].content.starts_with("Agent queried:"),
+        "unexpected auto observation format: {}",
+        auto_obs[0].content
+    );
+}
+
+/// `get_context_capsule` must write an `auto` observation when pivots are found.
+#[test]
+fn get_context_capsule_writes_auto_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir);
+    engine
+        .get_context_capsule("py fn", Some(4000), None, None)
+        .expect("get_context_capsule failed");
+
+    let observations = engine.get_session_context().expect("get_session_context failed");
+    let auto_obs: Vec<_> = observations
+        .iter()
+        .filter(|o| o.kind.as_str() == "auto")
+        .collect();
+    assert!(!auto_obs.is_empty(), "expected at least one auto observation after get_context_capsule");
+}
+
+/// Calling `run_pipeline` twice with the same task must deduplicate — only one auto observation.
+#[test]
+fn run_pipeline_deduplicates_auto_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir);
+    engine.run_pipeline("rust fn", Some(4000), None, None).expect("first call failed");
+    engine.run_pipeline("rust fn", Some(4000), None, None).expect("second call failed");
+
+    let observations = engine.get_session_context().expect("get_session_context failed");
+    let auto_count = observations
+        .iter()
+        .filter(|o| o.kind.as_str() == "auto" && o.content.contains("rust fn"))
+        .count();
+    assert_eq!(auto_count, 1, "duplicate auto observation should have been suppressed");
+}
+
+/// `run_pipeline` with no matching symbols must not write an auto observation.
+#[test]
+fn run_pipeline_no_pivots_skips_auto_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir); // empty index — no symbols
+    engine
+        .run_pipeline("xyzzy no match", Some(4000), None, None)
+        .expect("run_pipeline failed");
+
+    let observations = engine.get_session_context().expect("get_session_context failed");
+    let auto_obs: Vec<_> = observations
+        .iter()
+        .filter(|o| o.kind.as_str() == "auto")
+        .collect();
+    assert!(
+        auto_obs.is_empty(),
+        "expected no auto observation when there are no pivots, got: {:?}",
+        auto_obs.iter().map(|o| &o.content).collect::<Vec<_>>()
+    );
+}
+
 /// Queries issued while indexing is flagged as in-progress must succeed
 /// (possibly with partial results) and must not panic.
 #[test]

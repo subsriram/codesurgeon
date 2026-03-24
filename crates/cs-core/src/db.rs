@@ -327,6 +327,19 @@ impl Database {
         Ok(results)
     }
 
+    /// Returns true if an auto-observation with the same task was recorded within `window_mins`.
+    pub fn has_recent_auto_observation(&self, task: &str, window_mins: i64) -> Result<bool> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::minutes(window_mins);
+        let pattern = format!("Agent queried: \"{task}\" —%");
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM observations \
+             WHERE kind = 'auto' AND content LIKE ?1 AND created_at > ?2",
+            params![pattern, cutoff.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn delete_observation(&self, id: &str) -> Result<bool> {
         let count = self.conn.execute(
             "DELETE FROM observations WHERE id = ?1",
