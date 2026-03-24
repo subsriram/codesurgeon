@@ -3,22 +3,22 @@
 ## What it is
 
 codesurgeon is a **local-first, pure-Rust MCP server** that gives AI coding agents surgical context
-about your codebase. Inspired by vexp, but built end-to-end in Rust with no Node.js dependency.
+about your codebase. Inspired by the leading competitor in this space, but built end-to-end in Rust with no Node.js dependency.
 
 It parses your code into a dependency graph (AST nodes + call/import edges), then serves
 token-budgeted "context capsules" to the agent via MCP — returning only the code that matters.
 
-**Target token reduction: 65–70%** (matching vexp's measured results).
+**Target token reduction: 65–70%** (matching the leading competitor's measured results).
 
 ---
 
 ## What inspired this
 
-### vexp (https://vexp.dev)
+### Leading competitor
 
-Built by Nicola Alessi. Posted on r/ClaudeCode as "I cut Claude Code's token usage by 65%."
+A competing MCP context server, posted on r/ClaudeCode as "I cut Claude Code's token usage by 65%."
 
-**How vexp works:**
+**How the competitor works:**
 
 1. **Index** — tree-sitter parses every file into an AST. Nodes = functions/classes/types.
    Edges = imports/calls/implementations. Stored in SQLite. ~5,000 files in <15s using rayon.
@@ -32,11 +32,11 @@ Built by Nicola Alessi. Posted on r/ClaudeCode as "I cut Claude Code's token usa
 3. **Capsule** — Pivot nodes returned with **full source**. Adjacent nodes reduced to
    signatures + docstrings only ("skeletonized" — 70–90% smaller). Bounded to token budget.
 
-**vexp architecture:**
+**Competitor architecture:**
 ```
-Claude Code ──MCP (stdio)──► vexp-mcp (TypeScript/Node.js)
+Claude Code ──MCP (stdio)──► competitor-mcp (TypeScript/Node.js)
                                     │ Unix socket
-                             vexp-core (Rust)
+                             competitor-core (Rust)
                              ├── tree-sitter parser
                              ├── petgraph (DAG)
                              ├── SQLite (FTS5)
@@ -52,14 +52,14 @@ Claude Code ──MCP (stdio)──► vexp-mcp (TypeScript/Node.js)
 
 ---
 
-## Our differentiators vs vexp
+## Our differentiators vs the competition
 
 ### 1. Pure Rust end-to-end (no Node.js wrapper)
-vexp uses a TypeScript/Node.js MCP adapter because the MCP SDK was JS-first when built.
+The leading competitor uses a TypeScript/Node.js MCP adapter because the MCP SDK was JS-first when built.
 codesurgeon uses `rmcp` (Anthropic's official Rust MCP SDK) — single binary, zero Node dependency.
 
 ### 2. Richer graph edges
-vexp tracks: imports, calls.
+The leading competitor tracks: imports, calls.
 codesurgeon additionally tracks:
 - **Trait implementations** (`impl Foo for Bar`)
 - **Type flows** (where a type propagates through function signatures)
@@ -71,7 +71,7 @@ We target the exact stack: Python, TypeScript, TSX, JavaScript, JSX, Shell, HTML
 Each language has dedicated tree-sitter extraction logic tuned to its idioms.
 
 ### 4. Semantic chunking for long functions
-vexp returns full function bodies as pivots. For 500-line functions this is wasteful.
+Alternatives return full function bodies as pivots. For 500-line functions this is wasteful.
 codesurgeon can chunk bodies into logical AST blocks and return only the relevant branch
 (e.g., the specific `match` arm or `if` branch containing the query-relevant logic).
 
@@ -91,7 +91,7 @@ Purpose-built for code review context.
 Auto-generate per-module summaries as the graph is built, kept current with the code.
 
 ### 9. Optional local embeddings (candle)
-vexp uses lexical search only (TF-IDF + FTS5).
+The leading competitor uses lexical search only (TF-IDF + FTS5).
 codesurgeon optionally uses a small local embedding model via `candle` (HuggingFace's Rust ML
 framework) for better semantic matching — no API key, runs on CPU, falls back to lexical.
 
@@ -277,7 +277,7 @@ codesurgeon/
 ### Phase 6 — Distribution
 - [x] GitHub repository — https://github.com/subsriram/codesurgeon
 - [x] CI — `.github/workflows/ci.yml`: cargo test + clippy (-D warnings) + rustfmt --check
-- [x] README with benchmark table vs baseline and vs vexp
+- [x] README with benchmark table vs baseline and vs competition
 - [x] `docs/ranking.md` — full ranking pipeline documentation
 - [x] Stale PID file after crash — `acquire_pid_lock` uses `kill -0` to detect dead processes and
   silently overwrites the stale file; no manual cleanup needed (invariant #4 in CLAUDE.md)
@@ -304,7 +304,7 @@ codesurgeon/
   N edges in Xms`). Gives Claude Code's MCP panel enough signal to show state; currently
   indexing is completely silent and users can't tell if it's running, done, or stuck.
 - [ ] `.cursor/rules` and `.windsurf/rules` generation in `generate_module_docs` and
-  `codesurgeon setup` — mirrors what vexp generates for `.claude/CLAUDE.md`. Low effort,
+  `codesurgeon setup` — mirrors what the competition generates for `.claude/CLAUDE.md`. Low effort,
   broadens supported agent surface to Cursor and Windsurf users without new architecture.
 - [ ] `.codesurgeon/config.toml` — project-level config file, git-tracked alongside code,
   replaces env var juggling for per-project settings:
@@ -502,16 +502,16 @@ Extend `walk_sql()` to extract `CALL` and `EXEC` statements as `Calls` edges.
 
 ---
 
-### Phase 8 — vexp parity + tool improvements
+### Phase 8 — Competitive parity + tool improvements
 
-Gaps identified by reviewing vexp.dev/docs. Split into quick wins (parameter additions to
+Gaps identified by reviewing the competition's docs. Split into quick wins (parameter additions to
 existing tools) and new tools.
 
 ---
 
 #### 8a — Quick wins: parameter additions to existing tools (Low effort)
 
-Four small additions that close the most visible gaps with vexp. No new tools, no schema
+Four small additions that close the most visible gaps with the competition. No new tools, no schema
 changes — all are additive parameters with backward-compatible defaults.
 
 **`observation` param on `run_pipeline`**
@@ -536,7 +536,7 @@ multiple parallel call chains — useful when there are several routes between A
 
 #### 8b — `search_memory` tool (Low-med effort)
 
-A dedicated hybrid memory search tool, separate from `get_session_context`. vexp uses
+A dedicated hybrid memory search tool, separate from `get_session_context`. The leading competitor uses
 text relevance + semantic similarity + recency + code-graph proximity. codesurgeon currently
 only surfaces memories passively through `run_pipeline` or chronologically via
 `get_session_context` — there is no way to directly query past observations.
@@ -553,7 +553,7 @@ to the `observations` table rather than the symbol table. The memory store alrea
 
 #### 8c — `submit_lsp_edges` tool (Med effort)
 
-The most architecturally interesting gap. vexp accepts type-resolved call edges submitted
+The most architecturally interesting gap. The leading competitor accepts type-resolved call edges submitted
 from a VS Code Language Server extension, supplementing static analysis with precise type
 information. This is the "thin LSP-client bridge" approach: rather than codesurgeon spawning
 language servers (Phase 7b–7d), IDE users push edges *to* codesurgeon from the language
@@ -598,14 +598,14 @@ since codesurgeon's `generate_module_docs` already covers the CLAUDE.md onboardi
 
 ### Phase 9 — Memory system improvements
 
-Goal: close the gap between codesurgeon's basic observation store and vexp's more
+Goal: close the gap between codesurgeon's basic observation store and the competition's more
 sophisticated session memory. Ordered from highest to lowest value/effort ratio.
 
 ---
 
 #### 9a — Auto-capture tool calls as observations (Low effort, high value)
 
-Currently codesurgeon only passively captures file-change events. vexp records every
+Currently codesurgeon only passively captures file-change events. The leading competitor records every
 `run_pipeline` and `get_context_capsule` call as a compact observation (task + top pivot FQNs).
 This builds a picture of what the agent has explored across sessions without any manual saves —
 the most common case where session context is actually useful.
@@ -620,7 +620,7 @@ Implementation:
 
 #### 9b — Session TTL + compression (Low-med effort, high value)
 
-The observation store currently grows unbounded. vexp auto-compresses sessions after 2 hours
+The observation store currently grows unbounded. The leading competitor auto-compresses sessions after 2 hours
 of inactivity into structural summaries and enforces:
 - Auto-observations: expire after session compression
 - Manual observations: persist permanently
@@ -639,7 +639,7 @@ Implementation:
 #### 9c — L1 / L2 / L3 detail levels for `search_memory` (Low effort)
 
 Build this into `search_memory` (Phase 8b) from the start rather than retrofitting later.
-vexp surfaces results at three token levels:
+The leading competitor surfaces results at three token levels:
 - **L1** (~20 tokens): headline only — symbol name + one-line summary
 - **L2** (~50 tokens): standard — includes linked symbol signature
 - **L3** (~100 tokens): full observation content
@@ -666,7 +666,7 @@ Implementation:
 
 #### 9e — Richer AST change categories (Med effort)
 
-vexp's file watcher classifies changes into 6 specific categories:
+The leading competitor's file watcher classifies changes into 6 specific categories:
 `Added`, `Removed`, `Renamed`, `SignatureChanged`, `BodyChanged`, `VisibilityChanged`.
 codesurgeon detects that a file changed and counts re-indexed symbols, but doesn't
 classify the change type.
@@ -686,7 +686,7 @@ Implementation:
 
 #### 9f — Project rules (High effort, lower priority)
 
-When 3+ similar observations recur in the same scope, vexp auto-generates rule candidates
+When 3+ similar observations recur in the same scope, the leading competitor auto-generates rule candidates
 and injects them as standing conventions into capsule responses — e.g. "this codebase always
 uses `anyhow::Result`" stops being a repeated observation and becomes a rule.
 
@@ -708,32 +708,32 @@ Implementation:
 
 The gold-standard external validation for coding agents is
 [SWE-bench Verified](https://swebench.com) — 100 real GitHub issues, same model and cost
-cap across all agents. vexp's published results (Claude Opus 4.5, $3/task cap, 250 turns):
+cap across all agents. The leading competitor's published results (Claude Opus 4.5, $3/task cap, 250 turns):
 
 | Agent | Pass@1 | $/Task |
 |-------|--------|--------|
-| vexp + Claude Code | **73%** | **$0.67** |
+| Leading competitor + Claude Code | **73%** | **$0.67** |
 | OpenHands | 70% | $1.77 |
 | Sonar Foundation | 70% | $1.98 |
 
 **Key insight from per-repo breakdown:**
-- **astropy: 80% (vexp) vs 40% (competitors)** — import-heavy, interconnected dependencies;
+- **astropy: 80% (leading competitor) vs 40% (alternatives)** — import-heavy, interconnected dependencies;
   exactly the pattern a symbol dependency graph is built for
-- **matplotlib: 43% (vexp) vs 86% (Sonar Foundation)** — rendering/procedural logic; less
+- **matplotlib: 43% (leading competitor) vs 86% (Sonar Foundation)** — rendering/procedural logic; less
   amenable to symbolic traversal, more about symbolic graph traversal
 
 This maps onto codesurgeon's expected profile: strong on Rust (trait/impl graphs), Python
 backend (deep import chains), TypeScript (module boundaries); weaker on procedural/numerical
 code with few call-graph edges.
 
-**When to run:** once Phase 8 (vexp tool parity) and Phase 9 (session memory) are stable.
+**When to run:** once Phase 8 (competitive parity) and Phase 9 (session memory) are stable.
 The benchmark is open-source and runs in under 10 minutes.
 
 **What to measure:**
 - Pass@1 on the same 100-task subset with the same model (Claude Opus) and cost cap ($3/task)
 - $/task with codesurgeon vs without (bare Claude Code, same task set)
 - Per-repo breakdown to identify where the symbol graph helps and where it doesn't
-- Comparison row against vexp's published numbers
+- Comparison row against the leading competitor's published numbers
 
 **Setup:** `pip install swebench` → clone the 100-task subset → run Claude Code with
 codesurgeon MCP enabled → record pass/fail and token cost per task.
@@ -819,7 +819,7 @@ effort, risk, dogfooding opportunity (can codesurgeon benefit on itself immediat
 | Priority | Item | Effort | Key reason |
 |----------|------|--------|------------|
 | ✅ done | 7e Xcode MCP | Zero | Free — guidance auto-injected by `generate_module_docs` |
-| 1 | 8a Quick wins | Low | Four parameter additions; closes most visible vexp gaps immediately |
+| 1 | 8a Quick wins | Low | Four parameter additions; closes most visible competitive gaps immediately |
 | 2 | 9a Tool call auto-capture | Low | Builds cross-session picture without manual saves; high value, tiny change |
 | 3 | 7a Stub indexing | Low-med | Highest ROI on enrichment; fixes hallucinated library signatures |
 | 4 | 7f Shell/SQL edges | Low | Quick win; contained tree-sitter changes; no new deps |
@@ -859,7 +859,7 @@ agent value to implementation cost in the entire backlog.
 
 **#2 — 9a Tool call auto-capture** · Low effort
 Four backward-compatible additions to existing tools that close the most visible gaps
-with vexp in a single sprint: `observation` on `run_pipeline`, `include_tests` flag,
+with the competition in a single sprint: `observation` on `run_pipeline`, `include_tests` flag,
 `format`/Mermaid on `get_impact_graph`, `max_paths` on `search_logic_flow`. No new
 infrastructure, no schema changes.
 
@@ -1013,7 +1013,7 @@ CREATE TABLE query_log (
 - *Skeletonisation*: `(adjacent_full_tokens - adjacent_skeleton_tokens) / adjacent_full_tokens` — compression contribution only
 
 **Cost tracking:** `cost_saved_usd = tokens_saved × rate`, where `rate` is configurable via
-`CS_TOKEN_RATE_USD` (default: claude-sonnet-4 input pricing). Consistent with vexp's SWE-bench
+`CS_TOKEN_RATE_USD` (default: claude-sonnet-4 input pricing). Consistent with the leading competitor's SWE-bench
 finding that $0.67/task vs $1.98/task is the headline metric users remember — dollar figures
 communicate value more clearly than token percentages.
 
@@ -1073,7 +1073,7 @@ architecturally significant: schema migration (`root` column, FQN namespacing), 
 rethink, `EngineConfig` overhaul. Do this after enrichment is stable so the SQLite schema
 isn't migrated twice.
 
-Design is informed by vexp's multi-repo model (see deferred section below):
+Design is informed by the leading competitor's multi-repo model (see deferred section below):
 - `workspace.json` declares each repo with `alias`, `path`, `languages`, `role` (consumer/provider), and typed `cross_repo_links` (e.g. `"type": "openapi"` for API contracts)
 - Consumer repos query provider APIs; typed links enable contract-driven cross-boundary resolution instead of heuristic name-matching
 - All observations tagged with `repo_alias` so memory stays scoped when working across repos
@@ -1178,7 +1178,7 @@ result to `%A`. Exit 0 on success, 1 if it cannot resolve.
 
 ---
 
-#### 10c — `vexp.autoCommitIndex` equivalent: `CS_TRACK_MANIFEST` (Low effort)
+#### 10c — Auto-commit index equivalent: `CS_TRACK_MANIFEST` (Low effort)
 
 Environment variable (default: `true`) to opt out of manifest tracking — for users who
 prefer to gitignore `.codesurgeon/` entirely. When `false`, `write_manifest()` is skipped
@@ -1268,7 +1268,7 @@ CREATE TABLE query_log (
 ```
 
 `codesurgeon stats` CLI: reads from `query_log`, leads with **cost saved** (dollar figure)
-rather than token % — consistent with vexp's SWE-bench finding that $/task is the metric
+rather than token % — consistent with the leading competitor's SWE-bench finding that $/task is the metric
 users internalise. Token % surfaced as secondary. Rate configurable via `CS_TOKEN_RATE_USD`
 (default: claude-sonnet-4 input pricing).
 
@@ -1323,7 +1323,7 @@ auth?") require two tool calls, one per server.
 **Future work:** native multi-root support — single server, multiple workspace roots,
 aggregated symbol graph with per-root namespacing in FQNs, cross-root edge resolution.
 
-Design informed by vexp's multi-repo model:
+Design informed by the leading competitor's multi-repo model:
 
 **Configuration — `workspace.json`**
 ```json

@@ -13,26 +13,26 @@ codesurgeon parses your codebase into a symbol dependency graph, then serves tok
 | Relevant pivots surfaced | all files | 8 symbols |
 | Setup | none | `cargo install` + 1 config line |
 
-> Token figures are from vexp's published results (the project that inspired this). codesurgeon will report your actual per-workspace savings via `codesurgeon stats` once Phase 11 ships.
+> Token figures are from the leading competitor's published results. codesurgeon will report your actual per-workspace savings via `codesurgeon stats` once Phase 11 ships.
 
 ### SWE-bench Verified
 
-vexp (the project that inspired codesurgeon) benchmarked against [SWE-bench Verified](https://swebench.com) — 100 real GitHub issues, same model and cost cap across all agents:
+The leading competitor in this space benchmarked against [SWE-bench Verified](https://swebench.com) — 100 real GitHub issues, same model and cost cap across all agents:
 
 | Agent | Pass@1 | $/Task |
 |-------|--------|--------|
-| vexp + Claude Code | **73%** | **$0.67** |
+| Leading competitor + Claude Code | **73%** | **$0.67** |
 | OpenHands | 70% | $1.77 |
 | Sonar Foundation | 70% | $1.98 |
 
-Key insight from the per-repo breakdown: dependency-graph context (like codesurgeon's symbol graph) yields large gains on **import-heavy, interconnected codebases** (astropy: 80% vs 40% for competitors) but smaller gains on **rendering-heavy or procedural code** (matplotlib: 43% vs 86%). codesurgeon is best suited for Rust, Python backend, and TypeScript projects with deep module graphs.
+Key insight from the per-repo breakdown: dependency-graph context (like codesurgeon's symbol graph) yields large gains on **import-heavy, interconnected codebases** (astropy: 80% vs 40% for alternatives) but smaller gains on **rendering-heavy or procedural code** (matplotlib: 43% vs 86%). codesurgeon is best suited for Rust, Python backend, and TypeScript projects with deep module graphs.
 
-codesurgeon will run the same benchmark once Phase 8 (vexp tool parity) and Phase 9 (session memory) are stable.
+codesurgeon will run the same benchmark once Phase 8 (tool parity) and Phase 9 (session memory) are stable.
 
-Compared to [vexp](https://vexp.dev) (the project that inspired this):
+Compared to the leading alternative:
 
-| | vexp | codesurgeon |
-|-|------|-------------|
+| | Leading alternative | codesurgeon |
+|-|---------------------|-------------|
 | Runtime | TypeScript/Node.js wrapper + Rust core | Pure Rust, single binary |
 | Search | FTS5 + TF-IDF | BM25 (Tantivy) + graph centrality + optional embeddings |
 | Embeddings | None | nomic-embed-text-v1.5 (768-dim, Apple Silicon Metal) |
