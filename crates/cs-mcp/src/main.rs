@@ -101,6 +101,14 @@ fn tool_list() -> Value {
                             "type": "integer",
                             "description": "Max tokens to include in the capsule (default: 4000)",
                             "default": 4000
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Restrict results to a single language, e.g. 'rust', 'python', 'typescript'"
+                        },
+                        "file_hint": {
+                            "type": "string",
+                            "description": "Seed the search with a specific file path substring, e.g. 'src/auth' — results are filtered to symbols in matching files"
                         }
                     },
                     "required": ["task"]
@@ -120,6 +128,14 @@ fn tool_list() -> Value {
                             "type": "integer",
                             "description": "Max tokens (default: 4000)",
                             "default": 4000
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of pivot symbols to return (default: 8)"
+                        },
+                        "min_score": {
+                            "type": "number",
+                            "description": "Minimum relevance score threshold (0.0–1.0); symbols below this are excluded"
                         }
                     },
                     "required": ["query"]
@@ -134,6 +150,15 @@ fn tool_list() -> Value {
                         "symbol_fqn": {
                             "type": "string",
                             "description": "Fully-qualified name, e.g. 'src/auth/service.py::AuthService::validate_token'"
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "description": "Maximum traversal depth for transitive dependents (default: 5)"
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include test files in the impact results (default: true). Set false to see only production impact.",
+                            "default": true
                         }
                     },
                     "required": ["symbol_fqn"]
@@ -148,6 +173,10 @@ fn tool_list() -> Value {
                         "file_path": {
                             "type": "string",
                             "description": "Relative path to the file, e.g. 'src/auth/service.py'"
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "description": "Maximum nesting depth: 1 = top-level symbols only, 2 = top-level + methods, etc. (default: all depths)"
                         }
                     },
                     "required": ["file_path"]
@@ -328,16 +357,27 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // Kick off background indexing (primary instance only)
+                // Make the engine available to the stdio loop IMMEDIATELY.
+                // BM25 + graph queries work from the SQLite cache right away;
+                // embeddings come online asynchronously below.
+                let _ = cell_bg.set(Arc::clone(&engine));
+                tracing::info!("Engine ready (BM25+graph from cache)");
+
+                // Load the embedding model, then kick off full workspace indexing.
+                // Embedder loading (~2-5s warm, ~10-15s cold) happens here so that
+                // index_workspace can embed symbols in the same pass.
                 let e2 = Arc::clone(&engine);
-                std::thread::spawn(move || match e2.index_workspace() {
-                    Ok(stats) => tracing::info!(
-                        "Index complete: {} symbols, {} edges, {} files",
-                        stats.symbol_count,
-                        stats.edge_count,
-                        stats.file_count
-                    ),
-                    Err(e) => tracing::error!("Indexing failed: {}", e),
+                std::thread::spawn(move || {
+                    e2.load_embedder();
+                    match e2.index_workspace() {
+                        Ok(stats) => tracing::info!(
+                            "Index complete: {} symbols, {} edges, {} files",
+                            stats.symbol_count,
+                            stats.edge_count,
+                            stats.file_count
+                        ),
+                        Err(e) => tracing::error!("Indexing failed: {}", e),
+                    }
                 });
 
                 // Watch for file changes and re-index incrementally (primary instance only)
@@ -360,10 +400,6 @@ async fn main() -> Result<()> {
                     }
                     tracing::info!("File watcher stopped");
                 });
-
-                // Make the engine available to the stdio loop.
-                let _ = cell_bg.set(engine);
-                tracing::info!("Engine ready");
             });
 
             // Register signal handler to clean up on SIGTERM/SIGINT.
@@ -660,7 +696,9 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
                 .get("budget_tokens")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
-            engine.run_pipeline(&task, budget)
+            let language = args.get("language").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let file_hint = args.get("file_hint").and_then(|v| v.as_str()).map(|s| s.to_string());
+            engine.run_pipeline(&task, budget, language.as_deref(), file_hint.as_deref())
         }
 
         "get_context_capsule" => {
@@ -669,18 +707,23 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
                 .get("budget_tokens")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
-            engine.get_context_capsule(&query, budget)
+            let max_results = args.get("max_results").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let min_score = args.get("min_score").and_then(|v| v.as_f64()).map(|v| v as f32);
+            engine.get_context_capsule(&query, budget, max_results, min_score)
         }
 
         "get_impact_graph" => {
             let fqn = string_arg(&args, "symbol_fqn")?;
-            let result = engine.get_impact_graph(&fqn)?;
+            let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let include_tests = args.get("include_tests").and_then(|v| v.as_bool()).unwrap_or(true);
+            let result = engine.get_impact_graph(&fqn, max_depth, include_tests)?;
             Ok(serde_json::to_string_pretty(&result)?)
         }
 
         "get_skeleton" => {
             let file_path = string_arg(&args, "file_path")?;
-            let result = engine.get_skeleton(&file_path)?;
+            let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let result = engine.get_skeleton(&file_path, max_depth)?;
             let mut out = format!(
                 "## Skeleton: {}\n({} symbols, ~{} tokens)\n\n",
                 result.file_path,

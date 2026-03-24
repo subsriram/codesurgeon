@@ -44,7 +44,11 @@ enum Commands {
     Flow { from: String, to: String },
 
     /// Show session memory / observations
-    Memory,
+    Memory {
+        /// Delete an observation by ID
+        #[arg(short, long)]
+        delete: Option<String>,
+    },
 
     /// Save an observation
     Observe {
@@ -102,12 +106,12 @@ async fn main() -> Result<()> {
         }
 
         Commands::Search { query, budget } => {
-            let capsule = engine.get_context_capsule(&query, Some(budget))?;
+            let capsule = engine.get_context_capsule(&query, Some(budget), None, None)?;
             println!("{}", capsule);
         }
 
         Commands::Skeleton { file_path } => {
-            let result = engine.get_skeleton(&file_path)?;
+            let result = engine.get_skeleton(&file_path, None)?;
             println!(
                 "Skeleton: {} ({} symbols, ~{} tokens)\n",
                 result.file_path,
@@ -121,7 +125,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Impact { symbol_fqn } => {
-            let result = engine.get_impact_graph(&symbol_fqn)?;
+            let result = engine.get_impact_graph(&symbol_fqn, None, true)?;
             println!("Impact graph for: {}", result.target_fqn);
             println!("Total affected: {}\n", result.total_affected);
 
@@ -157,7 +161,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Memory => {
+        Commands::Memory { delete } => {
+            if let Some(id) = delete {
+                if engine.delete_observation(&id)? {
+                    println!("Deleted observation {id}.");
+                } else {
+                    eprintln!("No observation found with id {id}.");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             let observations = engine.get_session_context()?;
             if observations.is_empty() {
                 println!("No session observations.");
@@ -165,7 +178,7 @@ async fn main() -> Result<()> {
             }
             for obs in &observations {
                 let stale = if obs.is_stale { " [STALE]" } else { "" };
-                println!("[{}]{}: {}", obs.created_at, stale, obs.content);
+                println!("[{}]{} (id: {}): {}", obs.created_at, stale, obs.id, obs.content);
             }
         }
 

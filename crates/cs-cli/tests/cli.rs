@@ -190,3 +190,70 @@ fn observe_then_memory_round_trip() {
         stdout(&mem)
     );
 }
+
+/// `memory` output must include a UUID id field for each observation.
+#[test]
+fn memory_output_includes_id() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let obs = run(&dir, &["observe", "check-id-present"]);
+    assert!(obs.status.success(), "observe failed: {}", stderr(&obs));
+
+    let mem = run(&dir, &["memory"]);
+    assert!(mem.status.success(), "memory failed: {}", stderr(&mem));
+    let out = stdout(&mem);
+    // Output format: [...] (id: <uuid>): <content>
+    assert!(
+        out.contains("(id: "),
+        "memory output missing id field: {out}"
+    );
+}
+
+/// `memory --delete <id>` must remove the observation so it no longer appears.
+#[test]
+fn memory_delete_removes_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = "delete-me-sentinel";
+
+    let obs = run(&dir, &["observe", sentinel]);
+    assert!(obs.status.success(), "observe failed: {}", stderr(&obs));
+
+    let mem = run(&dir, &["memory"]);
+    let out = stdout(&mem);
+    assert!(out.contains(sentinel), "observation not found before delete");
+
+    // Extract the id from the output line containing the sentinel
+    let id = out
+        .lines()
+        .find(|l| l.contains(sentinel))
+        .and_then(|l| l.split("(id: ").nth(1))
+        .and_then(|s| s.split(')').next())
+        .expect("could not parse id from memory output")
+        .to_string();
+
+    let del = run(&dir, &["memory", "--delete", &id]);
+    assert!(del.status.success(), "delete failed: {}", stderr(&del));
+    assert!(
+        stdout(&del).contains("Deleted"),
+        "unexpected delete output: {}",
+        stdout(&del)
+    );
+
+    let mem2 = run(&dir, &["memory"]);
+    assert!(
+        !stdout(&mem2).contains(sentinel),
+        "observation still present after delete: {}",
+        stdout(&mem2)
+    );
+}
+
+/// `memory --delete` with an unknown id must exit non-zero.
+#[test]
+fn memory_delete_nonexistent_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let del = run(&dir, &["memory", "--delete", "00000000-0000-0000-0000-000000000000"]);
+    assert!(
+        !del.status.success(),
+        "expected non-zero exit for unknown id"
+    );
+}

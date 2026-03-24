@@ -257,6 +257,10 @@ codesurgeon impact src/http.rs::send       # Blast radius
 codesurgeon flow src/http.rs::send src/retry.rs::with_retry  # Logic flow
 codesurgeon diff < my.patch               # Diff-aware capsule
 codesurgeon docs                           # Generate per-module CLAUDE.md files
+codesurgeon memory                         # List saved observations (shows IDs)
+codesurgeon memory --delete <id>           # Delete an observation by ID
+codesurgeon observe "insight text"         # Save a manual observation
+codesurgeon observe "insight" --symbol src/http.rs::send  # Attach to a symbol
 ```
 
 ## Language support

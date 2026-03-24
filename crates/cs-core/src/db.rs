@@ -327,6 +327,14 @@ impl Database {
         Ok(results)
     }
 
+    pub fn delete_observation(&self, id: &str) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM observations WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(count > 0)
+    }
+
     /// Mark observations stale when the code they refer to has changed.
     pub fn mark_stale_by_symbol_hash(&self, symbol_fqn: &str, new_hash: &str) -> Result<u64> {
         let count = self.conn.execute(

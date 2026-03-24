@@ -1,8 +1,14 @@
 use crate::language::{detect_language, Language};
-use crate::symbol::{Edge, EdgeKind, Symbol, SymbolKind};
+use crate::symbol::{Symbol, SymbolKind};
 use anyhow::Result;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
+
+// Re-export edge extraction so callers can use `crate::indexer::extract_*`
+// without knowing about the edges module (source-compatible with old import paths).
+pub use crate::edges::{
+    extract_call_edges, extract_impl_edges, extract_import_edges, extract_type_flow_edges,
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -32,403 +38,6 @@ pub fn index_file(workspace_root: &Path, abs_path: &Path, content: &str) -> Resu
         Language::Sql => extract_sql(&rel_path, content),
         Language::Markdown => extract_markdown(&rel_path, content),
     }
-}
-
-/// Build import edges between already-indexed symbols.
-/// Parses import statement text to extract actual imported names.
-pub fn extract_import_edges(symbols: &[Symbol]) -> Vec<Edge> {
-    let mut name_to_ids: std::collections::HashMap<&str, Vec<u64>> =
-        std::collections::HashMap::new();
-    for sym in symbols {
-        name_to_ids
-            .entry(sym.name.as_str())
-            .or_default()
-            .push(sym.id);
-    }
-
-    let mut edges = Vec::new();
-
-    for sym in symbols {
-        if sym.kind != SymbolKind::Import {
-            continue;
-        }
-        for name in extract_imported_names(sym) {
-            if let Some(targets) = name_to_ids.get(name.as_str()) {
-                for &target_id in targets {
-                    if target_id != sym.id {
-                        edges.push(
-                            Edge::new(sym.id, target_id, EdgeKind::Imports)
-                                .with_label(name.clone()),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    edges
-}
-
-/// Parse an import symbol's body text to get the actual imported names.
-fn extract_imported_names(sym: &Symbol) -> Vec<String> {
-    let text = sym.body.trim();
-    match sym.language {
-        Language::Python => {
-            // "from foo import Bar, Baz" → ["Bar", "Baz"]
-            // "import os, sys" → ["os", "sys"]
-            if let Some(rest) = text.strip_prefix("from ") {
-                if let Some(import_part) = rest.split(" import ").nth(1) {
-                    return import_part
-                        .split(',')
-                        .map(|s| {
-                            s.trim()
-                                .trim_matches(|c| c == '(' || c == ')' || c == '\\')
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or("")
-                                .to_string()
-                        })
-                        .filter(|s| !s.is_empty() && s != "*")
-                        .collect();
-                }
-            }
-            if let Some(rest) = text.strip_prefix("import ") {
-                return rest
-                    .split(',')
-                    .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-            vec![]
-        }
-        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => {
-            // "import { Foo, Bar } from './module'" → ["Foo", "Bar"]
-            // "import DefaultExport from './x'" → ["DefaultExport"]
-            if let (Some(start), Some(end)) = (text.find('{'), text.find('}')) {
-                return text[start + 1..end]
-                    .split(',')
-                    .map(|s| {
-                        // "foo as bar" → "foo"
-                        s.split_whitespace().next().unwrap_or("").to_string()
-                    })
-                    .filter(|s| !s.is_empty() && s != "type")
-                    .collect();
-            }
-            // "import Foo from '...'" or "import * as Foo from '...'"
-            if let Some(rest) = text.strip_prefix("import ") {
-                let first = rest.split_whitespace().next().unwrap_or("");
-                if !first.is_empty() && first != "{" && first != "*" && first != "type" {
-                    return vec![first.to_string()];
-                }
-            }
-            vec![]
-        }
-        Language::Rust => {
-            // "use foo::bar::{Bar, Baz}" → ["Bar", "Baz"]
-            // "use foo::bar::Baz" → ["Baz"]
-            let path = text.trim_start_matches("use ").trim_end_matches(';').trim();
-            if let (Some(start), Some(end)) = (path.find('{'), path.rfind('}')) {
-                return path[start + 1..end]
-                    .split(',')
-                    .map(|s| {
-                        // "Foo as F" → "Foo"
-                        s.split_whitespace().next().unwrap_or("").to_string()
-                    })
-                    .filter(|s| !s.is_empty() && s != "*" && s != "self")
-                    .collect();
-            }
-            if let Some(last) = path.split("::").last() {
-                let name = last.trim().to_string();
-                if !name.is_empty() && name != "*" && name != "self" {
-                    return vec![name];
-                }
-            }
-            vec![]
-        }
-        _ => vec![],
-    }
-}
-
-/// Build Implements edges from `impl Trait for Type` symbols.
-pub fn extract_impl_edges(symbols: &[Symbol]) -> Vec<Edge> {
-    let mut name_to_ids: std::collections::HashMap<&str, Vec<u64>> =
-        std::collections::HashMap::new();
-    for sym in symbols {
-        name_to_ids
-            .entry(sym.name.as_str())
-            .or_default()
-            .push(sym.id);
-    }
-
-    let mut edges = Vec::new();
-
-    for sym in symbols {
-        if sym.kind != SymbolKind::Impl {
-            continue;
-        }
-        // Name is "impl::TraitName for TypeName" or "impl::TypeName"
-        let label = sym.name.trim_start_matches("impl::");
-        if let Some((trait_part, type_part)) = label.split_once(" for ") {
-            // Strip generic parameters: "Display" not "Display<T>"
-            let trait_name = trait_part.trim().split('<').next().unwrap_or("").trim();
-            let type_name = type_part.trim().split('<').next().unwrap_or("").trim();
-
-            if let (Some(type_ids), Some(trait_ids)) =
-                (name_to_ids.get(type_name), name_to_ids.get(trait_name))
-            {
-                for &type_id in type_ids {
-                    for &trait_id in trait_ids {
-                        if type_id != trait_id {
-                            edges.push(
-                                Edge::new(type_id, trait_id, EdgeKind::Implements)
-                                    .with_label(label.to_string()),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    edges
-}
-
-/// Build Calls edges by scanning function bodies for `identifier(args)` patterns.
-/// Edge labels include a short args snippet for call-site annotation.
-pub fn extract_call_edges(symbols: &[Symbol]) -> Vec<Edge> {
-    let mut name_to_ids: std::collections::HashMap<&str, Vec<u64>> =
-        std::collections::HashMap::new();
-    for sym in symbols {
-        name_to_ids
-            .entry(sym.name.as_str())
-            .or_default()
-            .push(sym.id);
-        // Also index by simple name (after last "::") so that method call sites
-        // like `foo()` resolve to `Type::foo` entries in the map.
-        if let Some(simple) = sym.name.rsplit("::").next() {
-            if simple != sym.name {
-                name_to_ids.entry(simple).or_default().push(sym.id);
-            }
-        }
-    }
-
-    let mut edges = Vec::new();
-
-    for sym in symbols {
-        if !sym.kind.is_callable() || sym.body.len() < 20 {
-            continue;
-        }
-        // Deduplicate: one edge per (caller, callee) pair with the first args snippet seen
-        let mut seen: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
-        for (callee_name, args_snippet) in calls_in_body(&sym.body) {
-            if let Some(targets) = name_to_ids.get(callee_name.as_str()) {
-                for &target_id in targets {
-                    if target_id != sym.id {
-                        seen.entry(target_id).or_insert_with(|| {
-                            if args_snippet.is_empty() {
-                                callee_name.clone()
-                            } else {
-                                format!("{}({})", callee_name, args_snippet)
-                            }
-                        });
-                    }
-                }
-            }
-        }
-        for (target_id, label) in seen {
-            edges.push(Edge::new(sym.id, target_id, EdgeKind::Calls).with_label(label));
-        }
-    }
-
-    edges
-}
-
-/// Extract call sites from source text.
-/// Returns `(callee_name, args_snippet)` pairs.
-/// `args_snippet` is a truncated view of the argument text (≤60 chars).
-fn calls_in_body(body: &str) -> Vec<(String, String)> {
-    const SKIP: &[&str] = &[
-        "if",
-        "for",
-        "while",
-        "match",
-        "fn",
-        "let",
-        "mut",
-        "pub",
-        "use",
-        "mod",
-        "struct",
-        "enum",
-        "impl",
-        "trait",
-        "type",
-        "async",
-        "await",
-        "return",
-        "where",
-        "loop",
-        "continue",
-        "break",
-        "Some",
-        "None",
-        "Ok",
-        "Err",
-        "Box",
-        "Vec",
-        "HashMap",
-        "HashSet",
-        "BTreeMap",
-        "String",
-        "Option",
-        "Result",
-        "Arc",
-        "Mutex",
-        "RwLock",
-        "format",
-        "println",
-        "eprintln",
-        "print",
-        "eprint",
-        "vec",
-        "assert",
-        "panic",
-        "todo",
-        "unimplemented",
-    ];
-
-    let mut calls = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
-    let bytes = body.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        if bytes[i] == b'(' && i > 0 {
-            let mut j = i.saturating_sub(1);
-            while j > 0 && bytes[j] == b' ' {
-                j -= 1;
-            }
-            if bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' {
-                let end = j + 1;
-                while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
-                    j -= 1;
-                }
-                if let Ok(name) = std::str::from_utf8(&bytes[j..end]) {
-                    if name.len() > 2 && !SKIP.contains(&name) && !seen_names.contains(name) {
-                        seen_names.insert(name.to_string());
-                        // Capture args snippet: scan forward, balance parens, take first 60 chars
-                        let args_start = i + 1;
-                        let args_snippet = extract_args_snippet(bytes, args_start, 60);
-                        calls.push((name.to_string(), args_snippet));
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-
-    calls
-}
-
-/// Capture up to `max_chars` of argument text starting at `start` (just after the opening `(`).
-/// Stops at the matching `)` or at `max_chars`.
-fn extract_args_snippet(bytes: &[u8], start: usize, max_chars: usize) -> String {
-    let len = bytes.len();
-    let mut depth = 1i32;
-    let mut end = start;
-    while end < len && depth > 0 {
-        match bytes[end] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            _ => {}
-        }
-        if depth > 0 {
-            end += 1;
-        }
-    }
-    let raw = std::str::from_utf8(&bytes[start..end.min(len)])
-        .unwrap_or("")
-        .trim();
-    if raw.len() <= max_chars {
-        raw.to_string()
-    } else {
-        // Find a valid UTF-8 char boundary at or before max_chars to avoid panic.
-        let mut boundary = max_chars;
-        while boundary > 0 && !raw.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        format!("{}…", &raw[..boundary])
-    }
-}
-
-/// Build type-flow edges: functions that mention a type in their signature depend on that type.
-/// Creates `References` edges from callables to the type symbols they reference.
-pub fn extract_type_flow_edges(symbols: &[Symbol]) -> Vec<Edge> {
-    // Build a map from type name → symbol IDs for all type-defining symbols
-    let mut type_name_to_ids: std::collections::HashMap<&str, Vec<u64>> =
-        std::collections::HashMap::new();
-    for sym in symbols {
-        if sym.kind.is_type_definition() {
-            type_name_to_ids
-                .entry(sym.name.as_str())
-                .or_default()
-                .push(sym.id);
-        }
-    }
-    if type_name_to_ids.is_empty() {
-        return vec![];
-    }
-
-    let mut edges = Vec::new();
-
-    for sym in symbols {
-        if !sym.kind.is_callable() {
-            continue;
-        }
-        // Extract the signature line (everything up to the first `{` or end of first line)
-        let sig = sym.body.lines().next().unwrap_or("").trim();
-        // Find PascalCase identifiers in the signature that match known types
-        for type_name in pascal_case_identifiers(sig) {
-            if let Some(type_ids) = type_name_to_ids.get(type_name.as_str()) {
-                for &type_id in type_ids {
-                    if type_id != sym.id {
-                        edges.push(
-                            Edge::new(sym.id, type_id, EdgeKind::References)
-                                .with_label(type_name.clone()),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    edges
-}
-
-/// Extract PascalCase identifiers from a string (type names in signatures).
-fn pascal_case_identifiers(text: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut i = 0;
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-
-    while i < len {
-        if bytes[i].is_ascii_uppercase() {
-            let start = i;
-            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            if i - start >= 2 {
-                if let Ok(name) = std::str::from_utf8(&bytes[start..i]) {
-                    result.push(name.to_string());
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
-    result
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1840,7 +1449,7 @@ $$ LANGUAGE plpgsql;
         let bytes = src.as_bytes();
         // Find the '(' position and step past it to get args_start.
         let args_start = src.find('(').unwrap() + 1;
-        let result = extract_args_snippet(bytes, args_start, 5);
+        let result = crate::edges::extract_args_snippet(bytes, args_start, 5);
         // Must not panic and must be valid UTF-8.
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
         // Must be no longer than max_chars + the ellipsis.
@@ -1851,7 +1460,7 @@ $$ LANGUAGE plpgsql;
     fn args_snippet_empty_parens() {
         let src = b"foo()";
         // args_start points at the char after '('
-        let result = extract_args_snippet(src, 4, 60);
+        let result = crate::edges::extract_args_snippet(src, 4, 60);
         assert!(result.is_empty(), "expected empty snippet, got {:?}", result);
     }
 
@@ -1859,7 +1468,7 @@ $$ LANGUAGE plpgsql;
     fn args_snippet_unclosed_paren_does_not_panic() {
         // No closing ')' — depth never reaches 0.
         let src = b"foo(bar, baz";
-        let result = extract_args_snippet(src, 4, 60);
+        let result = crate::edges::extract_args_snippet(src, 4, 60);
         // Should return whatever it found without panicking.
         assert!(!result.is_empty());
     }

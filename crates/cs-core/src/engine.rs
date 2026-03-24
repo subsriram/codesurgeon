@@ -9,53 +9,32 @@ use crate::indexer::{
     extract_call_edges, extract_impl_edges, extract_import_edges, extract_type_flow_edges,
     index_file,
 };
+use crate::diff::parse_diff_symbols;
 use crate::language::Language;
+use crate::module_docs::{detect_xcode_mcp, swift_enrichment_hint};
 use crate::memory::{new_session_id, MemoryStore};
+use crate::ranking::{
+    dedup_by_fqn, graph_candidates, inject_structural_candidates, resolve_adjacents,
+    rrf_merge, select_adjacents, apply_structural_resort,
+    CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K,
+};
+#[cfg(feature = "embeddings")]
+use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
+use crate::ranking::BM25_POOL_SIZE;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
-use crate::symbol::{Symbol, SymbolKind};
+use crate::symbol::Symbol;
 use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-
-// ── Ranking constants ────────────────────────────────────────────────────────
-// See docs/ranking.md for rationale. Update both when tuning.
-
-/// BM25 candidate pool size passed to Tantivy.
-const BM25_POOL_SIZE: usize = 50;
-/// Number of ANN candidates from the HNSW index per query.
-#[cfg(feature = "embeddings")]
-const ANN_CANDIDATES: usize = 25;
-/// Number of graph-neighbor candidates expanded from BM25 seeds per query.
-const GRAPH_CANDIDATES: usize = 25;
-/// RRF rank fusion constant (k=60 from the original paper).
-const RRF_K: f32 = 60.0;
-/// Structural injection: score multiplier for injected hub types.
-const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
-/// Centrality boost multiplier applied to BM25 score.
-const CENTRALITY_BOOST: f32 = 3.0;
-/// Fixed boost for markdown symbols (bypasses centrality which is always 0).
-const MARKDOWN_CENTRALITY_BYPASS: f32 = 2.5;
-/// Weight of BM25+centrality in the final blend (when embeddings are available).
-#[cfg(feature = "embeddings")]
-const BM25_BLEND_WEIGHT: f32 = 0.5;
-/// Weight of semantic cosine similarity in the final blend.
-#[cfg(feature = "embeddings")]
-const SEMANTIC_BLEND_WEIGHT: f32 = 0.5;
-/// Structural re-sort: in-degree weight (dominant signal).
-const STRUCTURAL_INDEGREE_WEIGHT: f32 = 20.0;
-/// Structural re-sort: accumulated BM25 weight (tiebreaker).
-const STRUCTURAL_BM25_WEIGHT: f32 = 0.05;
-/// Coordinator bonus per owned seed type.
-const COORDINATOR_BONUS_PER_TYPE: f32 = 5.0;
-/// Minimum owned seed types required to trigger coordinator bonus.
-const COORDINATOR_MIN_OWNED: usize = 2;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "embeddings")]
+use std::sync::OnceLock;
 
 #[cfg(feature = "embeddings")]
 fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
@@ -204,7 +183,7 @@ pub struct CoreEngine {
     /// "not ready" message rather than blocking or returning stale results.
     indexing: Arc<AtomicBool>,
     #[cfg(feature = "embeddings")]
-    embedder: Option<Embedder>,
+    embedder: Arc<OnceLock<Embedder>>,
     /// In-memory cache of all symbol embeddings — loaded after each index pass so
     /// run_pipeline never needs to hit SQLite for embedding lookups.
     #[cfg(feature = "embeddings")]
@@ -257,26 +236,11 @@ impl CoreEngine {
             );
         }
 
-        // Attempt to load the embedding model (only compiled in with --features embeddings).
-        // Skipped for secondary (read-only) instances — they don't compute new embeddings
-        // and loading the ~500 MB ONNX model would waste ~1-2 GB of RAM per probe process.
-        // Falls back to BM25-only search when None.
+        // Embedder is loaded lazily via `load_embedder()` after the engine is made
+        // available to the MCP stdio loop.  This lets BM25+graph queries proceed
+        // immediately while the ~130 MB ONNX model loads in the background.
         #[cfg(feature = "embeddings")]
-        let embedder = if config.load_embedder {
-            match Embedder::new() {
-                Ok(e) => {
-                    tracing::info!("Embedder loaded (NomicEmbedTextV15Q, 768-dim)");
-                    Some(e)
-                }
-                Err(e) => {
-                    tracing::warn!("Embedder unavailable, falling back to BM25: {}", e);
-                    None
-                }
-            }
-        } else {
-            tracing::info!("Embedder skipped (read-only instance)");
-            None
-        };
+        let embedder = Arc::new(OnceLock::new());
 
         // Warm the embedding cache from previously stored embeddings, then build the
         // HNSW index on a background thread so startup is not blocked.
@@ -314,6 +278,30 @@ impl CoreEngine {
             ann_index,
         })
     }
+
+    /// Load the embedding model in the current thread.
+    /// Call this from a background thread after the engine is available so queries
+    /// can proceed with BM25+graph while the ~130 MB ONNX model downloads/loads.
+    /// No-op when the `embeddings` feature is disabled or for read-only instances.
+    #[cfg(feature = "embeddings")]
+    pub fn load_embedder(&self) {
+        if !self.config.load_embedder {
+            tracing::info!("Embedder skipped (read-only instance)");
+            return;
+        }
+        match Embedder::new() {
+            Ok(e) => {
+                let _ = self.embedder.set(e);
+                tracing::info!("Embedder loaded (NomicEmbedTextV15Q, 768-dim)");
+            }
+            Err(e) => {
+                tracing::warn!("Embedder unavailable, falling back to BM25: {}", e);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "embeddings"))]
+    pub fn load_embedder(&self) {}
 
     // ── Indexing ──────────────────────────────────────────────────────────────
 
@@ -419,7 +407,7 @@ impl CoreEngine {
         // shorter text, lower noise, still captures what the symbol "is".
         // Runs after graph/search locks are released so queries can proceed in parallel.
         #[cfg(feature = "embeddings")]
-        if let Some(emb) = &self.embedder {
+        if let Some(emb) = self.embedder.get() {
             let skeletons: Vec<String> = all_symbols
                 .iter()
                 .map(|s| {
@@ -535,7 +523,7 @@ impl CoreEngine {
 
         // Phase 7: Re-embed new symbols and refresh cache (brief db lock, no other locks held).
         #[cfg(feature = "embeddings")]
-        if let Some(emb) = &self.embedder {
+        if let Some(emb) = self.embedder.get() {
             let skeletons: Vec<String> = symbols
                 .iter()
                 .map(|s| {
@@ -584,13 +572,19 @@ impl CoreEngine {
     // ── MCP Tool implementations ──────────────────────────────────────────────
 
     /// Primary tool: auto-detects intent, returns context + impact + memories.
-    pub fn run_pipeline(&self, task: &str, budget: Option<u32>) -> Result<String> {
+    pub fn run_pipeline(
+        &self,
+        task: &str,
+        budget: Option<u32>,
+        language: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<String> {
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(task);
 
         tracing::debug!("run_pipeline: intent={:?}, task={}", intent, task);
 
-        let capsule = self.build_context_capsule(task, budget, &intent)?;
+        let capsule = self.build_context_capsule(task, budget, &intent, language, file_hint, None, None)?;
         let mut out = format_capsule(&capsule);
 
         // Append Swift enrichment hint when Swift symbols appear in results.
@@ -612,15 +606,28 @@ impl CoreEngine {
     }
 
     /// Get context capsule for a query.
-    pub fn get_context_capsule(&self, query: &str, budget: Option<u32>) -> Result<String> {
+    pub fn get_context_capsule(
+        &self,
+        query: &str,
+        budget: Option<u32>,
+        max_results: Option<usize>,
+        min_score: Option<f32>,
+    ) -> Result<String> {
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(query);
-        let capsule = self.build_context_capsule(query, budget, &intent)?;
+        let capsule = self.build_context_capsule(query, budget, &intent, None, None, max_results, min_score)?;
         Ok(format_capsule(&capsule))
     }
 
     /// Get impact graph: what breaks if `symbol_fqn` changes?
-    pub fn get_impact_graph(&self, symbol_fqn: &str) -> Result<ImpactResult> {
+    /// `max_depth` overrides the config blast-radius depth.
+    /// `include_tests` (default true) — set false to exclude test files from results.
+    pub fn get_impact_graph(
+        &self,
+        symbol_fqn: &str,
+        max_depth: Option<u32>,
+        include_tests: bool,
+    ) -> Result<ImpactResult> {
         let graph = self.graph.read();
 
         let target = graph.find_by_fqn(symbol_fqn).ok_or_else(|| {
@@ -643,17 +650,26 @@ impl CoreEngine {
         })?;
 
         let target_id = target.id;
+        let depth = max_depth.unwrap_or(self.config.max_blast_radius_depth);
+
+        let is_test = |s: &SymbolRef| -> bool {
+            let p = &s.file_path;
+            p.contains("/test") || p.contains("_test.") || p.contains("test_")
+                || p.contains("/spec") || p.contains("_spec.")
+        };
 
         let direct: Vec<SymbolRef> = graph
             .dependents(target_id)
             .into_iter()
             .map(sym_ref)
+            .filter(|s| include_tests || !is_test(s))
             .collect();
 
         let transitive: Vec<SymbolRef> = graph
-            .blast_radius(target_id, self.config.max_blast_radius_depth)
+            .blast_radius(target_id, depth)
             .into_iter()
             .map(sym_ref)
+            .filter(|s| include_tests || !is_test(s))
             .collect();
 
         let total = direct.len() + transitive.len();
@@ -667,13 +683,27 @@ impl CoreEngine {
     }
 
     /// Get skeleton of a file: all signatures without bodies.
-    pub fn get_skeleton(&self, file_path: &str) -> Result<SkeletonResult> {
+    /// `max_depth` limits nesting depth: 1 = top-level only, 2 = top-level + methods, etc.
+    /// Depth is measured by counting `::` separators after the file prefix in the FQN.
+    pub fn get_skeleton(&self, file_path: &str, max_depth: Option<u32>) -> Result<SkeletonResult> {
         let graph = self.graph.read();
         let symbols = graph.file_symbols(file_path);
 
         let mut total_tokens = 0u32;
         let skeleton_syms: Vec<SkeletonSymbol> = symbols
             .iter()
+            .filter(|sym| {
+                if let Some(depth) = max_depth {
+                    let sym_depth = sym.fqn
+                        .splitn(2, "::")
+                        .nth(1)
+                        .map(|rest| rest.matches("::").count() as u32 + 1)
+                        .unwrap_or(1);
+                    sym_depth <= depth
+                } else {
+                    true
+                }
+            })
             .map(|sym| {
                 let skel = skeletonize(sym);
                 let tokens = (skel.len() / 4) as u32;
@@ -746,6 +776,11 @@ impl CoreEngine {
     pub fn get_session_context(&self) -> Result<Vec<crate::memory::Observation>> {
         let mem = self.memory.lock();
         mem.get_recent_observations(50)
+    }
+
+    /// Delete an observation by ID. Returns true if found and deleted.
+    pub fn delete_observation(&self, id: &str) -> Result<bool> {
+        self.memory.lock().delete(id)
     }
 
     /// Save a manual observation.
@@ -987,7 +1022,7 @@ impl CoreEngine {
     /// Returns `(symbol_id, cosine_similarity)` pairs, sorted descending by similarity.
     #[cfg(feature = "embeddings")]
     fn ann_candidates(&self, query: &str, k: usize) -> Vec<(u64, f32)> {
-        let Some(emb) = &self.embedder else { return vec![] };
+        let Some(emb) = self.embedder.get() else { return vec![] };
         let query_vec = match emb.embed_one(query) {
             Ok(v) => v,
             Err(e) => {
@@ -1031,6 +1066,10 @@ impl CoreEngine {
         query: &str,
         budget: u32,
         intent: &SearchIntent,
+        language: Option<&str>,
+        file_hint: Option<&str>,
+        max_results: Option<usize>,
+        min_score: Option<f32>,
     ) -> Result<Capsule> {
         // ── Stage 1: Candidate Retrieval (BM25 + graph neighbors + ANN) ──────────
         let bm25_results = self.search.lock().search(query, BM25_POOL_SIZE)?;
@@ -1042,27 +1081,23 @@ impl CoreEngine {
         // Graph neighbor expansion: 1-hop neighbors of BM25 seeds, ranked by centrality.
         let graph_results = {
             let graph = self.graph.read();
-            Self::graph_candidates(&graph, &bm25_ids, GRAPH_CANDIDATES)
+            graph_candidates(&graph, &bm25_ids, GRAPH_CANDIDATES)
         };
 
         // ANN semantic retrieval + RRF fusion across all three sources.
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
-            Self::rrf_merge(&[&bm25_results, &graph_results, &ann_results], RRF_K)
+            rrf_merge(&[&bm25_results, &graph_results, &ann_results], RRF_K)
         };
         #[cfg(not(feature = "embeddings"))]
-        let mut search_results = Self::rrf_merge(&[&bm25_results, &graph_results], RRF_K);
+        let mut search_results = rrf_merge(&[&bm25_results, &graph_results], RRF_K);
 
         let graph = self.graph.read();
 
         // 2. Inject high-centrality types for Structural queries (BM25 can't surface them)
         if *intent == SearchIntent::Structural {
-            Self::inject_structural_candidates(
-                &graph,
-                &mut search_results,
-                self.config.max_pivots,
-            );
+            inject_structural_candidates(&graph, &mut search_results, self.config.max_pivots);
         }
 
         // 3. Re-rank by query proximity + centrality + optional semantic similarity
@@ -1082,22 +1117,47 @@ impl CoreEngine {
 
         // 4. For Structural intent: re-sort by in-degree + coordinator bonus
         let scored = if *intent == SearchIntent::Structural {
-            Self::apply_structural_resort(&graph, scored, &bm25_ids, query)
+            apply_structural_resort(&graph, scored, &bm25_ids, query)
         } else {
             scored
         };
 
         // 5. Deduplicate by FQN — keep the highest-scored entry per unique FQN.
-        let scored = Self::dedup_by_fqn(&graph, scored);
+        let mut scored = dedup_by_fqn(&graph, scored);
+
+        // 5.5 Apply optional post-filters (language, file_hint, min_score)
+        if language.is_some() || file_hint.is_some() || min_score.is_some() {
+            scored.retain(|(id, score)| {
+                if let Some(min) = min_score {
+                    if *score < min {
+                        return false;
+                    }
+                }
+                if let Some(sym) = graph.get_symbol(*id) {
+                    if let Some(lang) = language {
+                        if !sym.language.as_str().eq_ignore_ascii_case(lang) {
+                            return false;
+                        }
+                    }
+                    if let Some(hint) = file_hint {
+                        if !sym.file_path.contains(hint) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+        }
+        let max_pivots = max_results.unwrap_or(self.config.max_pivots);
 
         // 6. Select pivots and adjacents
         let pivot_ids: Vec<u64> = scored
             .iter()
-            .take(self.config.max_pivots)
+            .take(max_pivots)
             .map(|(id, _)| *id)
             .collect();
         let adjacent_ids =
-            Self::select_adjacents(&graph, &pivot_ids, intent, self.config.max_adjacent);
+            select_adjacents(&graph, &pivot_ids, intent, self.config.max_adjacent);
 
         // 7. Resolve IDs → Symbols with filtering
         let filter_adjacents = matches!(intent, SearchIntent::Structural | SearchIntent::Explore);
@@ -1105,7 +1165,7 @@ impl CoreEngine {
             .iter()
             .filter_map(|id| graph.get_symbol(*id))
             .collect();
-        let adjacent_syms = Self::resolve_adjacents(&graph, &adjacent_ids, filter_adjacents);
+        let adjacent_syms = resolve_adjacents(&graph, &adjacent_ids, filter_adjacents);
 
         // 8. Fetch memories and assemble capsule
         let raw_memories = self.memory.lock().get_recent_observations(20)?;
@@ -1128,62 +1188,6 @@ impl CoreEngine {
         ))
     }
 
-    /// Reciprocal Rank Fusion over multiple ranked lists.
-    /// Each list contributes `1 / (k + rank + 1)` to a candidate's score.
-    /// Lists that agree on a candidate amplify its score; unique candidates are preserved.
-    fn rrf_merge(lists: &[&[(u64, f32)]], k: f32) -> Vec<(u64, f32)> {
-        let mut scores: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
-        for list in lists {
-            for (rank, (id, _)) in list.iter().enumerate() {
-                *scores.entry(*id).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
-            }
-        }
-        let mut merged: Vec<(u64, f32)> = scores.into_iter().collect();
-        merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        merged
-    }
-
-    /// Expand 1-hop graph neighbors of BM25 seed IDs, ranked by centrality.
-    /// Seeds themselves are excluded — they are already in the BM25 list.
-    fn graph_candidates(
-        graph: &CodeGraph,
-        seed_ids: &std::collections::HashSet<u64>,
-        max: usize,
-    ) -> Vec<(u64, f32)> {
-        let mut seen: std::collections::HashSet<u64> = seed_ids.clone();
-        let mut candidates: Vec<(u64, f32)> = Vec::new();
-        for &seed in seed_ids {
-            for neighbor_id in graph.neighbor_ids(seed) {
-                if seen.insert(neighbor_id) {
-                    candidates.push((neighbor_id, graph.centrality_score(neighbor_id)));
-                }
-            }
-        }
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.truncate(max);
-        candidates
-    }
-
-    /// Augment the BM25 candidate pool with top hub types ranked by family in-degree.
-    /// BM25 cannot surface types whose names don't lexically match the query.
-    fn inject_structural_candidates(
-        graph: &CodeGraph,
-        search_results: &mut Vec<(u64, f32)>,
-        max_pivots: usize,
-    ) {
-        let mut by_in_degree: Vec<(u64, f32)> = graph
-            .all_symbols()
-            .filter(|s| s.kind.is_type_definition() || s.kind == SymbolKind::Module)
-            .map(|s| (s.id, graph.family_in_degree_score(s.id)))
-            .collect();
-        by_in_degree.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (id, c_in) in by_in_degree.into_iter().take(max_pivots * 2) {
-            if !search_results.iter().any(|(sid, _)| *sid == id) {
-                search_results.push((id, c_in * STRUCTURAL_INJECTION_SCORE));
-            }
-        }
-    }
-
     /// Apply centrality boost and optionally blend semantic similarity scores.
     /// Final = BM25_centrality * 0.5 + semantic_cosine * 0.5 (when embedder present).
     fn apply_centrality_and_semantics(
@@ -1194,7 +1198,7 @@ impl CoreEngine {
     ) -> Vec<(u64, f32)> {
         #[cfg(feature = "embeddings")]
         let semantic_scores: std::collections::HashMap<u64, f32> =
-            if let Some(emb) = &self.embedder {
+            if let Some(emb) = self.embedder.get() {
                 match emb.embed_one(query) {
                     Ok(query_vec) => {
                         let candidate_ids: std::collections::HashSet<u64> =
@@ -1245,183 +1249,6 @@ impl CoreEngine {
                 #[cfg(not(feature = "embeddings"))]
                 let final_score = bm25_score;
                 (id, final_score)
-            })
-            .collect()
-    }
-
-    /// For Structural intent: re-sort so type definitions ranked by in-degree come first,
-    /// with a coordinator bonus for types that declare BM25-matched types as properties.
-    fn apply_structural_resort(
-        graph: &CodeGraph,
-        scored: Vec<(u64, f32)>,
-        bm25_ids: &std::collections::HashSet<u64>,
-        query: &str,
-    ) -> Vec<(u64, f32)> {
-        let is_hub_type = |id: u64| {
-            graph
-                .get_symbol(id)
-                .map(|s| {
-                    s.kind.is_type_definition()
-                        || s.kind == SymbolKind::Impl
-                        || s.kind == SymbolKind::Module
-                })
-                .unwrap_or(false)
-        };
-
-        let mut type_scored: Vec<(u64, f32)> = scored
-            .iter()
-            .filter(|(id, _)| is_hub_type(*id))
-            .map(|(id, accumulated)| {
-                let c_in = graph.family_in_degree_score(*id);
-                (*id, c_in * STRUCTURAL_INDEGREE_WEIGHT + accumulated * STRUCTURAL_BM25_WEIGHT)
-            })
-            .collect();
-
-        // Coordinator bonus: find the type that DECLARES BM25-matched types as member
-        // variables. Seeds = BM25-matched types whose names overlap with 4-char query stems.
-        let query_stems: Vec<String> = query
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| t.len() > 3)
-            .map(|t| t[..t.len().min(4)].to_lowercase())
-            .collect();
-        let seed_names: Vec<String> = type_scored
-            .iter()
-            .filter_map(|(id, _)| {
-                if bm25_ids.contains(id) {
-                    graph.get_symbol(*id).map(|s| s.name.clone())
-                } else {
-                    None
-                }
-            })
-            .filter(|n| {
-                n.len() > 4 && {
-                    let nl = n.to_lowercase();
-                    query_stems.iter().any(|stem| nl.contains(stem.as_str()))
-                }
-            })
-            .collect();
-
-        if seed_names.len() >= 2 {
-            for (id, score) in &mut type_scored {
-                if let Some(sym) = graph.get_symbol(*id) {
-                    let path_lower = sym.file_path.to_lowercase();
-                    if path_lower.contains("test")
-                        || path_lower.contains("spec")
-                        || path_lower.contains("mock")
-                    {
-                        continue;
-                    }
-                    let owned = seed_names
-                        .iter()
-                        .filter(|name| {
-                            *name != &sym.name
-                                && (sym.body.contains(&format!(": {}", name))
-                                    || sym.body.contains(&format!(": [{}]", name))
-                                    || sym.body.contains(&format!(": {}?", name))
-                                    || sym.body.contains(&format!("[{}]", name)))
-                        })
-                        .count();
-                    if owned >= COORDINATOR_MIN_OWNED {
-                        *score += owned as f32 * COORDINATOR_BONUS_PER_TYPE;
-                    }
-                }
-            }
-        }
-
-        type_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let others: Vec<(u64, f32)> = scored
-            .into_iter()
-            .filter(|(id, _)| !is_hub_type(*id))
-            .collect();
-        type_scored.into_iter().chain(others).collect()
-    }
-
-    /// Deduplicate by FQN — keep the highest-scored entry per unique FQN.
-    fn dedup_by_fqn(graph: &CodeGraph, scored: Vec<(u64, f32)>) -> Vec<(u64, f32)> {
-        let mut seen_fqns = std::collections::HashSet::new();
-        scored
-            .into_iter()
-            .filter(|(id, _)| {
-                graph
-                    .get_symbol(*id)
-                    .map(|sym| seen_fqns.insert(sym.fqn.clone()))
-                    .unwrap_or(true)
-            })
-            .collect()
-    }
-
-    /// Select adjacent symbol IDs based on the search intent.
-    fn select_adjacents(
-        graph: &CodeGraph,
-        pivot_ids: &[u64],
-        intent: &SearchIntent,
-        max_adjacent: usize,
-    ) -> Vec<u64> {
-        let raw: Vec<u64> = match intent {
-            SearchIntent::Debug => pivot_ids
-                .iter()
-                .flat_map(|&id| {
-                    graph
-                        .dependencies(id)
-                        .iter()
-                        .map(|s| s.id)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|id| !pivot_ids.contains(id))
-                .take(max_adjacent)
-                .collect(),
-            SearchIntent::Refactor => pivot_ids
-                .iter()
-                .flat_map(|&id| {
-                    graph
-                        .blast_radius(id, 2)
-                        .iter()
-                        .map(|s| s.id)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|id| !pivot_ids.contains(id))
-                .take(max_adjacent)
-                .collect(),
-            _ => pivot_ids
-                .iter()
-                .flat_map(|&id| {
-                    let mut adj: Vec<u64> =
-                        graph.dependencies(id).iter().map(|s| s.id).collect();
-                    adj.extend(graph.dependents(id).iter().map(|s| s.id));
-                    adj
-                })
-                .filter(|id| !pivot_ids.contains(id))
-                .take(max_adjacent)
-                .collect(),
-        };
-        // Deduplicate (same symbol may be reachable from multiple pivots).
-        let mut seen = std::collections::HashSet::new();
-        raw.into_iter().filter(|id| seen.insert(*id)).collect()
-    }
-
-    /// Resolve adjacent IDs to symbols, filtering test files and capping per-file counts.
-    fn resolve_adjacents<'a>(
-        graph: &'a CodeGraph,
-        adjacent_ids: &[u64],
-        filter_test_files: bool,
-    ) -> Vec<&'a Symbol> {
-        let mut file_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        adjacent_ids
-            .iter()
-            .filter_map(|id| graph.get_symbol(*id))
-            .filter(|sym| {
-                if filter_test_files {
-                    let p = sym.file_path.to_lowercase();
-                    !p.contains("test") && !p.contains("spec") && !p.contains("mock")
-                } else {
-                    true
-                }
-            })
-            .filter(|sym| {
-                let count = file_counts.entry(sym.file_path.as_str()).or_insert(0);
-                *count += 1;
-                *count <= 2 // max 2 symbols per file in adjacents
             })
             .collect()
     }
@@ -1479,54 +1306,6 @@ impl CoreEngine {
     }
 }
 
-/// Parse a unified diff and return (file_path, start_line, end_line) for each changed hunk.
-fn parse_diff_symbols(diff: &str) -> Vec<(String, u32, u32)> {
-    let mut result = Vec::new();
-    let mut current_file = String::new();
-    let mut hunk_start = 0u32;
-    let mut hunk_end = 0u32;
-
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ b/") {
-            // Flush previous hunk
-            if !current_file.is_empty() && hunk_end >= hunk_start {
-                result.push((current_file.clone(), hunk_start, hunk_end));
-            }
-            current_file = rest.trim().to_string();
-            hunk_start = 0;
-            hunk_end = 0;
-        } else if line.starts_with("@@ ") {
-            // Flush previous hunk for this file
-            if !current_file.is_empty() && hunk_end >= hunk_start && hunk_start > 0 {
-                result.push((current_file.clone(), hunk_start, hunk_end));
-            }
-            // Parse "@@ -old_start,old_len +new_start,new_len @@"
-            // We care about the new file's line range (+new_start,new_len)
-            if let Some((start, len)) = parse_hunk_header(line) {
-                hunk_start = start;
-                hunk_end = start + len.saturating_sub(1);
-            }
-        }
-    }
-
-    // Flush last hunk
-    if !current_file.is_empty() && hunk_end >= hunk_start && hunk_start > 0 {
-        result.push((current_file, hunk_start, hunk_end));
-    }
-
-    result
-}
-
-fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
-    // "@@ -a,b +c,d @@" — extract c and d
-    let plus_part = line.split('+').nth(1)?;
-    let range_part = plus_part.split(' ').next()?;
-    let mut parts = range_part.splitn(2, ',');
-    let start: u32 = parts.next()?.parse().ok()?;
-    let len: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-    Some((start, len))
-}
-
 fn sym_ref(s: &Symbol) -> SymbolRef {
     SymbolRef {
         fqn: s.fqn.clone(),
@@ -1536,162 +1315,4 @@ fn sym_ref(s: &Symbol) -> SymbolRef {
     }
 }
 
-/// Probe for Xcode 26+ MCP bridge availability. Result is cached after the first call
-/// so repeated `run_pipeline` or `index_status` calls pay the subprocess cost only once.
-fn detect_xcode_mcp() -> bool {
-    use std::sync::OnceLock;
-    static XCODE_MCP: OnceLock<bool> = OnceLock::new();
-    *XCODE_MCP.get_or_init(|| {
-        std::process::Command::new("xcrun")
-            .args(["--find", "mcpbridge"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
-}
 
-/// Human-readable hint appended to capsule output when Swift symbols are present.
-/// Tells the agent which enrichment path is available and what the fallback is,
-/// so it never silently operates on incomplete type information.
-fn swift_enrichment_hint(xcode_mcp_available: bool) -> String {
-    if xcode_mcp_available {
-        "\n> **Swift symbols detected.** \
-         Xcode MCP is available — call its tools for resolved types and live build diagnostics. \
-         codesurgeon results reflect tree-sitter parsing and remain available for semantic search \
-         and session memory.\n"
-            .to_string()
-    } else {
-        "\n> **Swift symbols detected.** \
-         Xcode MCP was not found — results are based on tree-sitter parsing only (no resolved types, \
-         no macro-expanded symbols). \
-         To enable full Swift enrichment: install Xcode 26+ and turn on \
-         Settings → Intelligence → Enable Model Context Protocol, \
-         then wire it up with `xcrun mcpbridge`. \
-         codesurgeon's graph is still usable for semantic search and session memory.\n"
-            .to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    fn test_engine(dir: &TempDir) -> CoreEngine {
-        let config = EngineConfig::new(dir.path()).without_embedder();
-        CoreEngine::new(config).expect("engine init failed")
-    }
-
-    /// A corrupt SQLite file must cause `CoreEngine::new` to return `Err`,
-    /// not panic or silently succeed with a broken state.
-    #[test]
-    fn corrupt_sqlite_returns_err_not_panic() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_dir = dir.path().join(".codesurgeon");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        // Write garbage bytes where the SQLite file would be.
-        std::fs::write(db_dir.join("index.db"), b"not a sqlite database\xff\xfe").unwrap();
-
-        let config = EngineConfig::new(dir.path()).without_embedder();
-        let result = CoreEngine::new(config);
-        assert!(
-            result.is_err(),
-            "expected Err for corrupt db, got Ok"
-        );
-    }
-
-    /// Parallel calls to `run_pipeline` must not deadlock or panic.
-    /// This guards against lock-ordering bugs between graph/search/db.
-    #[test]
-    fn parallel_queries_do_not_deadlock() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = Arc::new(test_engine(&dir));
-
-        let handles: Vec<_> = (0..8)
-            .map(|i| {
-                let e = Arc::clone(&engine);
-                std::thread::spawn(move || {
-                    let query = format!("query number {}", i);
-                    // Empty workspace — just must not panic/deadlock.
-                    let _ = e.run_pipeline(&query, Some(500));
-                })
-            })
-            .collect();
-
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
-    }
-
-    /// Concurrent `reindex_file` calls for the same file must not corrupt the
-    /// index or deadlock. Each call should complete without panicking.
-    #[test]
-    fn concurrent_reindex_same_file() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Write a small Rust file into the workspace.
-        let file_path = dir.path().join("lib.rs");
-        std::fs::write(
-            &file_path,
-            "pub fn foo() {}\npub fn bar() {}\n",
-        )
-        .unwrap();
-
-        let engine = Arc::new(test_engine(&dir));
-
-        let handles: Vec<_> = (0..4)
-            .map(|_| {
-                let e = Arc::clone(&engine);
-                let p = file_path.clone();
-                std::thread::spawn(move || {
-                    e.reindex_file(&p, crate::watcher::ChangeKind::Modified)
-                        .expect("reindex_file failed");
-                })
-            })
-            .collect();
-
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
-
-        // After concurrent reindexing, a query must still succeed.
-        let _ = engine.run_pipeline("foo", Some(500));
-    }
-
-    /// Queries issued while indexing is flagged as in-progress must succeed
-    /// (possibly with partial results) and must not panic.
-    #[test]
-    fn query_during_indexing_does_not_panic() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Write a few files so there's something to index.
-        std::fs::write(dir.path().join("a.py"), "def alpha(): pass\n").unwrap();
-        std::fs::write(dir.path().join("b.py"), "def beta(): pass\n").unwrap();
-
-        let engine = Arc::new(test_engine(&dir));
-
-        // Spawn an indexer thread.
-        let e_idx = Arc::clone(&engine);
-        let indexer = std::thread::spawn(move || {
-            e_idx.index_workspace().expect("index_workspace failed");
-        });
-
-        // Fire queries from multiple threads while indexing may still be running.
-        let query_handles: Vec<_> = (0..4)
-            .map(|_| {
-                let e = Arc::clone(&engine);
-                std::thread::spawn(move || {
-                    let _ = e.run_pipeline("alpha", Some(500));
-                })
-            })
-            .collect();
-
-        indexer.join().expect("indexer thread panicked");
-        for h in query_handles {
-            h.join().expect("query thread panicked");
-        }
-    }
-}

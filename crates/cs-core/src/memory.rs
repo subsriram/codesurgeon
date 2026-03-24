@@ -260,6 +260,11 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Delete an observation by ID. Returns true if a row was deleted.
+    pub fn delete(&self, id: &str) -> Result<bool> {
+        self.db.lock().delete_observation(id)
+    }
+
     /// Mark observations stale when their linked symbol's code has changed.
     pub fn check_and_mark_stale(&self, symbol_fqn: &str, new_hash: &str) -> Result<u64> {
         self.db

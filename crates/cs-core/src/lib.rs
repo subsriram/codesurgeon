@@ -1,11 +1,15 @@
 pub mod capsule;
 pub mod db;
+pub mod diff;
+pub mod edges;
 pub mod embedder;
 pub mod engine;
 pub mod graph;
 pub mod indexer;
 pub mod language;
 pub mod memory;
+pub mod module_docs;
+pub mod ranking;
 pub mod search;
 pub mod skeletonizer;
 pub mod symbol;

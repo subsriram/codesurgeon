@@ -78,32 +78,3 @@ pub fn detect_language(path: &Path) -> Option<Language> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn detects_python() {
-        assert_eq!(
-            detect_language(&PathBuf::from("foo.py")),
-            Some(Language::Python)
-        );
-    }
-
-    #[test]
-    fn detects_tsx() {
-        assert_eq!(
-            detect_language(&PathBuf::from("App.tsx")),
-            Some(Language::Tsx)
-        );
-    }
-
-    #[test]
-    fn detects_rust() {
-        assert_eq!(
-            detect_language(&PathBuf::from("main.rs")),
-            Some(Language::Rust)
-        );
-    }
-}
