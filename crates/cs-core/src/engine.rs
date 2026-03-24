@@ -1440,6 +1440,24 @@ mod tests {
         CoreEngine::new(config).expect("engine init failed")
     }
 
+    /// A corrupt SQLite file must cause `CoreEngine::new` to return `Err`,
+    /// not panic or silently succeed with a broken state.
+    #[test]
+    fn corrupt_sqlite_returns_err_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join(".codesurgeon");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        // Write garbage bytes where the SQLite file would be.
+        std::fs::write(db_dir.join("index.db"), b"not a sqlite database\xff\xfe").unwrap();
+
+        let config = EngineConfig::new(dir.path()).without_embedder();
+        let result = CoreEngine::new(config);
+        assert!(
+            result.is_err(),
+            "expected Err for corrupt db, got Ok"
+        );
+    }
+
     /// Parallel calls to `run_pipeline` must not deadlock or panic.
     /// This guards against lock-ordering bugs between graph/search/db.
     #[test]
