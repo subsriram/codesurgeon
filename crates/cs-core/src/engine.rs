@@ -1452,6 +1452,7 @@ impl CoreEngine {
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
+            .add_custom_ignore_filename(".codesurgeonignore")
             .build();
 
         let files: Vec<PathBuf> = walker
@@ -1461,6 +1462,9 @@ impl CoreEngine {
                     return None;
                 }
                 let path = entry.into_path();
+                if is_sensitive_file(&path) {
+                    return None;
+                }
                 // Filter by extension
                 let ext = path.extension()?.to_str()?.to_lowercase();
                 if matches!(
@@ -1499,12 +1503,196 @@ impl CoreEngine {
     }
 }
 
+// ── Secrets exclusion (11a) ───────────────────────────────────────────────────
+
+/// Returns true if the file's name matches a well-known sensitive-file pattern
+/// and should never be indexed, regardless of other settings.
+fn is_sensitive_filename(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_lowercase(),
+        None => return false,
+    };
+
+    // .env, .env.local, .env.production, etc.
+    if name.starts_with(".env") {
+        return true;
+    }
+    // foo.env
+    if name.ends_with(".env") {
+        return true;
+    }
+    // secret / credential / password anywhere in the name
+    if name.contains("secret") || name.contains("credential") || name.contains("password") {
+        return true;
+    }
+    // Certificate / key material
+    if matches!(
+        path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+        "pem" | "key" | "p12" | "pfx"
+    ) {
+        return true;
+    }
+
+    false
+}
+
+/// Heuristically scans the first 4 KB of a file for common API key literal patterns.
+/// Returns true if a high-confidence pattern is found.
+fn file_contains_api_key(path: &Path) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 4096];
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let n = f.read(&mut buf).unwrap_or(0);
+    let content = match std::str::from_utf8(&buf[..n]) {
+        Ok(s) => s,
+        // Binary file — not a source file we'd index anyway, but be safe
+        Err(_) => return false,
+    };
+
+    // (prefix, minimum length of the token after the prefix)
+    const PREFIXES: &[(&str, usize)] = &[
+        ("AKIA", 12),        // AWS access key ID
+        ("sk-", 24),         // OpenAI-style secret key
+        ("ghp_", 16),        // GitHub personal access token
+        ("github_pat_", 8),  // GitHub fine-grained PAT
+        ("glpat-", 16),      // GitLab personal access token
+        ("xoxb-", 8),        // Slack bot token
+        ("xoxp-", 8),        // Slack user token
+    ];
+
+    for (prefix, min_after) in PREFIXES {
+        let mut search = content;
+        while let Some(pos) = search.find(prefix) {
+            let after = &search[pos + prefix.len()..];
+            let token_len = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/'))
+                .count();
+            if token_len >= *min_after {
+                return true;
+            }
+            // Advance past this occurrence
+            search = &search[pos + prefix.len()..];
+        }
+    }
+
+    false
+}
+
+/// Combined check: excludes the file if its name matches sensitive patterns
+/// OR if its first 4 KB contains a high-confidence API key literal.
+fn is_sensitive_file(path: &Path) -> bool {
+    if is_sensitive_filename(path) {
+        return true;
+    }
+    if file_contains_api_key(path) {
+        tracing::debug!(path = %path.display(), "excluding file: API key pattern detected");
+        return true;
+    }
+    false
+}
+
 fn sym_ref(s: &Symbol) -> SymbolRef {
     SymbolRef {
         fqn: s.fqn.clone(),
         file_path: s.file_path.clone(),
         start_line: s.start_line,
         kind: s.kind.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod secrets_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // ── is_sensitive_filename ─────────────────────────────────────────────────
+
+    #[test]
+    fn dotenv_blocked() {
+        assert!(is_sensitive_filename(Path::new(".env")));
+        assert!(is_sensitive_filename(Path::new(".env.local")));
+        assert!(is_sensitive_filename(Path::new(".env.production")));
+        assert!(is_sensitive_filename(Path::new("dir/.env.test")));
+    }
+
+    #[test]
+    fn dotenv_extension_blocked() {
+        assert!(is_sensitive_filename(Path::new("config.env")));
+        assert!(is_sensitive_filename(Path::new("prod.env")));
+    }
+
+    #[test]
+    fn secret_credential_password_in_name_blocked() {
+        assert!(is_sensitive_filename(Path::new("my_secret.py")));
+        assert!(is_sensitive_filename(Path::new("db_credentials.json")));
+        assert!(is_sensitive_filename(Path::new("user_passwords.sql")));
+        assert!(is_sensitive_filename(Path::new("SECRET_KEY.txt")));
+    }
+
+    #[test]
+    fn certificate_key_extensions_blocked() {
+        assert!(is_sensitive_filename(Path::new("server.pem")));
+        assert!(is_sensitive_filename(Path::new("id_rsa.key")));
+        assert!(is_sensitive_filename(Path::new("keystore.p12")));
+        assert!(is_sensitive_filename(Path::new("cert.pfx")));
+    }
+
+    #[test]
+    fn normal_source_files_allowed() {
+        assert!(!is_sensitive_filename(Path::new("main.rs")));
+        assert!(!is_sensitive_filename(Path::new("config.toml")));
+        assert!(!is_sensitive_filename(Path::new("README.md")));
+        assert!(!is_sensitive_filename(Path::new("settings.py")));
+        assert!(!is_sensitive_filename(Path::new("environment.ts")));
+    }
+
+    // ── file_contains_api_key ─────────────────────────────────────────────────
+
+    fn tmp_with(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn aws_key_detected() {
+        let f = tmp_with("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE123\n");
+        assert!(file_contains_api_key(f.path()));
+    }
+
+    #[test]
+    fn openai_key_detected() {
+        let f = tmp_with("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789\n");
+        assert!(file_contains_api_key(f.path()));
+    }
+
+    #[test]
+    fn github_pat_detected() {
+        let f = tmp_with("token = ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345\n");
+        assert!(file_contains_api_key(f.path()));
+    }
+
+    #[test]
+    fn slack_bot_token_detected() {
+        let f = tmp_with("SLACK_TOKEN=xoxb-12345678-abcdefghij\n");
+        assert!(file_contains_api_key(f.path()));
+    }
+
+    #[test]
+    fn clean_source_file_not_flagged() {
+        let f = tmp_with("fn main() {\n    println!(\"Hello, world!\");\n}\n");
+        assert!(!file_contains_api_key(f.path()));
+    }
+
+    #[test]
+    fn short_prefix_match_not_flagged() {
+        // "sk-" with only 3 chars after — below the min_after=24 threshold
+        let f = tmp_with("let x = \"sk-abc\";\n");
+        assert!(!file_contains_api_key(f.path()));
     }
 }
 

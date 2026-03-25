@@ -400,6 +400,98 @@ fn index_stubs_false_skips_stub_files() {
     assert_eq!(stats.stub_symbol_count, 0, "stubs should not be indexed when disabled");
 }
 
+/// Sensitive files (.env, *.key, files named *secret*, etc.) must not be indexed.
+#[test]
+fn sensitive_files_are_not_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Normal file — should be indexed
+    std::fs::write(dir.path().join("app.py"), "def hello(): pass\n").unwrap();
+
+    // Sensitive files — must be excluded
+    std::fs::write(dir.path().join(".env"), "DB_PASSWORD=hunter2\n").unwrap();
+    std::fs::write(dir.path().join(".env.local"), "SECRET=abc\n").unwrap();
+    std::fs::write(dir.path().join("my_secret.py"), "API_KEY = 'abc'\n").unwrap();
+    std::fs::write(dir.path().join("credentials.json"), "{\"key\":\"val\"}\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    let out = engine
+        .run_pipeline("hello", Some(4000), None, None)
+        .expect("run_pipeline failed");
+
+    assert!(!out.contains(".env"), "env file should be excluded: {}", out);
+    assert!(!out.contains("my_secret"), "secret file should be excluded: {}", out);
+    assert!(!out.contains("credentials"), "credentials file should be excluded: {}", out);
+}
+
+/// Files containing known API key patterns in the first 4 KB must not be indexed.
+#[test]
+fn file_with_api_key_content_is_not_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Normal file
+    std::fs::write(dir.path().join("lib.py"), "def safe(): pass\n").unwrap();
+    // File with an AWS key literal embedded
+    std::fs::write(
+        dir.path().join("config.py"),
+        "AWS_KEY = \"AKIAIOSFODNN7EXAMPLE123\"\n",
+    )
+    .unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    let out = engine
+        .run_pipeline("AWS_KEY safe", Some(4000), None, None)
+        .expect("run_pipeline failed");
+
+    assert!(!out.contains("config.py"), "file with embedded API key should be excluded: {}", out);
+}
+
+/// Files listed in `.codesurgeonignore` must not appear in the index.
+#[test]
+fn codesurgeonignore_excludes_files() {
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(dir.path().join("app.py"), "def keep(): pass\n").unwrap();
+    std::fs::write(dir.path().join("generated.py"), "def generated(): pass\n").unwrap();
+    std::fs::write(dir.path().join(".codesurgeonignore"), "generated.py\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    let out = engine
+        .run_pipeline("generated keep", Some(4000), None, None)
+        .expect("run_pipeline failed");
+
+    assert!(!out.contains("generated.py"), "ignored file should be excluded: {}", out);
+}
+
+/// Glob patterns in `.codesurgeonignore` must work (e.g. `fixtures/`).
+#[test]
+fn codesurgeonignore_glob_pattern_excludes_directory() {
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(dir.path().join("app.py"), "def main(): pass\n").unwrap();
+
+    let fixtures = dir.path().join("fixtures");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    std::fs::write(fixtures.join("data.py"), "def fixture_fn(): pass\n").unwrap();
+
+    std::fs::write(dir.path().join(".codesurgeonignore"), "fixtures/\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    let out = engine
+        .run_pipeline("fixture_fn", Some(4000), None, None)
+        .expect("run_pipeline failed");
+
+    assert!(!out.contains("fixtures/"), "fixtures dir should be excluded: {}", out);
+}
+
 /// (possibly with partial results) and must not panic.
 #[test]
 fn query_during_indexing_does_not_panic() {
