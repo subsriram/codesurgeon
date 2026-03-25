@@ -10,6 +10,175 @@ use crate::language::Language;
 use crate::symbol::{Edge, EdgeKind, Symbol, SymbolKind};
 use std::collections::{HashMap, HashSet};
 
+// ── Shell call-graph edges ────────────────────────────────────────────────────
+
+/// Build Calls edges for shell scripts by scanning function bodies for
+/// invocations of other shell functions defined in the same workspace.
+pub fn extract_shell_call_edges(symbols: &[Symbol]) -> Vec<Edge> {
+    let mut name_to_ids: HashMap<&str, Vec<u64>> = HashMap::new();
+    for sym in symbols {
+        if sym.language == Language::Shell {
+            name_to_ids.entry(sym.name.as_str()).or_default().push(sym.id);
+        }
+    }
+    if name_to_ids.is_empty() {
+        return vec![];
+    }
+
+    let mut edges = Vec::new();
+    for sym in symbols {
+        if sym.language != Language::Shell || sym.kind != SymbolKind::Function {
+            continue;
+        }
+        let mut seen: HashSet<u64> = HashSet::new();
+        for word in shell_command_names(&sym.body) {
+            if let Some(targets) = name_to_ids.get(word.as_str()) {
+                for &target_id in targets {
+                    if target_id != sym.id && seen.insert(target_id) {
+                        edges.push(
+                            Edge::new(sym.id, target_id, EdgeKind::Calls).with_label(word.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    edges
+}
+
+// ── SQL reference edges ───────────────────────────────────────────────────────
+
+/// Build References edges for SQL: views and functions that reference tables
+/// or other views via FROM / JOIN / INTO / UPDATE clauses.
+pub fn extract_sql_ref_edges(symbols: &[Symbol]) -> Vec<Edge> {
+    // Only tables (Struct) and views (TypeAlias) are valid targets.
+    let mut name_to_ids: HashMap<String, Vec<u64>> = HashMap::new();
+    for sym in symbols {
+        if sym.language == Language::Sql
+            && matches!(sym.kind, SymbolKind::Struct | SymbolKind::TypeAlias)
+        {
+            name_to_ids
+                .entry(sym.name.to_lowercase())
+                .or_default()
+                .push(sym.id);
+        }
+    }
+    if name_to_ids.is_empty() {
+        return vec![];
+    }
+
+    let mut edges = Vec::new();
+    for sym in symbols {
+        if sym.language != Language::Sql {
+            continue;
+        }
+        if !matches!(sym.kind, SymbolKind::TypeAlias | SymbolKind::Function) {
+            continue;
+        }
+        let mut seen: HashSet<u64> = HashSet::new();
+        for ref_name in sql_table_references(&sym.body) {
+            let key = ref_name.to_lowercase();
+            if let Some(targets) = name_to_ids.get(&key) {
+                for &target_id in targets {
+                    if target_id != sym.id && seen.insert(target_id) {
+                        edges.push(
+                            Edge::new(sym.id, target_id, EdgeKind::References)
+                                .with_label(ref_name.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    edges
+}
+
+// ── Private helpers ─ shell ───────────────────────────────────────────────────
+
+/// Extract command names from a shell function body.
+///
+/// Splits on common command separators (newlines, `;`, `|`, `&`, `{`, `(`)
+/// and takes the first identifier-like token from each resulting segment,
+/// skipping shell built-ins and keywords.
+fn shell_command_names(body: &str) -> Vec<String> {
+    const SHELL_KEYWORDS: &[&str] = &[
+        "if", "then", "else", "elif", "fi", "for", "in", "do", "done", "while", "until",
+        "case", "esac", "function", "return", "local", "export", "echo", "printf", "read",
+        "test", "true", "false", "exit", "break", "continue", "shift", "set", "unset",
+        "declare", "source", "eval", "exec", "cd", "pwd", "ls", "mkdir", "rm", "cp", "mv",
+        "grep", "sed", "awk", "cat", "head", "tail", "sort", "uniq", "wc", "find", "xargs",
+        "tr", "cut", "touch", "chmod", "chown",
+    ];
+
+    // Split the body on characters that end a "statement" or begin a new one.
+    let mut names = Vec::new();
+    for segment in body.split(|c| matches!(c, '\n' | ';' | '|' | '&' | '{' | '(')) {
+        let word = segment
+            .trim()
+            // Strip variable-expansion prefix, e.g. `$(cmd` → `cmd`
+            .trim_start_matches('$')
+            .trim_start_matches('(')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        // Normalise: strip trailing special chars that may have been attached
+        let word = word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        if word.len() >= 2
+            && word
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_alphabetic() || c == '_')
+            && word
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            && !SHELL_KEYWORDS.contains(&word)
+        {
+            names.push(word.to_string());
+        }
+    }
+    names
+}
+
+// ── Private helpers ─ SQL ─────────────────────────────────────────────────────
+
+/// Extract table/view names referenced in a SQL statement body.
+///
+/// Looks for identifiers that immediately follow FROM, JOIN, INTO, or UPDATE
+/// keywords (case-insensitive). Schema-qualified names (`schema.table`) are
+/// reduced to just the table part.
+fn sql_table_references(body: &str) -> Vec<String> {
+    const TABLE_KEYWORDS: &[&str] = &["from", "join", "into", "update"];
+
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    let mut refs = Vec::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        // Strip trailing punctuation from the keyword token itself (e.g. `FROM,`)
+        let kw = tok.trim_end_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if TABLE_KEYWORDS.contains(&kw.as_str()) {
+            if let Some(next) = tokens.get(i + 1) {
+                // Strip trailing punctuation (`,`, `)`, `;`) and schema prefix
+                let name = next
+                    .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                    .split('.')
+                    .last()
+                    .unwrap_or(next);
+                // Strip quoting characters
+                let name = name.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+                if name.len() >= 1
+                    && name
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_alphabetic() || c == '_')
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    refs.push(name.to_string());
+                }
+            }
+        }
+    }
+    refs
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Build import edges between already-indexed symbols.

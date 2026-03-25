@@ -7,7 +7,8 @@ use tree_sitter::{Node, Parser};
 // Re-export edge extraction so callers can use `crate::indexer::extract_*`
 // without knowing about the edges module (source-compatible with old import paths).
 pub use crate::edges::{
-    extract_call_edges, extract_impl_edges, extract_import_edges, extract_type_flow_edges,
+    extract_call_edges, extract_impl_edges, extract_import_edges, extract_shell_call_edges,
+    extract_sql_ref_edges, extract_type_flow_edges,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1565,6 +1566,108 @@ fn process(s: &str, n: i32) {}
                 .iter()
                 .any(|e| e.from_id == caller_sym.id && e.to_id == process_sym.id),
             "expected Calls edge from caller to process"
+        );
+    }
+
+    // ── Shell call-graph edges ────────────────────────────────────────────────
+
+    #[test]
+    fn shell_call_edges_basic() {
+        let src = r#"
+bar() {
+  echo "bar"
+}
+
+baz() {
+  echo "baz"
+}
+
+foo() {
+  bar
+  baz
+}
+"#;
+        let symbols = extract_shell("script.sh", src).expect("shell parse");
+        let edges = extract_shell_call_edges(&symbols);
+        let foo_sym = symbols.iter().find(|s| s.name == "foo").expect("foo");
+        let bar_sym = symbols.iter().find(|s| s.name == "bar").expect("bar");
+        let baz_sym = symbols.iter().find(|s| s.name == "baz").expect("baz");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.from_id == foo_sym.id && e.to_id == bar_sym.id),
+            "expected foo → bar edge"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.from_id == foo_sym.id && e.to_id == baz_sym.id),
+            "expected foo → baz edge"
+        );
+    }
+
+    #[test]
+    fn shell_call_edges_no_self_loop() {
+        let src = "foo() {\n  foo\n}\n";
+        let symbols = extract_shell("script.sh", src).expect("shell parse");
+        let edges = extract_shell_call_edges(&symbols);
+        assert!(
+            edges.iter().all(|e| e.from_id != e.to_id),
+            "self-loop edges must not be produced"
+        );
+    }
+
+    // ── SQL reference edges ───────────────────────────────────────────────────
+
+    #[test]
+    fn sql_ref_edges_view_to_table() {
+        let src = r#"
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+CREATE VIEW active_users AS SELECT * FROM users WHERE active = true;
+"#;
+        let symbols = extract_sql("schema.sql", src).expect("sql parse");
+        let edges = extract_sql_ref_edges(&symbols);
+        let users_sym = symbols.iter().find(|s| s.name == "users").expect("users table");
+        let view_sym = symbols
+            .iter()
+            .find(|s| s.name == "active_users")
+            .expect("active_users view");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.from_id == view_sym.id && e.to_id == users_sym.id),
+            "expected active_users → users edge; edges={:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn sql_ref_edges_function_to_table() {
+        let src = r#"
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY
+);
+
+CREATE FUNCTION get_user(p_id INT) RETURNS users AS $$
+BEGIN
+  RETURN QUERY SELECT * FROM users WHERE id = p_id;
+END;
+$$ LANGUAGE plpgsql;
+"#;
+        let symbols = extract_sql("schema.sql", src).expect("sql parse");
+        let edges = extract_sql_ref_edges(&symbols);
+        let users_sym = symbols.iter().find(|s| s.name == "users").expect("users table");
+        let fn_sym = symbols.iter().find(|s| s.name == "get_user").expect("get_user");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.from_id == fn_sym.id && e.to_id == users_sym.id),
+            "expected get_user → users edge; edges={:?}",
+            edges
         );
     }
 

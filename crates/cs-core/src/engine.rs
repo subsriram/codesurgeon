@@ -6,8 +6,8 @@ use crate::embedder::{cosine_similarity, Embedder};
 use instant_distance::{Builder as HnswBuilder, HnswMap, Search as HnswSearch};
 use crate::graph::CodeGraph;
 use crate::indexer::{
-    extract_call_edges, extract_impl_edges, extract_import_edges, extract_type_flow_edges,
-    index_file,
+    extract_call_edges, extract_impl_edges, extract_import_edges, extract_shell_call_edges,
+    extract_sql_ref_edges, extract_type_flow_edges, index_file,
 };
 use crate::diff::parse_diff_symbols;
 use crate::language::Language;
@@ -373,6 +373,8 @@ impl CoreEngine {
             .chain(extract_impl_edges(&all_symbols))
             .chain(extract_call_edges(&all_symbols))
             .chain(extract_type_flow_edges(&all_symbols))
+            .chain(extract_shell_call_edges(&all_symbols))
+            .chain(extract_sql_ref_edges(&all_symbols))
             .collect();
 
         // Flush everything to SQLite in a single transaction (brief db lock).
