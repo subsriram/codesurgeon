@@ -209,7 +209,7 @@ fn run_pipeline_writes_auto_observation() {
     let engine = indexed_engine_with_two_langs(&dir);
     engine.run_pipeline("rust fn", Some(4000), None, None).expect("run_pipeline failed");
 
-    let observations = engine.get_session_context().expect("get_session_context failed");
+    let observations = engine.get_session_context().expect("get_session_context failed").observations;
     let auto_obs: Vec<_> = observations
         .iter()
         .filter(|o| o.kind.as_str() == "auto")
@@ -231,7 +231,7 @@ fn get_context_capsule_writes_auto_observation() {
         .get_context_capsule("py fn", Some(4000), None, None)
         .expect("get_context_capsule failed");
 
-    let observations = engine.get_session_context().expect("get_session_context failed");
+    let observations = engine.get_session_context().expect("get_session_context failed").observations;
     let auto_obs: Vec<_> = observations
         .iter()
         .filter(|o| o.kind.as_str() == "auto")
@@ -247,7 +247,7 @@ fn run_pipeline_deduplicates_auto_observations() {
     engine.run_pipeline("rust fn", Some(4000), None, None).expect("first call failed");
     engine.run_pipeline("rust fn", Some(4000), None, None).expect("second call failed");
 
-    let observations = engine.get_session_context().expect("get_session_context failed");
+    let observations = engine.get_session_context().expect("get_session_context failed").observations;
     let auto_count = observations
         .iter()
         .filter(|o| o.kind.as_str() == "auto" && o.content.contains("rust fn"))
@@ -264,7 +264,7 @@ fn run_pipeline_no_pivots_skips_auto_observation() {
         .run_pipeline("xyzzy no match", Some(4000), None, None)
         .expect("run_pipeline failed");
 
-    let observations = engine.get_session_context().expect("get_session_context failed");
+    let observations = engine.get_session_context().expect("get_session_context failed").observations;
     let auto_obs: Vec<_> = observations
         .iter()
         .filter(|o| o.kind.as_str() == "auto")
@@ -519,4 +519,156 @@ fn query_during_indexing_does_not_panic() {
     for h in query_handles {
         h.join().expect("query thread panicked");
     }
+}
+
+// ── TTL / compression / staleness tests ───────────────────────────────────────
+
+use cs_core::memory::{MemoryConfig, MemoryStore, Observation, ObservationKind};
+use cs_core::db::Database;
+use parking_lot::Mutex;
+
+/// Auto observations must have a non-None `expires_at` set 7 days out.
+#[test]
+fn auto_observation_gets_7_day_ttl() {
+    let obs = Observation::new("s", "content", None, None, ObservationKind::Auto);
+    assert!(obs.expires_at.is_some(), "auto observations must have expires_at");
+    let expires: chrono::DateTime<chrono::Utc> = obs
+        .expires_at
+        .as_ref()
+        .unwrap()
+        .parse()
+        .expect("invalid rfc3339");
+    let diff = expires - chrono::Utc::now();
+    // Allow ±1 minute for clock skew during test runs
+    assert!(diff.num_days() >= 6 && diff.num_days() <= 7, "expected ~7 day TTL, got {:?}", diff);
+}
+
+/// Manual observations must have `expires_at = None` by default (never expire).
+#[test]
+fn manual_observation_has_no_ttl_by_default() {
+    let obs = Observation::new("s", "content", None, None, ObservationKind::Manual);
+    assert!(obs.expires_at.is_none(), "manual observations must not expire by default");
+}
+
+/// `MemoryConfig` loaded from config.toml overrides default TTLs.
+#[test]
+fn memory_config_toml_overrides_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "[memory]\nauto_ttl_days = 3\nmanual_ttl_days = 30\n").unwrap();
+    let cfg = MemoryConfig::load_from_toml(&config_path);
+    assert_eq!(cfg.auto_ttl_days, 3);
+    assert_eq!(cfg.manual_ttl_days, Some(30));
+}
+
+/// `MemoryConfig::load_from_toml` returns defaults when file is missing.
+#[test]
+fn memory_config_toml_missing_returns_defaults() {
+    let cfg = MemoryConfig::load_from_toml(std::path::Path::new("/nonexistent/config.toml"));
+    assert_eq!(cfg.auto_ttl_days, 7);
+    assert!(cfg.manual_ttl_days.is_none());
+}
+
+/// `prune_expired` removes observations whose TTL has elapsed.
+#[test]
+fn prune_expired_removes_past_ttl_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Arc::new(Mutex::new(
+        Database::open(&db_dir.join("mem.db")).unwrap(),
+    ));
+    let store = MemoryStore::new(Arc::clone(&db), "test-session");
+
+    // Insert an observation with an already-elapsed expires_at
+    let mut obs = Observation::new("test-session", "old content", None, None, ObservationKind::Auto);
+    obs.expires_at = Some(
+        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+    );
+    db.lock().insert_observation(&obs).unwrap();
+
+    // Save a regular (non-expired) manual observation too
+    store.save("keep me", None, None).unwrap();
+
+    let pruned = store.prune_expired().unwrap();
+    assert_eq!(pruned, 1, "expected exactly 1 expired observation pruned");
+
+    let remaining = store.get_recent_observations(50).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].content, "keep me");
+}
+
+/// `staleness_score` returns 0 when no observations are stale.
+#[test]
+fn staleness_score_zero_when_no_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir);
+    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
+    let ctx = engine.get_session_context().unwrap();
+    assert_eq!(ctx.staleness_score, 0.0);
+}
+
+/// `staleness_score` is > 0 after an observation is marked stale.
+#[test]
+fn staleness_score_nonzero_after_stale_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Arc::new(Mutex::new(
+        Database::open(&db_dir.join("mem.db")).unwrap(),
+    ));
+    let store = MemoryStore::new(Arc::clone(&db), "test-session");
+
+    // Save a symbol-linked observation
+    store.save("insight about foo", Some("foo::bar"), Some("hash-1")).unwrap();
+    // Simulate code change — mark stale by providing a different hash
+    store.check_and_mark_stale("foo::bar", "hash-2").unwrap();
+
+    let score = store.staleness_score().unwrap();
+    assert!(score > 0.0, "staleness_score should be > 0 after marking stale");
+}
+
+/// After 3+ observations accumulate for the same symbol, `compress_observations`
+/// creates one Summary entry and retires the originals.
+#[test]
+fn compress_observations_merges_symbol_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Arc::new(Mutex::new(
+        Database::open(&db_dir.join("mem.db")).unwrap(),
+    ));
+    let store = MemoryStore::new(Arc::clone(&db), "test-session");
+
+    // Save 3 symbol-linked observations for the same FQN
+    for i in 0..3u8 {
+        store
+            .save(&format!("observation {i}"), Some("my::Symbol"), Some("hash"))
+            .unwrap();
+    }
+
+    let compressed = store.compress_observations().unwrap();
+    assert_eq!(compressed, 1, "expected 1 symbol compressed");
+
+    // After compression, non-expired visible observations should be just the Summary
+    let visible = store.get_recent_observations(50).unwrap();
+    let summaries: Vec<_> = visible.iter().filter(|o| o.kind.as_str() == "summary").collect();
+    assert_eq!(summaries.len(), 1, "expected exactly 1 summary after compression");
+    assert!(summaries[0].content.contains("[summary of 3 observations]"));
+
+    // The originals must no longer appear (they were expired)
+    let originals: Vec<_> = visible.iter().filter(|o| o.kind.as_str() == "manual").collect();
+    assert!(originals.is_empty(), "original observations should be expired after compression");
+}
+
+/// `get_session_context` wraps observations and staleness_score together.
+#[test]
+fn get_session_context_returns_session_context_struct() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir);
+    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
+    let ctx = engine.get_session_context().unwrap();
+    assert!(!ctx.observations.is_empty(), "expected observations");
+    // staleness_score is a valid percentage
+    assert!(ctx.staleness_score >= 0.0 && ctx.staleness_score <= 100.0);
 }

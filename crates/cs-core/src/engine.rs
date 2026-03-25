@@ -12,7 +12,7 @@ use crate::indexer::{
 use crate::diff::parse_diff_symbols;
 use crate::language::Language;
 use crate::module_docs::{detect_xcode_mcp, swift_enrichment_hint};
-use crate::memory::{new_session_id, MemoryStore};
+use crate::memory::{new_session_id, MemoryConfig, MemoryStore};
 use crate::ranking::{
     dedup_by_fqn, graph_candidates, inject_structural_candidates, resolve_adjacents,
     rrf_merge, select_adjacents, apply_structural_resort,
@@ -111,6 +111,15 @@ pub struct IndexStats {
     /// types and live diagnostics; codesurgeon remains the fallback for semantic search
     /// and session memory.
     pub xcode_mcp_available: bool,
+}
+
+/// Return value of `get_session_context`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionContext {
+    pub observations: Vec<crate::memory::Observation>,
+    /// Percentage (0–100) of non-expired observations that are currently stale.
+    /// High values indicate that significant code has changed since observations were recorded.
+    pub staleness_score: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,10 +222,17 @@ impl CoreEngine {
         let db = Arc::new(Mutex::new(Database::open(&config.db_path)?));
         let graph = Arc::new(RwLock::new(CodeGraph::new()));
         let search = Arc::new(Mutex::new(SearchIndex::new()?));
-        let memory = Arc::new(Mutex::new(MemoryStore::new(
-            Arc::clone(&db),
-            &config.session_id,
-        )));
+
+        // Load optional memory config from .codesurgeon/config.toml
+        let mem_config = {
+            let config_path = config.workspace_root.join(".codesurgeon").join("config.toml");
+            MemoryConfig::load_from_toml(&config_path)
+        };
+
+        let memory = Arc::new(Mutex::new(
+            MemoryStore::new(Arc::clone(&db), &config.session_id)
+                .with_config(mem_config),
+        ));
 
         // Warm the in-memory graph and tantivy index from the persisted SQLite DB.
         // Without this, every fresh process starts with 0 pivots on every search.
@@ -243,6 +259,21 @@ impl CoreEngine {
                 symbols.len(),
                 edges.len()
             );
+        }
+
+        // Prune expired observations and run compression pass on startup.
+        {
+            let mem = memory.lock();
+            if let Ok(pruned) = mem.prune_expired() {
+                if pruned > 0 {
+                    tracing::info!("Pruned {} expired observation(s)", pruned);
+                }
+            }
+            if let Ok(compressed) = mem.compress_observations() {
+                if compressed > 0 {
+                    tracing::info!("Compressed observations for {} symbol(s)", compressed);
+                }
+            }
         }
 
         // Embedder is loaded lazily via `load_embedder()` after the engine is made
@@ -869,10 +900,12 @@ impl CoreEngine {
         })
     }
 
-    /// Get session observations (cross-session memory).
-    pub fn get_session_context(&self) -> Result<Vec<crate::memory::Observation>> {
+    /// Get session observations (cross-session memory) with a staleness score.
+    pub fn get_session_context(&self) -> Result<SessionContext> {
         let mem = self.memory.lock();
-        mem.get_recent_observations(50)
+        let observations = mem.get_recent_observations(50)?;
+        let staleness_score = mem.staleness_score()?;
+        Ok(SessionContext { observations, staleness_score })
     }
 
     /// Delete an observation by ID. Returns true if found and deleted.

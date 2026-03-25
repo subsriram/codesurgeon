@@ -17,6 +17,6 @@ pub mod watcher;
 
 // Re-export the main entry point
 pub use capsule::Capsule;
-pub use engine::{CoreEngine, EngineConfig, IndexStats};
+pub use engine::{CoreEngine, EngineConfig, IndexStats, SessionContext};
 pub use memory::Observation;
 pub use symbol::{Edge, EdgeKind, Symbol, SymbolKind};

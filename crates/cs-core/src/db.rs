@@ -77,11 +77,13 @@ impl Database {
                 symbol_hash   TEXT,
                 created_at    TEXT NOT NULL,
                 is_stale      INTEGER NOT NULL DEFAULT 0,
-                kind          TEXT NOT NULL DEFAULT 'manual'
+                kind          TEXT NOT NULL DEFAULT 'manual',
+                expires_at    TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id);
-            CREATE INDEX IF NOT EXISTS idx_obs_symbol  ON observations(symbol_fqn);
+            CREATE INDEX IF NOT EXISTS idx_obs_session  ON observations(session_id);
+            CREATE INDEX IF NOT EXISTS idx_obs_symbol   ON observations(symbol_fqn);
+            CREATE INDEX IF NOT EXISTS idx_obs_expires  ON observations(expires_at);
 
             -- Optional: stored embedding vectors (packed f32 LE bytes, 384-dim)
             -- Populated only when built with --features embeddings
@@ -91,11 +93,18 @@ impl Database {
             );
         "#,
         )?;
-        // Idempotent migration: adds is_stub to databases created before this column was added.
-        // Fails silently with "duplicate column name" on fresh databases (column already in CREATE TABLE above).
+        // Idempotent migrations — fail silently with "duplicate column name" on fresh databases.
         let _ = self.conn.execute(
             "ALTER TABLE symbols ADD COLUMN is_stub INTEGER NOT NULL DEFAULT 0",
             [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE observations ADD COLUMN expires_at TEXT",
+            [],
+        );
+        // Index may already exist on new databases; ignore error.
+        let _ = self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_obs_expires ON observations(expires_at);",
         );
         Ok(())
     }
@@ -300,8 +309,8 @@ impl Database {
     pub fn insert_observation(&self, obs: &Observation) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO observations \
-             (id, session_id, agent_id, content, symbol_fqn, symbol_hash, created_at, is_stale, kind) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+             (id, session_id, agent_id, content, symbol_fqn, symbol_hash, created_at, is_stale, kind, expires_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 obs.id,
                 obs.session_id,
@@ -312,6 +321,7 @@ impl Database {
                 obs.created_at,
                 obs.is_stale as i64,
                 obs.kind.as_str(),
+                obs.expires_at,
             ],
         )?;
         Ok(())
@@ -320,8 +330,11 @@ impl Database {
     pub fn get_session_observations(&self, session_id: &str) -> Result<Vec<Observation>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
-             created_at, is_stale, kind \
-             FROM observations WHERE session_id = ?1 ORDER BY created_at ASC",
+             created_at, is_stale, kind, expires_at \
+             FROM observations \
+             WHERE session_id = ?1 \
+               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+             ORDER BY created_at ASC",
         )?;
         let results = stmt
             .query_map(params![session_id], row_to_observation)?
@@ -333,8 +346,10 @@ impl Database {
     pub fn get_recent_observations(&self, limit: usize) -> Result<Vec<Observation>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
-             created_at, is_stale, kind \
-             FROM observations ORDER BY created_at DESC LIMIT ?1",
+             created_at, is_stale, kind, expires_at \
+             FROM observations \
+             WHERE (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+             ORDER BY created_at DESC LIMIT ?1",
         )?;
         let results = stmt
             .query_map(params![limit as i64], row_to_observation)?
@@ -372,6 +387,82 @@ impl Database {
             params![symbol_fqn, new_hash],
         )? as u64;
         Ok(count)
+    }
+
+    /// Delete all observations whose `expires_at` is in the past.
+    pub fn prune_expired_observations(&self) -> Result<u64> {
+        let count = self.conn.execute(
+            "DELETE FROM observations WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')",
+            [],
+        )? as u64;
+        Ok(count)
+    }
+
+    /// Return all non-expired observations for a specific symbol FQN, oldest first.
+    pub fn get_observations_for_fqn(&self, fqn: &str) -> Result<Vec<Observation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
+             created_at, is_stale, kind, expires_at \
+             FROM observations \
+             WHERE symbol_fqn = ?1 \
+               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+             ORDER BY created_at ASC",
+        )?;
+        let results = stmt
+            .query_map(params![fqn], row_to_observation)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(results)
+    }
+
+    /// Immediately expire a set of observations by setting their `expires_at` to now.
+    /// Used by the compression pass to retire originals after creating a Summary.
+    pub fn expire_observations(&self, ids: &[String]) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        for id in ids {
+            self.conn.execute(
+                "UPDATE observations SET expires_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Returns all distinct symbol FQNs that have ≥ `threshold` non-expired,
+    /// non-summary observations. Used to find candidates for compression.
+    pub fn fqns_needing_compression(&self, threshold: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol_fqn, COUNT(*) as cnt \
+             FROM observations \
+             WHERE symbol_fqn IS NOT NULL \
+               AND kind != 'summary' \
+               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+             GROUP BY symbol_fqn \
+             HAVING cnt >= ?1",
+        )?;
+        let results = stmt
+            .query_map(params![threshold as i64], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(results)
+    }
+
+    /// Returns (stale_count, total_count) for non-expired observations.
+    pub fn observation_staleness_counts(&self) -> Result<(u64, u64)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM observations \
+             WHERE (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
+            [],
+            |row| row.get(0),
+        )?;
+        let stale: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM observations \
+             WHERE is_stale = 1 \
+               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((stale as u64, total as u64))
     }
 
     /// Load every symbol from the database (used to warm the in-memory graph + search index on startup).
@@ -457,6 +548,7 @@ fn row_to_observation(row: &rusqlite::Row) -> rusqlite::Result<Observation> {
         created_at: row.get(6)?,
         is_stale: row.get::<_, i64>(7)? != 0,
         kind: crate::memory::ObservationKind::parse_kind(&row.get::<_, String>(8)?),
+        expires_at: row.get(9)?,
     })
 }
 

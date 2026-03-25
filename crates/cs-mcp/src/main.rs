@@ -791,12 +791,12 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
         }
 
         "get_session_context" => {
-            let observations = engine.get_session_context()?;
-            if observations.is_empty() {
+            let ctx = engine.get_session_context()?;
+            if ctx.observations.is_empty() {
                 return Ok("No session observations yet.".to_string());
             }
             let mut out = "## Session memory\n\n".to_string();
-            for obs in &observations {
+            for obs in &ctx.observations {
                 let stale = if obs.is_stale { " ⚠️ [stale]" } else { "" };
                 let sym = obs
                     .symbol_fqn
@@ -806,6 +806,12 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
                 out.push_str(&format!(
                     "- [{}]{}{}: {}\n",
                     obs.created_at, sym, stale, obs.content
+                ));
+            }
+            if ctx.staleness_score > 0.0 {
+                out.push_str(&format!(
+                    "\n⚠️ Staleness: {:.0}% of observations refer to code that has since changed.\n",
+                    ctx.staleness_score
                 ));
             }
             Ok(out)

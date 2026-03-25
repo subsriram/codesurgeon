@@ -21,6 +21,9 @@ categories = ["development-tools", "command-line-utilities"]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Config file parsing
+toml = "0.8"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

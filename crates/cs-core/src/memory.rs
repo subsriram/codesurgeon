@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use uuid::Uuid;
 
-// ── Observation ───────────────────────────────────────────────────────────────
+// ── ObservationKind ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ObservationKind {
@@ -21,6 +21,8 @@ pub enum ObservationKind {
     Insight,
     /// Automatically captured from run_pipeline / get_context_capsule calls
     Auto,
+    /// Compressed summary created by the compression pass; replaces 3+ originals
+    Summary,
 }
 
 impl ObservationKind {
@@ -32,6 +34,7 @@ impl ObservationKind {
             ObservationKind::FileThrash => "file_thrash",
             ObservationKind::Insight => "insight",
             ObservationKind::Auto => "auto",
+            ObservationKind::Summary => "summary",
         }
     }
 
@@ -42,10 +45,94 @@ impl ObservationKind {
             "file_thrash" => ObservationKind::FileThrash,
             "insight" => ObservationKind::Insight,
             "auto" => ObservationKind::Auto,
+            "summary" => ObservationKind::Summary,
             _ => ObservationKind::Manual,
         }
     }
+
+    /// Default TTL in days for each kind.
+    /// Returns `None` for kinds that never expire (Manual, Insight).
+    pub fn default_ttl_days(&self) -> Option<i64> {
+        match self {
+            ObservationKind::Auto => Some(7),
+            ObservationKind::Passive => Some(7),
+            ObservationKind::FileThrash => Some(7),
+            ObservationKind::DeadEnd => Some(7),
+            ObservationKind::Summary => Some(90),
+            ObservationKind::Manual => None,
+            ObservationKind::Insight => None,
+        }
+    }
 }
+
+// ── MemoryConfig ───────────────────────────────────────────────────────────────
+
+/// TTL configuration for the observation store.
+/// Loaded from `.codesurgeon/config.toml` under `[memory]` if present,
+/// otherwise uses the built-in defaults.
+///
+/// Example config.toml:
+/// ```toml
+/// [memory]
+/// auto_ttl_days    = 7
+/// manual_ttl_days  = 90
+/// ```
+#[derive(Debug, Clone)]
+pub struct MemoryConfig {
+    /// TTL for auto/passive/file_thrash/dead_end observations (days). Default: 7.
+    pub auto_ttl_days: i64,
+    /// TTL for manual/insight observations (days). `None` = never expire. Default: None.
+    pub manual_ttl_days: Option<i64>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig {
+            auto_ttl_days: 7,
+            manual_ttl_days: None,
+        }
+    }
+}
+
+impl MemoryConfig {
+    /// Load from a `config.toml` file at the given path.
+    /// If the file is missing or the `[memory]` section is absent, returns defaults.
+    pub fn load_from_toml(path: &std::path::Path) -> Self {
+        let mut cfg = MemoryConfig::default();
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return cfg;
+        };
+        let Ok(table) = text.parse::<toml::Table>() else {
+            return cfg;
+        };
+        if let Some(memory) = table.get("memory").and_then(|v| v.as_table()) {
+            if let Some(v) = memory.get("auto_ttl_days").and_then(|v| v.as_integer()) {
+                cfg.auto_ttl_days = v.max(1);
+            }
+            if let Some(v) = memory.get("manual_ttl_days").and_then(|v| v.as_integer()) {
+                cfg.manual_ttl_days = Some(v.max(1));
+            }
+        }
+        cfg
+    }
+
+    /// Compute `expires_at` for an observation of the given kind using this config.
+    pub fn expires_at(&self, kind: &ObservationKind) -> Option<String> {
+        let days = match kind {
+            ObservationKind::Auto
+            | ObservationKind::Passive
+            | ObservationKind::FileThrash
+            | ObservationKind::DeadEnd => Some(self.auto_ttl_days),
+            ObservationKind::Manual | ObservationKind::Insight => self.manual_ttl_days,
+            // Summaries get the manual TTL (or 90 days if manual never expires)
+            ObservationKind::Summary => self.manual_ttl_days.or(Some(90)),
+        }?;
+        let ts = chrono::Utc::now() + chrono::Duration::days(days);
+        Some(ts.to_rfc3339())
+    }
+}
+
+// ── Observation ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Observation {
@@ -62,6 +149,9 @@ pub struct Observation {
     pub created_at: String,
     pub is_stale: bool,
     pub kind: ObservationKind,
+    /// RFC-3339 timestamp after which this observation is considered expired.
+    /// `None` means it never expires automatically (manual/insight with no TTL set).
+    pub expires_at: Option<String>,
 }
 
 impl Observation {
@@ -72,6 +162,9 @@ impl Observation {
         symbol_hash: Option<&str>,
         kind: ObservationKind,
     ) -> Self {
+        let expires_at = kind.default_ttl_days().map(|days| {
+            (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+        });
         Observation {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -82,7 +175,14 @@ impl Observation {
             created_at: chrono::Utc::now().to_rfc3339(),
             is_stale: false,
             kind,
+            expires_at,
         }
+    }
+
+    /// Override the default `expires_at` with a value derived from `MemoryConfig`.
+    pub fn with_ttl(mut self, config: &MemoryConfig) -> Self {
+        self.expires_at = config.expires_at(&self.kind);
+        self
     }
 
     pub fn with_agent(mut self, agent_id: &str) -> Self {
@@ -168,6 +268,7 @@ pub struct MemoryStore {
     agent_id: Option<String>,
     thrash_tracker: FileThrashTracker,
     dead_end_tracker: DeadEndTracker,
+    config: MemoryConfig,
 }
 
 impl MemoryStore {
@@ -178,11 +279,17 @@ impl MemoryStore {
             agent_id: None,
             thrash_tracker: FileThrashTracker::new(),
             dead_end_tracker: DeadEndTracker::new(),
+            config: MemoryConfig::default(),
         }
     }
 
     pub fn with_agent(mut self, agent_id: &str) -> Self {
         self.agent_id = Some(agent_id.to_string());
+        self
+    }
+
+    pub fn with_config(mut self, config: MemoryConfig) -> Self {
+        self.config = config;
         self
     }
 
@@ -199,7 +306,8 @@ impl MemoryStore {
             symbol_fqn,
             symbol_hash,
             ObservationKind::Manual,
-        );
+        )
+        .with_ttl(&self.config);
         if let Some(ref aid) = self.agent_id {
             obs = obs.with_agent(aid);
         }
@@ -216,7 +324,8 @@ impl MemoryStore {
             None,
             None,
             ObservationKind::Passive,
-        );
+        )
+        .with_ttl(&self.config);
         self.db.lock().insert_observation(&obs)?;
 
         // Check for file thrashing
@@ -231,7 +340,8 @@ impl MemoryStore {
                 None,
                 None,
                 ObservationKind::FileThrash,
-            );
+            )
+            .with_ttl(&self.config);
             self.db.lock().insert_observation(&thrash_obs)?;
             tracing::warn!("File thrash detected: {}", file_path);
         }
@@ -257,7 +367,8 @@ impl MemoryStore {
                 Some(fqn),
                 None,
                 ObservationKind::DeadEnd,
-            );
+            )
+            .with_ttl(&self.config);
             self.db.lock().insert_observation(&obs)?;
             tracing::warn!("Dead-end exploration detected for: {}", fqn);
         }
@@ -290,7 +401,8 @@ impl MemoryStore {
             None,
             None,
             ObservationKind::Auto,
-        );
+        )
+        .with_ttl(&self.config);
         if let Some(ref aid) = self.agent_id {
             obs = obs.with_agent(aid);
         }
@@ -310,6 +422,55 @@ impl MemoryStore {
             .mark_stale_by_symbol_hash(symbol_fqn, new_hash)
     }
 
+    /// Delete all observations whose TTL has elapsed.
+    pub fn prune_expired(&self) -> Result<u64> {
+        self.db.lock().prune_expired_observations()
+    }
+
+    /// Compression pass: for each symbol with ≥ 3 non-expired, non-summary observations,
+    /// create one `Summary` entry (keeping the most recent wording) and expire the originals.
+    /// Returns the number of symbols compressed.
+    pub fn compress_observations(&self) -> Result<usize> {
+        const COMPRESSION_THRESHOLD: usize = 3;
+        let fqns = self.db.lock().fqns_needing_compression(COMPRESSION_THRESHOLD)?;
+        let count = fqns.len();
+        for fqn in &fqns {
+            let obs = self.db.lock().get_observations_for_fqn(fqn)?;
+            // Keep only non-summary entries for compression
+            let to_compress: Vec<_> = obs
+                .iter()
+                .filter(|o| !matches!(o.kind, ObservationKind::Summary))
+                .collect();
+            if to_compress.len() < COMPRESSION_THRESHOLD {
+                continue;
+            }
+            // Use the most recent observation's content as the summary wording
+            let most_recent = to_compress.last().expect("checked len");
+            let summary_content = format!(
+                "[summary of {} observations] {}",
+                to_compress.len(),
+                most_recent.content
+            );
+            let summary = Observation::new(
+                &self.session_id,
+                &summary_content,
+                Some(fqn),
+                most_recent.symbol_hash.as_deref(),
+                ObservationKind::Summary,
+            )
+            .with_ttl(&self.config);
+
+            let ids_to_expire: Vec<String> =
+                to_compress.iter().map(|o| o.id.clone()).collect();
+            {
+                let db = self.db.lock();
+                db.insert_observation(&summary)?;
+                db.expire_observations(&ids_to_expire)?;
+            }
+        }
+        Ok(count)
+    }
+
     /// Retrieve observations for the current session.
     pub fn get_session_observations(&self) -> Result<Vec<Observation>> {
         self.db
@@ -320,6 +481,15 @@ impl MemoryStore {
     /// Retrieve recent observations across all sessions (for cross-session context).
     pub fn get_recent_observations(&self, limit: usize) -> Result<Vec<Observation>> {
         self.db.lock().get_recent_observations(limit)
+    }
+
+    /// Returns the fraction (0.0–100.0) of non-expired observations that are stale.
+    pub fn staleness_score(&self) -> Result<f32> {
+        let (stale, total) = self.db.lock().observation_staleness_counts()?;
+        if total == 0 {
+            return Ok(0.0);
+        }
+        Ok(stale as f32 / total as f32 * 100.0)
     }
 
     pub fn session_id(&self) -> &str {
