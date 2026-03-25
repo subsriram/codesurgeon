@@ -83,7 +83,6 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_obs_session  ON observations(session_id);
             CREATE INDEX IF NOT EXISTS idx_obs_symbol   ON observations(symbol_fqn);
-            CREATE INDEX IF NOT EXISTS idx_obs_expires  ON observations(expires_at);
 
             -- Optional: stored embedding vectors (packed f32 LE bytes, 384-dim)
             -- Populated only when built with --features embeddings
