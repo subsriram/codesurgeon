@@ -768,21 +768,26 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
             } else {
                 "- Swift enrichment: Xcode MCP not detected — tree-sitter only (see README for setup)\n"
             };
-            Ok(format!(
+            let mut status = format!(
                 "## codesurgeon index status\n\
                  - Indexing: {}\n\
                  - Symbols: {}\n\
                  - Edges: {}\n\
-                 - Files: {}\n\
-                 - Session: {}\n\
-                 {}",
+                 - Files: {}\n",
                 if indexing { "in progress" } else { "ready" },
                 stats.symbol_count,
                 stats.edge_count,
                 stats.file_count,
-                stats.session_id,
-                xcode_line,
-            ))
+            );
+            if stats.stub_symbol_count > 0 {
+                status.push_str(&format!(
+                    "- Stub symbols: {} (library stubs, skeleton-only)\n",
+                    stats.stub_symbol_count
+                ));
+            }
+            status.push_str(&format!("- Session: {}\n", stats.session_id));
+            status.push_str(xcode_line);
+            Ok(status)
         }
 
         "get_session_context" => {

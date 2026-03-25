@@ -43,6 +43,9 @@ pub(crate) const STRUCTURAL_BM25_WEIGHT: f32 = 0.05;
 pub(crate) const COORDINATOR_BONUS_PER_TYPE: f32 = 5.0;
 /// Minimum owned seed types required to trigger coordinator bonus.
 pub(crate) const COORDINATOR_MIN_OWNED: usize = 2;
+/// Score multiplier for symbols from library stub files (`.d.ts`, `.pyi`, `.swiftinterface`).
+/// Stubs rank below project symbols and are never returned as pivots.
+pub(crate) const STUB_SCORE_WEIGHT: f32 = 0.3;
 
 // ── Candidate retrieval ───────────────────────────────────────────────────────
 

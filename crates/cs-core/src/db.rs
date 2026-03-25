@@ -38,7 +38,8 @@ impl Database {
                 docstring     TEXT,
                 body          TEXT NOT NULL,
                 language      TEXT NOT NULL,
-                content_hash  TEXT NOT NULL
+                content_hash  TEXT NOT NULL,
+                is_stub       INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
@@ -90,6 +91,12 @@ impl Database {
             );
         "#,
         )?;
+        // Idempotent migration: adds is_stub to databases created before this column was added.
+        // Fails silently with "duplicate column name" on fresh databases (column already in CREATE TABLE above).
+        let _ = self.conn.execute(
+            "ALTER TABLE symbols ADD COLUMN is_stub INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(())
     }
 
@@ -111,8 +118,8 @@ impl Database {
         self.conn.execute(
             r#"INSERT OR REPLACE INTO symbols
                (id, fqn, name, kind, file_path, start_line, end_line,
-                signature, docstring, body, language, content_hash)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
+                signature, docstring, body, language, content_hash, is_stub)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"#,
             params![
                 sym.id as i64,
                 sym.fqn,
@@ -126,6 +133,7 @@ impl Database {
                 sym.body,
                 sym.language.as_str(),
                 sym.content_hash,
+                sym.is_stub as i64,
             ],
         )?;
         // Keep FTS in sync
@@ -169,7 +177,7 @@ impl Database {
     pub fn get_symbol(&self, id: u64) -> Result<Option<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash \
+             signature,docstring,body,language,content_hash,is_stub \
              FROM symbols WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id as i64], row_to_symbol)?;
@@ -196,6 +204,14 @@ impl Database {
             .conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get::<_, i64>(0))?
             as u64)
+    }
+
+    pub fn stub_symbol_count(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols WHERE is_stub = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })? as u64)
     }
 
     // ── Edges ─────────────────────────────────────────────────────────────────
@@ -362,7 +378,7 @@ impl Database {
     pub fn all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash \
+             signature,docstring,body,language,content_hash,is_stub \
              FROM symbols",
         )?;
         let results = stmt
@@ -398,7 +414,7 @@ impl Database {
     pub fn all_symbols_for_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash \
+             signature,docstring,body,language,content_hash,is_stub \
              FROM symbols WHERE file_path = ?1",
         )?;
         let results = stmt
@@ -426,6 +442,7 @@ fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
         body: row.get(9)?,
         language: Language::from_db_str(&row.get::<_, String>(10)?),
         content_hash: row.get(11)?,
+        is_stub: row.get::<_, i64>(12)? != 0,
     })
 }
 

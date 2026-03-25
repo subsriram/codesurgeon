@@ -16,7 +16,7 @@ use crate::memory::{new_session_id, MemoryStore};
 use crate::ranking::{
     dedup_by_fqn, graph_candidates, inject_structural_candidates, resolve_adjacents,
     rrf_merge, select_adjacents, apply_structural_resort,
-    CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K,
+    CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -24,6 +24,8 @@ use crate::ranking::BM25_POOL_SIZE;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
 use crate::symbol::Symbol;
+#[cfg(feature = "embeddings")]
+use crate::symbol::SymbolKind;
 use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -64,6 +66,11 @@ pub struct EngineConfig {
     /// Set to false for secondary (read-only) instances to avoid loading the
     /// ~500 MB ONNX model when it won't be used for indexing or query embedding.
     pub load_embedder: bool,
+    /// When true (default), index type stub files found in the workspace:
+    /// `node_modules/@types/**/*.d.ts`, `site-packages/**/*.pyi`, and
+    /// `.swiftinterface` files in SPM `.build/` directories.
+    /// Gate with `[indexing] include_stubs = false` in `config.toml` to disable.
+    pub index_stubs: bool,
 }
 
 impl EngineConfig {
@@ -80,6 +87,7 @@ impl EngineConfig {
             max_blast_radius_depth: 5,
             session_id,
             load_embedder: true,
+            index_stubs: true,
         }
     }
 
@@ -96,6 +104,7 @@ pub struct IndexStats {
     pub symbol_count: u64,
     pub edge_count: u64,
     pub file_count: u64,
+    pub stub_symbol_count: u64,
     pub session_id: String,
     /// Whether Xcode 26+ MCP bridge (`xcrun mcpbridge`) was detected on this machine.
     /// When true, agents working on Swift files should prefer Xcode MCP for resolved
@@ -326,6 +335,10 @@ impl CoreEngine {
 
         let files = self.collect_source_files()?;
         tracing::info!("Found {} source files", files.len());
+        let stub_files = self.collect_stub_files();
+        if !stub_files.is_empty() {
+            tracing::info!("Found {} stub files", stub_files.len());
+        }
 
         // Parse files in parallel with rayon
         let results: Vec<(PathBuf, String, Vec<Symbol>)> = files
@@ -401,6 +414,74 @@ impl CoreEngine {
             search.commit()?;
             graph.warm_caches();
         } // graph + search locks released here
+
+        // ── Stub file indexing ────────────────────────────────────────────────
+        // Parse stub files in parallel, mark every symbol with is_stub=true,
+        // then flush to SQLite and update the in-memory graph/search.
+        // Edges are intentionally skipped for stub symbols — library internals
+        // don't need to influence the project dependency graph.
+        if !stub_files.is_empty() {
+            let stub_results: Vec<(PathBuf, String, Vec<Symbol>)> = stub_files
+                .par_iter()
+                .filter_map(|path| {
+                    let content = std::fs::read_to_string(path).ok()?;
+                    let mut symbols =
+                        index_file(&self.config.workspace_root, path, &content)
+                            .ok()
+                            .unwrap_or_default();
+                    for sym in &mut symbols {
+                        sym.is_stub = true;
+                    }
+                    Some((path.clone(), content, symbols))
+                })
+                .collect();
+
+            let mut stub_file_data: Vec<(String, String, Vec<Symbol>)> = Vec::new();
+            for (path, content, symbols) in &stub_results {
+                let rel = path
+                    .strip_prefix(&self.config.workspace_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                let file_hash = hash_content(content.as_bytes());
+                stub_file_data.push((rel, file_hash, symbols.clone()));
+            }
+
+            {
+                let db = self.db.lock();
+                db.begin_transaction()?;
+                for (rel, file_hash, symbols) in &stub_file_data {
+                    db.upsert_file(rel, file_hash)?;
+                    db.delete_file_symbols(rel)?;
+                    for sym in symbols {
+                        db.upsert_symbol(sym)?;
+                    }
+                }
+                db.commit_transaction()?;
+            }
+
+            {
+                let mut graph = self.graph.write();
+                let mut search = self.search.lock();
+                for (rel, _, symbols) in &stub_file_data {
+                    graph.remove_file(rel);
+                    for sym in symbols {
+                        graph.add_symbol(sym.clone());
+                        search.index_symbol(sym)?;
+                    }
+                }
+                search.commit()?;
+                graph.warm_caches();
+            }
+
+            let stub_sym_count: usize =
+                stub_file_data.iter().map(|(_, _, s)| s.len()).sum();
+            tracing::info!(
+                "Indexed {} stub symbols from {} files",
+                stub_sym_count,
+                stub_file_data.len()
+            );
+        }
 
         // Embed symbols in batches of 64 (only when embeddings feature is enabled).
         // We embed the skeleton (signature + docstring) rather than the full body —
@@ -780,6 +861,7 @@ impl CoreEngine {
             symbol_count: db.symbol_count()?,
             edge_count: db.edge_count()?,
             file_count: db.file_count()?,
+            stub_symbol_count: db.stub_symbol_count()?,
             session_id: self.config.session_id.clone(),
             xcode_mcp_available: detect_xcode_mcp(),
         })
@@ -1138,6 +1220,20 @@ impl CoreEngine {
         // 5. Deduplicate by FQN — keep the highest-scored entry per unique FQN.
         let mut scored = dedup_by_fqn(&graph, scored);
 
+        // 5.5a Apply stub score penalty: library stubs rank at ×0.3 relative to project symbols.
+        // Re-sort after applying penalty so pivots are selected from the adjusted order.
+        let has_stubs = scored
+            .iter()
+            .any(|(id, _)| graph.get_symbol(*id).map(|s| s.is_stub).unwrap_or(false));
+        if has_stubs {
+            for (id, score) in scored.iter_mut() {
+                if graph.get_symbol(*id).map(|s| s.is_stub).unwrap_or(false) {
+                    *score *= STUB_SCORE_WEIGHT;
+                }
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
         // 5.5 Apply optional post-filters (language, file_hint, min_score)
         if language.is_some() || file_hint.is_some() || min_score.is_some() {
             scored.retain(|(id, score)| {
@@ -1164,8 +1260,10 @@ impl CoreEngine {
         let max_pivots = max_results.unwrap_or(self.config.max_pivots);
 
         // 6. Select pivots and adjacents
+        // Stubs are excluded from pivots — they are skeleton-only references.
         let pivot_ids: Vec<u64> = scored
             .iter()
+            .filter(|(id, _)| !graph.get_symbol(*id).map(|s| s.is_stub).unwrap_or(false))
             .take(max_pivots)
             .map(|(id, _)| *id)
             .collect();
@@ -1264,6 +1362,86 @@ impl CoreEngine {
                 (id, final_score)
             })
             .collect()
+    }
+
+    /// Walk a directory for files with specific extensions, ignoring all ignore rules.
+    /// Used to scan stub directories that are typically excluded by `.gitignore`.
+    fn walk_stub_dir(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+        WalkBuilder::new(dir)
+            .hidden(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .build()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter(|e| {
+                let ext = e
+                    .path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.to_lowercase())
+                    .unwrap_or_default();
+                extensions.contains(&ext.as_str())
+            })
+            .map(|e| e.into_path())
+            .collect()
+    }
+
+    /// Collect library stub files from well-known locations within the workspace:
+    /// - TypeScript: `node_modules/@types/**/*.ts` (`.d.ts` files)
+    /// - Python: `site-packages/**/*.pyi` inside common virtual-env directories
+    /// - Swift: `**/*.swiftinterface` inside `.build/` (SPM package cache)
+    ///
+    /// Returns an empty list when `config.index_stubs` is false.
+    fn collect_stub_files(&self) -> Vec<PathBuf> {
+        if !self.config.index_stubs {
+            return Vec::new();
+        }
+        let root = &self.config.workspace_root;
+        let mut files: Vec<PathBuf> = Vec::new();
+
+        // ── TypeScript: node_modules/@types/**/*.ts ────────────────────────────
+        let types_dir = root.join("node_modules").join("@types");
+        if types_dir.is_dir() {
+            files.extend(Self::walk_stub_dir(&types_dir, &["ts"]));
+        }
+
+        // ── Python: site-packages/**/*.pyi ────────────────────────────────────
+        // Search common virtual-environment root names for site-packages dirs.
+        for venv in &["venv", ".venv", "env", ".env", ".tox"] {
+            let venv_dir = root.join(venv);
+            if !venv_dir.is_dir() {
+                continue;
+            }
+            // Walk venv (gitignore disabled) and collect any site-packages dirs.
+            let site_pkg_dirs: Vec<PathBuf> = WalkBuilder::new(&venv_dir)
+                .hidden(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .max_depth(Some(6))
+                .build()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                        && e.file_name() == "site-packages"
+                })
+                .map(|e| e.into_path())
+                .collect();
+            for dir in site_pkg_dirs {
+                files.extend(Self::walk_stub_dir(&dir, &["pyi"]));
+            }
+        }
+
+        // ── Swift: .swiftinterface in SPM .build/ cache ───────────────────────
+        let build_dir = root.join(".build");
+        if build_dir.is_dir() {
+            files.extend(Self::walk_stub_dir(&build_dir, &["swiftinterface"]));
+        }
+
+        tracing::debug!("collect_stub_files: found {} stub files", files.len());
+        files
     }
 
     fn collect_source_files(&self) -> Result<Vec<PathBuf>> {

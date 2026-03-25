@@ -277,6 +277,129 @@ fn run_pipeline_no_pivots_skips_auto_observation() {
 }
 
 /// Queries issued while indexing is flagged as in-progress must succeed
+/// Stub files under `node_modules/@types/` must be indexed with `is_stub=true`
+/// and must never appear as pivots in `run_pipeline` results.
+#[test]
+fn stub_files_indexed_but_not_returned_as_pivots() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Project source file
+    std::fs::write(dir.path().join("app.ts"), "export function greet(name: string): string { return `Hello ${name}`; }\n").unwrap();
+
+    // Simulate a .d.ts stub under node_modules/@types/
+    let types_dir = dir.path().join("node_modules").join("@types").join("node");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    std::fs::write(
+        types_dir.join("index.d.ts"),
+        "declare function require(id: string): any;\ndeclare var process: NodeJS.Process;\n",
+    ).unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index_workspace failed");
+
+    let stats = engine.index_stats().expect("index_stats failed");
+    assert!(stats.stub_symbol_count > 0, "expected stub symbols to be indexed");
+
+    // run_pipeline on a stub-only query — stubs must not appear as pivots
+    let out = engine.run_pipeline("require", Some(4000), None, None).expect("run_pipeline failed");
+    // Pivots are formatted as `#### \`...\``; stub symbols must not be pivots
+    assert!(
+        !out.contains("#### `node_modules/"),
+        "stub symbol appeared as pivot: {}",
+        out
+    );
+}
+
+/// Regular project source files must NOT be marked as stubs.
+#[test]
+fn project_files_are_not_stubs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn real_fn() {}\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index_workspace failed");
+
+    let stats = engine.index_stats().expect("index_stats failed");
+    assert_eq!(stats.stub_symbol_count, 0, "project symbols should not be stubs");
+    assert!(stats.symbol_count > 0, "project symbols should be indexed");
+}
+
+/// Python `.pyi` stubs under a virtual-env `site-packages/` directory must be indexed
+/// and marked as stubs.
+#[test]
+fn python_pyi_stubs_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Simulate .venv/lib/python3.x/site-packages/requests.pyi
+    let site_packages = dir
+        .path()
+        .join(".venv")
+        .join("lib")
+        .join("python3.11")
+        .join("site-packages");
+    std::fs::create_dir_all(&site_packages).unwrap();
+    std::fs::write(
+        site_packages.join("requests.pyi"),
+        "def get(url: str, **kwargs) -> Response: ...\nclass Response:\n    status_code: int\n",
+    )
+    .unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index_workspace failed");
+
+    let stats = engine.index_stats().expect("index_stats failed");
+    assert!(stats.stub_symbol_count > 0, "Python pyi stubs should be indexed");
+}
+
+/// Swift `.swiftinterface` stubs under `.build/` must be indexed and marked as stubs.
+#[test]
+fn swift_swiftinterface_stubs_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Simulate .build/release/Modules/Foundation.swiftinterface
+    let modules_dir = dir
+        .path()
+        .join(".build")
+        .join("release")
+        .join("Modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::write(
+        modules_dir.join("MyLib.swiftinterface"),
+        "public func doSomething() -> Void\npublic class MyClass {}\n",
+    )
+    .unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index_workspace failed");
+
+    let stats = engine.index_stats().expect("index_stats failed");
+    assert!(stats.stub_symbol_count > 0, "Swift swiftinterface stubs should be indexed");
+}
+
+/// When `index_stubs = false`, stub directories are skipped entirely.
+#[test]
+fn index_stubs_false_skips_stub_files() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let types_dir = dir.path().join("node_modules").join("@types").join("node");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    std::fs::write(
+        types_dir.join("index.d.ts"),
+        "declare function require(id: string): any;\n",
+    )
+    .unwrap();
+
+    let config = cs_core::EngineConfig {
+        index_stubs: false,
+        ..cs_core::EngineConfig::new(dir.path()).without_embedder()
+    };
+    let engine = cs_core::CoreEngine::new(config).expect("engine init failed");
+    engine.index_workspace().expect("index_workspace failed");
+
+    let stats = engine.index_stats().expect("index_stats failed");
+    assert_eq!(stats.stub_symbol_count, 0, "stubs should not be indexed when disabled");
+}
+
 /// (possibly with partial results) and must not panic.
 #[test]
 fn query_during_indexing_does_not_panic() {

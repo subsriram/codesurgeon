@@ -63,7 +63,7 @@ impl std::fmt::Display for Language {
 pub fn detect_language(path: &Path) -> Option<Language> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     match ext.as_str() {
-        "py" | "pyw" => Some(Language::Python),
+        "py" | "pyw" | "pyi" => Some(Language::Python),
         "ts" => Some(Language::TypeScript),
         "tsx" => Some(Language::Tsx),
         "js" | "mjs" | "cjs" => Some(Language::JavaScript),
@@ -71,7 +71,7 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "sh" | "bash" | "zsh" | "fish" => Some(Language::Shell),
         "html" | "htm" => Some(Language::Html),
         "rs" => Some(Language::Rust),
-        "swift" => Some(Language::Swift),
+        "swift" | "swiftinterface" => Some(Language::Swift),
         "sql" => Some(Language::Sql),
         "md" | "mdx" => Some(Language::Markdown),
         _ => None,

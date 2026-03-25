@@ -313,3 +313,4 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | max_blast_radius_depth | 5 | `engine.rs` |
 | family_in_degree k | 5 | `graph.rs` |
 | centrality_score k | 15 | `graph.rs` |
+| Stub score weight | × 0.3 | `ranking.rs:STUB_SCORE_WEIGHT` |

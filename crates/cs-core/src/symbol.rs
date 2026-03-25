@@ -108,6 +108,11 @@ pub struct Symbol {
 
     /// blake3 hash of `body` — used for stale observation detection
     pub content_hash: String,
+
+    /// True for symbols extracted from library stub files (`.d.ts`, `.pyi`,
+    /// `.swiftinterface`).  Stubs are indexed for signature lookup but never
+    /// returned as pivots and are ranked at ×0.3 relative to project symbols.
+    pub is_stub: bool,
 }
 
 impl Symbol {
@@ -140,6 +145,7 @@ impl Symbol {
             body,
             language,
             content_hash,
+            is_stub: false,
         }
     }
 
