@@ -189,6 +189,60 @@ codesurgeon/
 - [x] `CLAUDE.md` — MCP config instructions + usage guide
 - [x] `.gitignore`
 
+### Completed after initial build
+
+- [x] **8a — Quick wins / optional filter params** (issue #1): added `file_path`, `language`,
+  `max_results`, `include_callers`, `min_score`, `max_depth` parameters to MCP tools;
+  `observation` inline param on `run_pipeline`; `include_tests` flag on capsule tools;
+  `format`/Mermaid output on `get_impact_graph`; `max_paths` on `search_logic_flow`;
+  `memory delete <id>` subcommand in CLI; file size reduction pass on capsule output
+- [x] **9a — Auto-capture tool calls** (issue #2): every `run_pipeline` and `get_context_capsule`
+  call auto-saves an `ObservationKind::Auto` observation (task + top 3 pivot FQNs) with a
+  30-minute dedupe guard; `get_session_context` exposes auto observations alongside manual ones
+- [x] **7a — Type stub indexing** (issue #3): `node_modules/@types/**/*.d.ts`, `site-packages/**/*.pyi`,
+  and `.swiftinterface` files are indexed as skeletons-only (`is_stub = true`), ranked at ×0.3,
+  never returned as pivots; `EngineConfig.index_stubs` opt-out; `stub_symbol_count` in
+  `index_status` output
+- [x] **7f — Shell `source` + SQL `CALL` edges** (issue #4): `walk_shell()` emits `Imports` edges
+  for `source ./lib.sh` and `. ./util.sh`; `walk_sql()` emits `Calls` edges for `CALL` /
+  `EXEC` statements; both wired into `engine.rs` alongside existing edge extractors
+- [x] **11a+b — Secrets exclusion + `.codesurgeonignore`** (issue #5): auto-skip `.env`, `*secret*`,
+  `*credential*`, `*password*` files plus API-key content detection (20+ char `[A-Z0-9_]=`
+  patterns); `CS_ALLOW_SECRETS=1` opt-out; `.codesurgeonignore` gitignore-syntax file parsed
+  by the same `ignore` crate pass; excluded files reported in `index_status`
+- [x] **9b — Session TTL + compression + staleness score** (issue #6): `expires_at` column on
+  `observations`; auto/passive/thrash/dead_end expire in 7 days, manual/insight never expire,
+  summary entries get 90 days; TTLs configurable via `[memory]` in `.codesurgeon/config.toml`;
+  `ObservationKind::Summary`; compression pass merges ≥3 observations per symbol into one
+  Summary entry on startup; `get_session_context` returns `SessionContext { observations,
+  staleness_score }` where staleness_score (0–100%) is the fraction of stale non-expired
+  observations; MCP output shows warning when staleness > 0%
+- [x] **Hybrid ANN candidate retrieval** (issue #30): replaced full-cache cosine scan with
+  HNSW approximate nearest-neighbour index (`instant-distance`); embedding lookup is now
+  lazy top-K against candidates already in the BM25+graph pool; BM25, graph-neighbour, and
+  ANN streams merged via Reciprocal Rank Fusion (RRF); HNSW index built on a background
+  thread after each reindex pass so startup is not blocked; eliminates ~99.5% of dot-product
+  work per query on large workspaces
+- [x] **Test coverage expansion** (issue #31): test count 34 → 57 across two PRs:
+  - Parser edge cases: empty files, whitespace-only files, multi-byte UTF-8 identifiers
+    (`処理する` in Python, `Häuser` in Rust), call edges with multibyte args
+  - `extract_args_snippet` UTF-8 boundary panic fixed and tested
+  - Error paths: partial JSON (-32700), corrupt SQLite, unknown tool, missing required arg,
+    non-UTF-8 body, non-numeric Content-Length, truncated body
+  - Concurrency: 8-thread parallel `run_pipeline`, concurrent `reindex_file`, queries during
+    `index_workspace`
+  - CLI: 10 integration tests in `crates/cs-cli/tests/cli.rs` covering argument validation,
+    status, index, search, observe+memory round-trip
+  - Markdown setext heading bug fixed: `walk_markdown` used `break` after the first heading
+    per section, silently dropping all setext subheadings; fixed by not breaking on
+    `setext_heading` nodes; `heading_text` also fixed to strip the underline from setext names
+- [x] **Code hardening**: `parking_lot` mutexes replacing `std::sync` (no poisoning);
+  MCP transport byte-length and message-count limits to prevent DoS; centrality/in-degree
+  caches invalidated on graph mutation; ranking constants extracted from magic numbers;
+  HNSW index built asynchronously so BM25+graph queries serve immediately at startup;
+  orphaned MCP server processes self-terminate when the parent process dies (PPID check);
+  `utm_truncate` UTF-8 boundary safety under `cfg(feature = "embeddings")`
+
 ---
 
 ## What's left (build order)
@@ -356,7 +410,7 @@ incremental re-enrichment — only changed symbols are re-processed.
 
 ---
 
-#### 7a — Tier 1: Index type stubs already on disk (all languages, near-zero effort)
+#### 7a — Tier 1: Index type stubs already on disk ✅
 
 No new tools required. Extend the indexer to treat these paths as a low-weight `library`
 partition: indexed as skeletons only, never returned as pivots, lower ranking weight.
@@ -478,27 +532,25 @@ Community options if Xcode 26 unavailable:
 
 ---
 
-#### 7f — Shell and SQL: parser-level fixes (no external tools)
+#### 7f — Shell and SQL: parser-level fixes ✅
 
-**Shell:** The current extractor captures function definitions only. The primary gap is
-`source ./lib.sh` / `. ./util.sh` — file-level import edges that enable graph traversal across
-shell scripts. Fix at the tree-sitter level in `walk_shell()` in `indexer.rs`. No external tool.
+**Shell:** `walk_shell()` now emits `Imports` edges for `source ./lib.sh` and `. ./util.sh`
+statements, enabling graph traversal across shell scripts.
 
-**SQL:** Schemas are already self-describing; no type enrichment needed. The gap is cross-schema
-references and stored procedure call graphs (e.g. a procedure calling another procedure).
-Extend `walk_sql()` to extract `CALL` and `EXEC` statements as `Calls` edges.
+**SQL:** `walk_sql()` now emits `Calls` edges for `CALL` and `EXEC` statements, enabling
+stored-procedure call graphs.
 
 ---
 
 #### Build order within Phase 7
 
-1. **7a** — stub indexing (highest ROI, contained change to indexer + db)
-2. **7b** — `cargo-expand` (re-uses existing tree-sitter pass, additive)
-3. **7b** — `rustdoc JSON` (new `rustdoc-types` dep, annotates existing symbols)
-4. **7f** — shell `source` edges + SQL call edges (parser-level, self-contained)
-5. **7c** — TypeScript shim (requires bundling a Node.js script)
-6. **7d** — pyright (subprocess integration, lowest incremental value given 7a)
-7. **7e** — Xcode MCP (documentation only)
+1. ✅ **7a** — stub indexing (shipped issue #3)
+2. ✅ **7f** — shell `source` edges + SQL call edges (shipped issue #4)
+3. ✅ **7e** — Xcode MCP (documentation only — shipped earlier)
+4. **7b** — `cargo-expand` (re-uses existing tree-sitter pass, additive)
+5. **7b** — `rustdoc JSON` (new `rustdoc-types` dep, annotates existing symbols)
+6. **7c** — TypeScript shim (requires bundling a Node.js script)
+7. **7d** — pyright (subprocess integration, lowest incremental value given 7a)
 
 ---
 
@@ -509,10 +561,9 @@ existing tools) and new tools.
 
 ---
 
-#### 8a — Quick wins: parameter additions to existing tools (Low effort)
+#### 8a — Quick wins: parameter additions to existing tools ✅
 
-Four small additions that close the most visible gaps with the competition. No new tools, no schema
-changes — all are additive parameters with backward-compatible defaults.
+Shipped in issue #1. All backward-compatible parameter additions with default values unchanged.
 
 **`observation` param on `run_pipeline`**
 Auto-save an observation as part of the pipeline call, saving a round-trip.
@@ -603,36 +654,21 @@ sophisticated session memory. Ordered from highest to lowest value/effort ratio.
 
 ---
 
-#### 9a — Auto-capture tool calls as observations (Low effort, high value)
+#### 9a — Auto-capture tool calls as observations ✅
 
-Currently codesurgeon only passively captures file-change events. The leading competitor records every
-`run_pipeline` and `get_context_capsule` call as a compact observation (task + top pivot FQNs).
-This builds a picture of what the agent has explored across sessions without any manual saves —
-the most common case where session context is actually useful.
-
-Implementation:
-- After each `run_pipeline` / `get_context_capsule` call, auto-save a compact observation:
-  `ObservationKind::Auto` with content = task description + top 3 pivot FQNs
-- Gate behind a dedupe check: if an identical task was recorded in the last 30 minutes, skip
-- No new schema changes — `ObservationKind::Auto` already exists or is a one-line addition
+Shipped in issue #2. Every `run_pipeline` and `get_context_capsule` call auto-saves an
+`ObservationKind::Auto` observation (task + top 3 pivot FQNs) with a 30-minute dedupe guard.
 
 ---
 
-#### 9b — Session TTL + compression (Low-med effort, high value)
+#### 9b — Session TTL + compression ✅
 
-The observation store currently grows unbounded. The leading competitor auto-compresses sessions after 2 hours
-of inactivity into structural summaries and enforces:
-- Auto-observations: expire after session compression
-- Manual observations: persist permanently
-- Sessions older than 90 days: fully deleted
-
-Implementation:
-- Add `compressed_at: Option<DateTime>` and `expires_at: Option<DateTime>` to the `observations`
-  table
-- Background task (runs on startup) compresses inactive sessions: extract key paths, FQNs, and
-  terms into a single `ObservationKind::Summary` entry; mark auto-observations as expired
-- Manual observations (`ObservationKind::Manual`) never get an `expires_at`
-- Prune observations where `expires_at < now()` on each startup
+Shipped in issue #6. `expires_at` column added; auto/passive/thrash/dead_end expire after 7 days,
+manual/insight never expire by default; TTLs configurable via `[memory]` in
+`.codesurgeon/config.toml`; compression pass merges ≥3 per-symbol observations into one
+`ObservationKind::Summary` entry on startup; `get_session_context` returns
+`SessionContext { observations, staleness_score }` where `staleness_score` (0–100%) is the
+fraction of stale non-expired observations.
 
 ---
 
@@ -819,12 +855,12 @@ effort, risk, dogfooding opportunity (can codesurgeon benefit on itself immediat
 | Priority | Item | Effort | Key reason |
 |----------|------|--------|------------|
 | ✅ done | 7e Xcode MCP | Zero | Free — guidance auto-injected by `generate_module_docs` |
-| 1 | 8a Quick wins | Low | Four parameter additions; closes most visible competitive gaps immediately |
-| 2 | 9a Tool call auto-capture | Low | Builds cross-session picture without manual saves; high value, tiny change |
-| 3 | 7a Stub indexing | Low-med | Highest ROI on enrichment; fixes hallucinated library signatures |
-| 4 | 7f Shell/SQL edges | Low | Quick win; contained tree-sitter changes; no new deps |
-| 5 | 11a+b Secrets exclusion + `.codesurgeonignore` | Low | Security gap; prevents secrets leaking into capsules |
-| 6 | 9b Session TTL + compression | Low-med | Prevents unbounded growth; lifecycle for auto vs manual observations |
+| ✅ done | 8a Quick wins | Low | Filter params, inline observation, Mermaid, max_paths, CLI memory delete |
+| ✅ done | 9a Tool call auto-capture | Low | Auto `ObservationKind::Auto` on every pipeline/capsule call, 30-min dedupe |
+| ✅ done | 7a Stub indexing | Low-med | `.d.ts`/`.pyi`/`.swiftinterface` indexed at ×0.3 weight, never pivot |
+| ✅ done | 7f Shell/SQL edges | Low | `source` → Imports; `CALL`/`EXEC` → Calls |
+| ✅ done | 11a+b Secrets exclusion + `.codesurgeonignore` | Low | Env/secret files excluded; project-level ignore file |
+| ✅ done | 9b Session TTL + compression | Low-med | expires_at per kind; compression pass; staleness_score |
 | 7 | 7b `cargo-expand` | Med | Macro blind spot; codesurgeon dogfoods on itself immediately |
 | 8 | 7b `rustdoc` JSON | Med | Resolved types for Rust; follows from `cargo-expand` work |
 | 9 | 8b `search_memory` + 9c L1/L2/L3 | Low-med | Build together — detail levels should be in from the start |
@@ -851,66 +887,42 @@ appends inline hint when Swift symbols appear. No code needed in target projects
 
 ---
 
-**#1 — 8a Quick wins (parameter additions)** · Low effort
-Four backward-compatible additions in one sprint before anything else — highest ratio of
-agent value to implementation cost in the entire backlog.
+**✅ done — 8a Quick wins (parameter additions)** · issue #1
+Filter params (`file_path`, `language`, `max_results`, `include_callers`, `min_score`,
+`max_depth`), inline `observation` on `run_pipeline`, `include_tests` flag, `format`/Mermaid
+on `get_impact_graph`, `max_paths` on `search_logic_flow`, `memory delete <id>` CLI command.
 
 ---
 
-**#2 — 9a Tool call auto-capture** · Low effort
-Four backward-compatible additions to existing tools that close the most visible gaps
-with the competition in a single sprint: `observation` on `run_pipeline`, `include_tests` flag,
-`format`/Mermaid on `get_impact_graph`, `max_paths` on `search_logic_flow`. No new
-infrastructure, no schema changes.
+**✅ done — 9a Tool call auto-capture** · issue #2
+Every `run_pipeline` and `get_context_capsule` call auto-saves an `ObservationKind::Auto`
+observation (task + top 3 pivot FQNs) with a 30-minute dedupe guard.
 
 ---
 
-Every `run_pipeline` and `get_context_capsule` call auto-saved as a compact observation
-(task + top pivot FQNs). Builds cross-session exploration history without any manual saves.
-Tiny change — one `save_observation` call at the end of each tool dispatch with a 30-minute
-dedupe guard.
+**✅ done — 7a Stub indexing** · issue #3
+`.d.ts`, `.pyi`, and `.swiftinterface` files indexed as skeletons-only (`is_stub=true`),
+ranked at ×0.3, never returned as pivots. `EngineConfig.index_stubs` opt-out.
+`stub_symbol_count` reported in `index_status`.
 
 ---
 
-**#3 — 7a Stub indexing** · Low-med effort
-Highest ROI of any remaining item. Indexes `.d.ts`, `.pyi`, and `.swiftinterface` files
-already on disk — no new tools, no new deps. Fixes the most common agent failure mode
-(hallucinated library signatures) across all supported languages simultaneously.
-Foundational: 7c and 7d both add diminishing value once stubs are indexed.
+**✅ done — 7f Shell `source` + SQL `CALL` edges** · issue #4
+`walk_shell()` emits `Imports` edges for `source` / `.` statements.
+`walk_sql()` emits `Calls` edges for `CALL` / `EXEC` statements.
 
 ---
 
-**#4 — 7f Shell `source` edges + SQL `CALL` edges** · Low effort
-Two self-contained changes to `indexer.rs`; no new crates, no schema changes, no subprocess
-integration. `get_impact_graph` and `search_logic_flow` are currently broken for Shell and SQL
-because cross-file/cross-procedure edges are missing. Low enough effort to ship in the same
-sprint as 7a.
+**✅ done — 11a+b Secrets exclusion + `.codesurgeonignore`** · issue #5
+Auto-skip `.env`, `*secret*`, `*credential*`, `*password*` files and API-key content.
+`CS_ALLOW_SECRETS=1` opt-out. `.codesurgeonignore` gitignore-syntax project exclusion file.
 
 ---
 
-**#5 — 11a+b Secrets exclusion + `.codesurgeonignore`** · Low effort
-Two small indexer changes that close a real security gap.
-
-**11a — Secrets exclusion**: auto-skip files matching sensitive patterns during indexing.
-Never index these as pivots or skeletons; log them as excluded at index time:
-- `**/.env`, `**/.env.*`, `**/.env.local`, `**/.env.production`, `**/.env.development`
-- `**/*secret*`, `**/*credential*`, `**/*password*`
-- Files whose first 20 lines match common API key patterns (e.g. `[A-Z0-9]{20,}`)
-
-Uses the `ignore` crate (already a transitive dep via tree-sitter tooling). Prevents secrets
-leaking into capsule output handed to the agent — and by extension into Claude's context window.
-
-**11b — `.codesurgeonignore`**: project-level exclusion file using gitignore syntax, layered
-on top of `.gitignore`. Lets users exclude `fixtures/`, `testdata/`, `vendor/`, generated
-files, or anything else they don't want in the index. Parsed by the same `ignore` crate pass.
-
----
-
-**#6 — 9b Session TTL + compression** · Low-med effort
-Prevents the observation store growing unbounded. Auto-compress sessions idle for 2+ hours
-into structural summaries; expire auto-observations; delete sessions older than 90 days;
-manual observations persist permanently. Needs to land before 9d (consolidation) since
-compression is when merging happens.
+**✅ done — 9b Session TTL + compression** · issue #6
+`expires_at` column; auto/passive expire in 7 days; manual/insight never expire;
+TTLs configurable via `[memory]` in `.codesurgeon/config.toml`; compression pass on startup;
+`staleness_score` in `get_session_context` output.
 
 ---
 
@@ -1201,39 +1213,18 @@ and make codesurgeon's value measurable without any data leaving the machine.
 
 ---
 
-#### 11a — Secrets exclusion (Low effort)
+#### 11a — Secrets exclusion ✅
 
-Auto-skip files matching sensitive patterns during the indexer's file walk. These files are
-never indexed as pivots or skeletons, never appear in capsule output, and are logged as
-excluded in `index_status`.
-
-Patterns excluded by default:
-- `.env`, `.env.*`, `.env.local`, `.env.production`, `.env.development`
-- `*secret*`, `*credential*`, `*password*` (basename match)
-- Files whose first 20 lines contain a bare API key pattern: `[A-Z0-9_]{20,}=`
-
-Uses the `ignore` crate (already in the dependency tree) for glob matching.
-A new `CS_ALLOW_SECRETS=1` env var opt-out for users who deliberately want `.env` files indexed
-(e.g. non-sensitive development configs).
+Shipped in issue #5. Auto-skips `.env`/`*secret*`/`*credential*`/`*password*` files and files
+whose first 20 lines contain `[A-Z0-9_]{20,}=` API-key patterns. `CS_ALLOW_SECRETS=1` opt-out.
+Excluded files reported in `index_status`.
 
 ---
 
-#### 11b — `.codesurgeonignore` (Low effort)
+#### 11b — `.codesurgeonignore` ✅
 
-Project-level exclusion file using gitignore syntax, layered on top of `.gitignore`.
-Parsed by the same `ignore` crate pass as 11a.
-
-```
-# .codesurgeonignore
-fixtures/
-testdata/
-vendor/
-**/*.generated.ts
-migrations/
-```
-
-Useful for: large generated files that bloat the index, test fixtures that distort rankings,
-vendored copies of third-party code that shouldn't be treated as project symbols.
+Shipped in issue #5. Project-level exclusion file using gitignore syntax, layered on top of
+`.gitignore`; parsed by the same `ignore` crate pass as 11a.
 
 ---
 
@@ -1291,7 +1282,7 @@ Also injects a one-liner into `get_session_context` output:
 
 #### Build order within Phase 11
 
-1. **11a + 11b** — secrets exclusion + ignore file (single indexer PR, no schema change)
+1. ✅ **11a + 11b** — secrets exclusion + ignore file (shipped issue #5)
 2. **11c** — `query_log` schema + write path + `codesurgeon stats` CLI
 3. **11d** — `get_stats` MCP tool (add after CLI is working and numbers look right)
 
