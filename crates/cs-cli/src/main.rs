@@ -172,11 +172,11 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             let observations = engine.get_session_context()?;
-            if observations.is_empty() {
+            if observations.observations.is_empty() {
                 println!("No session observations.");
                 return Ok(());
             }
-            for obs in &observations {
+            for obs in &observations.observations {
                 let stale = if obs.is_stale { " [STALE]" } else { "" };
                 println!("[{}]{} (id: {}): {}", obs.created_at, stale, obs.id, obs.content);
             }
