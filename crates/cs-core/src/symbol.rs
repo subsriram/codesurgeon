@@ -113,6 +113,10 @@ pub struct Symbol {
     /// `.swiftinterface`).  Stubs are indexed for signature lookup but never
     /// returned as pivots and are ranked at ×0.3 relative to project symbols.
     pub is_stub: bool,
+
+    /// Origin of the symbol. `None` means regular source code. Known values:
+    /// - `"macro_expanded"` — synthesised by `cargo-expand` from a proc-macro/derive
+    pub source: Option<String>,
 }
 
 impl Symbol {
@@ -146,6 +150,7 @@ impl Symbol {
             language,
             content_hash,
             is_stub: false,
+            source: None,
         }
     }
 

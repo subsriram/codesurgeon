@@ -65,6 +65,44 @@ impl ObservationKind {
     }
 }
 
+// ── IndexingConfig ─────────────────────────────────────────────────────────────
+
+/// Indexing-time enrichment configuration.
+/// Loaded from `.codesurgeon/config.toml` under `[indexing]` if present.
+///
+/// Example config.toml:
+/// ```toml
+/// [indexing]
+/// rust_expand_macros = true
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct IndexingConfig {
+    /// When true, run `cargo-expand` on Rust files that contain proc-macro or
+    /// derive invocations and add the generated symbols to the index.
+    /// Requires `cargo-expand` to be installed; skipped gracefully if absent.
+    /// Default: false.
+    pub rust_expand_macros: bool,
+}
+
+impl IndexingConfig {
+    /// Load from a `config.toml` file. Missing file or section → defaults.
+    pub fn load_from_toml(path: &std::path::Path) -> Self {
+        let mut cfg = IndexingConfig::default();
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return cfg;
+        };
+        let Ok(table) = text.parse::<toml::Table>() else {
+            return cfg;
+        };
+        if let Some(indexing) = table.get("indexing").and_then(|v| v.as_table()) {
+            if let Some(v) = indexing.get("rust_expand_macros").and_then(|v| v.as_bool()) {
+                cfg.rust_expand_macros = v;
+            }
+        }
+        cfg
+    }
+}
+
 // ── MemoryConfig ───────────────────────────────────────────────────────────────
 
 /// TTL configuration for the observation store.

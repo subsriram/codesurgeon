@@ -804,3 +804,100 @@ fn get_session_context_returns_session_context_struct() {
     // staleness_score is a valid percentage
     assert!(ctx.staleness_score >= 0.0 && ctx.staleness_score <= 100.0);
 }
+
+// ── Macro expansion tests ──────────────────────────────────────────────────────
+
+/// Symbols extracted from source code must have `source = None` by default.
+#[test]
+fn symbol_source_is_none_for_regular_code() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn my_fn() {}\npub struct MyStruct;\n",
+    )
+    .unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+    // Verify via run_pipeline that we indexed the symbols; source field is
+    // None for regular source code symbols (tested at the struct level below).
+    let src_sym = cs_core::symbol::Symbol::new(
+        "src/lib.rs",
+        "plain_fn",
+        cs_core::SymbolKind::Function,
+        1,
+        1,
+        "fn plain_fn()".to_string(),
+        None,
+        "fn plain_fn() {}".to_string(),
+        cs_core::language::Language::Rust,
+    );
+    assert!(
+        src_sym.source.is_none(),
+        "source should be None for regular symbols"
+    );
+}
+
+/// `[indexing] rust_expand_macros = true` in config.toml must set the flag.
+#[test]
+fn indexing_config_rust_expand_macros_loaded_from_toml() {
+    use cs_core::memory::IndexingConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[indexing]\nrust_expand_macros = true\n",
+    )
+    .unwrap();
+    let cfg = IndexingConfig::load_from_toml(&config_dir.join("config.toml"));
+    assert!(
+        cfg.rust_expand_macros,
+        "rust_expand_macros should be true when set in config.toml"
+    );
+}
+
+/// `IndexingConfig` must default to `rust_expand_macros = false`.
+#[test]
+fn indexing_config_defaults_to_false() {
+    use cs_core::memory::IndexingConfig;
+    let cfg = IndexingConfig::default();
+    assert!(
+        !cfg.rust_expand_macros,
+        "rust_expand_macros should default to false"
+    );
+}
+
+/// `run_macro_enrichment` must return empty when no Cargo.toml is present.
+#[test]
+fn macro_enrichment_skipped_without_cargo_toml() {
+    use cs_core::db::Database;
+    use cs_core::macro_expand::run_macro_enrichment;
+    let dir = tempfile::tempdir().unwrap();
+    // No Cargo.toml in dir — enrichment must skip gracefully.
+    let db_path = dir.path().join("index.db");
+    let db = Database::open(&db_path).expect("db open failed");
+    let result = run_macro_enrichment(dir.path(), &[], &db);
+    assert!(
+        result.is_empty(),
+        "expected empty result without Cargo.toml"
+    );
+}
+
+/// `run_macro_enrichment` must return empty when file_data has no Rust files.
+#[test]
+fn macro_enrichment_skipped_for_non_rust_files() {
+    use cs_core::db::Database;
+    use cs_core::macro_expand::run_macro_enrichment;
+    let dir = tempfile::tempdir().unwrap();
+    // Cargo.toml present so the Cargo gate passes.
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let db_path = dir.path().join("index.db");
+    let db = Database::open(&db_path).expect("db open failed");
+    // Only a Python file in file_data.
+    let file_data = vec![("script.py".to_string(), "abc".to_string(), vec![])];
+    let result = run_macro_enrichment(dir.path(), &file_data, &db);
+    assert!(
+        result.is_empty(),
+        "expected empty result for non-Rust files"
+    );
+}

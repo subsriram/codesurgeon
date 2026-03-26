@@ -7,6 +7,7 @@ pub mod engine;
 pub mod graph;
 pub mod indexer;
 pub mod language;
+pub mod macro_expand;
 pub mod memory;
 pub mod module_docs;
 pub mod ranking;

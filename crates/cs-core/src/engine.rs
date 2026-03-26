@@ -9,7 +9,8 @@ use crate::indexer::{
     extract_sql_ref_edges, extract_type_flow_edges, index_file,
 };
 use crate::language::Language;
-use crate::memory::{new_session_id, MemoryConfig, MemoryStore};
+use crate::macro_expand::run_macro_enrichment;
+use crate::memory::{new_session_id, IndexingConfig, MemoryConfig, MemoryStore};
 use crate::module_docs::{detect_xcode_mcp, swift_enrichment_hint};
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
@@ -71,6 +72,12 @@ pub struct EngineConfig {
     /// `.swiftinterface` files in SPM `.build/` directories.
     /// Gate with `[indexing] include_stubs = false` in `config.toml` to disable.
     pub index_stubs: bool,
+
+    /// When true, run `cargo-expand` on Rust files that contain proc-macro or
+    /// derive invocations and index the generated symbols.
+    /// Set via `[indexing] rust_expand_macros = true` in `config.toml`.
+    /// Default: false.
+    pub rust_expand_macros: bool,
 }
 
 impl EngineConfig {
@@ -88,6 +95,7 @@ impl EngineConfig {
             session_id,
             load_embedder: true,
             index_stubs: true,
+            rust_expand_macros: false,
         }
     }
 
@@ -224,14 +232,19 @@ impl CoreEngine {
         let graph = Arc::new(RwLock::new(CodeGraph::new()));
         let search = Arc::new(Mutex::new(SearchIndex::new()?));
 
-        // Load optional memory config from .codesurgeon/config.toml
-        let mem_config = {
-            let config_path = config
-                .workspace_root
-                .join(".codesurgeon")
-                .join("config.toml");
-            MemoryConfig::load_from_toml(&config_path)
-        };
+        // Load optional configs from .codesurgeon/config.toml
+        let config_path = config
+            .workspace_root
+            .join(".codesurgeon")
+            .join("config.toml");
+        let mem_config = MemoryConfig::load_from_toml(&config_path);
+        let indexing_config = IndexingConfig::load_from_toml(&config_path);
+        // Apply [indexing] settings onto EngineConfig (config is already cloned into Arc).
+        // We update the local binding before it moves into the Arc below.
+        let mut config = config;
+        if indexing_config.rust_expand_macros {
+            config.rust_expand_macros = true;
+        }
 
         let memory = Arc::new(Mutex::new(
             MemoryStore::new(Arc::clone(&db), &config.session_id).with_config(mem_config),
@@ -450,6 +463,42 @@ impl CoreEngine {
             search.commit()?;
             graph.warm_caches();
         } // graph + search locks released here
+
+        // ── Macro expansion enrichment ────────────────────────────────────────
+        // Run cargo-expand on Rust files with proc-macro/derive invocations and
+        // add the generated symbols to the index.  Skipped when the feature is
+        // disabled in config or when cargo-expand is not installed.
+        if self.config.rust_expand_macros {
+            let expanded_symbols = {
+                let db = self.db.lock();
+                run_macro_enrichment(&self.config.workspace_root, &file_data, &db)
+            };
+            if !expanded_symbols.is_empty() {
+                tracing::info!(
+                    "macro-expand: indexing {} expanded symbol(s)",
+                    expanded_symbols.len()
+                );
+                {
+                    let db = self.db.lock();
+                    db.begin_transaction()?;
+                    for sym in &expanded_symbols {
+                        db.upsert_symbol(sym)?;
+                    }
+                    db.commit_transaction()?;
+                }
+                {
+                    let mut graph = self.graph.write();
+                    let mut search = self.search.lock();
+                    for sym in &expanded_symbols {
+                        graph.add_symbol(sym.clone());
+                        search.index_symbol(sym)?;
+                    }
+                    search.commit()?;
+                    graph.warm_caches();
+                }
+                all_symbols.extend(expanded_symbols);
+            }
+        }
 
         // ── Stub file indexing ────────────────────────────────────────────────
         // Parse stub files in parallel, mark every symbol with is_stub=true,

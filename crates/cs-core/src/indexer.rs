@@ -15,6 +15,12 @@ pub use crate::edges::{
 // Public API
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Parse raw Rust source (e.g. `cargo-expand` output) against a given
+/// logical `file_path` and return all symbols. Used by the macro enrichment pass.
+pub fn parse_rust_source(file_path: &str, source: &str) -> Result<Vec<Symbol>> {
+    extract_rust(file_path, source)
+}
+
 /// Parse a single file and return all symbols found in it.
 pub fn index_file(workspace_root: &Path, abs_path: &Path, content: &str) -> Result<Vec<Symbol>> {
     let lang = match detect_language(abs_path) {

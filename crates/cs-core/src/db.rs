@@ -39,7 +39,13 @@ impl Database {
                 body          TEXT NOT NULL,
                 language      TEXT NOT NULL,
                 content_hash  TEXT NOT NULL,
-                is_stub       INTEGER NOT NULL DEFAULT 0
+                is_stub       INTEGER NOT NULL DEFAULT 0,
+                source        TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS macro_expand_cache (
+                file_path    TEXT PRIMARY KEY,
+                source_hash  TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
@@ -99,6 +105,13 @@ impl Database {
         );
         let _ = self
             .conn
+            .execute("ALTER TABLE symbols ADD COLUMN source TEXT", []);
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS macro_expand_cache \
+             (file_path TEXT PRIMARY KEY, source_hash TEXT NOT NULL);",
+        );
+        let _ = self
+            .conn
             .execute("ALTER TABLE observations ADD COLUMN expires_at TEXT", []);
         // Index may already exist on new databases; ignore error.
         let _ = self.conn.execute_batch(
@@ -125,8 +138,8 @@ impl Database {
         self.conn.execute(
             r#"INSERT OR REPLACE INTO symbols
                (id, fqn, name, kind, file_path, start_line, end_line,
-                signature, docstring, body, language, content_hash, is_stub)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"#,
+                signature, docstring, body, language, content_hash, is_stub, source)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"#,
             params![
                 sym.id as i64,
                 sym.fqn,
@@ -141,6 +154,7 @@ impl Database {
                 sym.language.as_str(),
                 sym.content_hash,
                 sym.is_stub as i64,
+                sym.source,
             ],
         )?;
         // Keep FTS in sync
@@ -184,7 +198,7 @@ impl Database {
     pub fn get_symbol(&self, id: u64) -> Result<Option<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash,is_stub \
+             signature,docstring,body,language,content_hash,is_stub,source \
              FROM symbols WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id as i64], row_to_symbol)?;
@@ -466,7 +480,7 @@ impl Database {
     pub fn all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash,is_stub \
+             signature,docstring,body,language,content_hash,is_stub,source \
              FROM symbols",
         )?;
         let results = stmt
@@ -502,7 +516,7 @@ impl Database {
     pub fn all_symbols_for_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash,is_stub \
+             signature,docstring,body,language,content_hash,is_stub,source \
              FROM symbols WHERE file_path = ?1",
         )?;
         let results = stmt
@@ -510,6 +524,27 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(results)
+    }
+
+    // ── Macro expansion cache ─────────────────────────────────────────────────
+
+    /// Return the source_hash stored for `file_path` in the macro-expand cache,
+    /// or `None` if this file has never been expanded.
+    pub fn get_macro_expand_hash(&self, file_path: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_hash FROM macro_expand_cache WHERE file_path = ?1")?;
+        let mut rows = stmt.query_map(params![file_path], |row| row.get(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Update (or insert) the cache entry for `file_path`.
+    pub fn set_macro_expand_hash(&self, file_path: &str, source_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO macro_expand_cache (file_path, source_hash) VALUES (?1, ?2)",
+            params![file_path, source_hash],
+        )?;
+        Ok(())
     }
 }
 
@@ -531,6 +566,7 @@ fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
         language: Language::from_db_str(&row.get::<_, String>(10)?),
         content_hash: row.get(11)?,
         is_stub: row.get::<_, i64>(12)? != 0,
+        source: row.get(13)?,
     })
 }
 
