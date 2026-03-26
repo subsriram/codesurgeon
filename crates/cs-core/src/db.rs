@@ -40,7 +40,8 @@ impl Database {
                 language      TEXT NOT NULL,
                 content_hash  TEXT NOT NULL,
                 is_stub       INTEGER NOT NULL DEFAULT 0,
-                source        TEXT
+                source        TEXT,
+                resolved_type TEXT
             );
 
             CREATE TABLE IF NOT EXISTS macro_expand_cache (
@@ -106,6 +107,9 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE symbols ADD COLUMN source TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE symbols ADD COLUMN resolved_type TEXT", []);
         let _ = self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS macro_expand_cache \
              (file_path TEXT PRIMARY KEY, source_hash TEXT NOT NULL);",
@@ -138,8 +142,9 @@ impl Database {
         self.conn.execute(
             r#"INSERT OR REPLACE INTO symbols
                (id, fqn, name, kind, file_path, start_line, end_line,
-                signature, docstring, body, language, content_hash, is_stub, source)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"#,
+                signature, docstring, body, language, content_hash, is_stub, source,
+                resolved_type)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"#,
             params![
                 sym.id as i64,
                 sym.fqn,
@@ -155,6 +160,7 @@ impl Database {
                 sym.content_hash,
                 sym.is_stub as i64,
                 sym.source,
+                sym.resolved_type,
             ],
         )?;
         // Keep FTS in sync
@@ -198,7 +204,7 @@ impl Database {
     pub fn get_symbol(&self, id: u64) -> Result<Option<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash,is_stub,source \
+             signature,docstring,body,language,content_hash,is_stub,source,resolved_type \
              FROM symbols WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id as i64], row_to_symbol)?;
@@ -480,7 +486,7 @@ impl Database {
     pub fn all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash,is_stub,source \
+             signature,docstring,body,language,content_hash,is_stub,source,resolved_type \
              FROM symbols",
         )?;
         let results = stmt
@@ -516,7 +522,7 @@ impl Database {
     pub fn all_symbols_for_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
-             signature,docstring,body,language,content_hash,is_stub,source \
+             signature,docstring,body,language,content_hash,is_stub,source,resolved_type \
              FROM symbols WHERE file_path = ?1",
         )?;
         let results = stmt
@@ -567,6 +573,7 @@ fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
         content_hash: row.get(11)?,
         is_stub: row.get::<_, i64>(12)? != 0,
         source: row.get(13)?,
+        resolved_type: row.get(14)?,
     })
 }
 

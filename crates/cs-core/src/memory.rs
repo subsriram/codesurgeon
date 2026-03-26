@@ -73,7 +73,8 @@ impl ObservationKind {
 /// Example config.toml:
 /// ```toml
 /// [indexing]
-/// rust_expand_macros = true
+/// rust_expand_macros  = true
+/// rust_rustdoc_types  = true
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct IndexingConfig {
@@ -82,6 +83,13 @@ pub struct IndexingConfig {
     /// Requires `cargo-expand` to be installed; skipped gracefully if absent.
     /// Default: false.
     pub rust_expand_macros: bool,
+
+    /// When true, run `cargo +nightly doc --output-format json` and merge
+    /// resolved return types and trait-impl lists into existing symbols.
+    /// Requires a nightly Rust toolchain; skipped gracefully if absent.
+    /// Re-run is gated on `Cargo.lock` content hash — skipped when unchanged.
+    /// Default: false.
+    pub rust_rustdoc_types: bool,
 }
 
 impl IndexingConfig {
@@ -97,6 +105,9 @@ impl IndexingConfig {
         if let Some(indexing) = table.get("indexing").and_then(|v| v.as_table()) {
             if let Some(v) = indexing.get("rust_expand_macros").and_then(|v| v.as_bool()) {
                 cfg.rust_expand_macros = v;
+            }
+            if let Some(v) = indexing.get("rust_rustdoc_types").and_then(|v| v.as_bool()) {
+                cfg.rust_rustdoc_types = v;
             }
         }
         cfg

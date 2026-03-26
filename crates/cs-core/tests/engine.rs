@@ -901,3 +901,104 @@ fn macro_enrichment_skipped_for_non_rust_files() {
         "expected empty result for non-Rust files"
     );
 }
+
+// ── rustdoc enrichment tests ──────────────────────────────────────────────────
+
+/// `Symbol::resolved_type` must default to `None` for freshly-created symbols.
+#[test]
+fn symbol_resolved_type_is_none_by_default() {
+    let sym = cs_core::symbol::Symbol::new(
+        "src/lib.rs",
+        "my_fn",
+        cs_core::SymbolKind::Function,
+        1,
+        3,
+        "fn my_fn() -> String".to_string(),
+        None,
+        "fn my_fn() -> String { String::new() }".to_string(),
+        cs_core::language::Language::Rust,
+    );
+    assert!(
+        sym.resolved_type.is_none(),
+        "resolved_type should default to None"
+    );
+}
+
+/// `[indexing] rust_rustdoc_types = true` must be loaded correctly.
+#[test]
+fn indexing_config_rust_rustdoc_types_loaded_from_toml() {
+    use cs_core::memory::IndexingConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[indexing]\nrust_rustdoc_types = true\n",
+    )
+    .unwrap();
+    let cfg = IndexingConfig::load_from_toml(&config_dir.join("config.toml"));
+    assert!(
+        cfg.rust_rustdoc_types,
+        "rust_rustdoc_types should be true when set in config.toml"
+    );
+}
+
+/// Both enrichment flags can be enabled together.
+#[test]
+fn indexing_config_both_enrichment_flags() {
+    use cs_core::memory::IndexingConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[indexing]\nrust_expand_macros = true\nrust_rustdoc_types = true\n",
+    )
+    .unwrap();
+    let cfg = IndexingConfig::load_from_toml(&config_dir.join("config.toml"));
+    assert!(cfg.rust_expand_macros, "rust_expand_macros should be true");
+    assert!(cfg.rust_rustdoc_types, "rust_rustdoc_types should be true");
+}
+
+/// `run_rustdoc_enrichment` must return 0 when no Cargo.toml is present.
+#[test]
+fn rustdoc_enrichment_skipped_without_cargo_toml() {
+    use cs_core::db::Database;
+    use cs_core::rustdoc_enrich::run_rustdoc_enrichment;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("index.db");
+    let db = Database::open(&db_path).expect("db open failed");
+    let count = run_rustdoc_enrichment(dir.path(), &mut [], &db);
+    assert_eq!(count, 0, "expected 0 enrichments without Cargo.toml");
+}
+
+/// Symbols with `resolved_type` set must be correctly persisted and read back.
+#[test]
+fn resolved_type_round_trips_through_db() {
+    use cs_core::db::Database;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("index.db");
+    let db = Database::open(&db_path).expect("db open failed");
+
+    let mut sym = cs_core::symbol::Symbol::new(
+        "src/lib.rs",
+        "parse",
+        cs_core::SymbolKind::Function,
+        1,
+        4,
+        "pub fn parse(s: &str) -> Option<u32>".to_string(),
+        None,
+        "pub fn parse(s: &str) -> Option<u32> { s.parse().ok() }".to_string(),
+        cs_core::language::Language::Rust,
+    );
+    sym.resolved_type = Some("Option<u32>".to_string());
+    sym.source = Some("rustdoc".to_string());
+
+    db.upsert_symbol(&sym).expect("upsert failed");
+    let fetched = db
+        .get_symbol(sym.id)
+        .expect("get failed")
+        .expect("symbol missing");
+    assert_eq!(fetched.resolved_type.as_deref(), Some("Option<u32>"));
+    assert_eq!(fetched.source.as_deref(), Some("rustdoc"));
+}

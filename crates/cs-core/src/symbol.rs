@@ -116,7 +116,14 @@ pub struct Symbol {
 
     /// Origin of the symbol. `None` means regular source code. Known values:
     /// - `"macro_expanded"` — synthesised by `cargo-expand` from a proc-macro/derive
+    /// - `"rustdoc"` — enriched with resolved type information from `cargo doc --output-format json`
     pub source: Option<String>,
+
+    /// Resolved type information from rustdoc JSON, if available.
+    /// For functions: the resolved return type (e.g. `Option<String>`, `Vec<u8>`).
+    /// For types: comma-separated list of directly-implemented traits
+    /// (e.g. `"Debug, Serialize, Clone"`).
+    pub resolved_type: Option<String>,
 }
 
 impl Symbol {
@@ -151,6 +158,7 @@ impl Symbol {
             content_hash,
             is_stub: false,
             source: None,
+            resolved_type: None,
         }
     }
 

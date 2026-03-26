@@ -20,6 +20,7 @@ use crate::ranking::{
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
+use crate::rustdoc_enrich::run_rustdoc_enrichment;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
 use crate::symbol::Symbol;
@@ -78,6 +79,12 @@ pub struct EngineConfig {
     /// Set via `[indexing] rust_expand_macros = true` in `config.toml`.
     /// Default: false.
     pub rust_expand_macros: bool,
+
+    /// When true, run `cargo +nightly doc --output-format json` and merge
+    /// resolved types into the symbol index.
+    /// Set via `[indexing] rust_rustdoc_types = true` in `config.toml`.
+    /// Default: false.
+    pub rust_rustdoc_types: bool,
 }
 
 impl EngineConfig {
@@ -96,6 +103,7 @@ impl EngineConfig {
             load_embedder: true,
             index_stubs: true,
             rust_expand_macros: false,
+            rust_rustdoc_types: false,
         }
     }
 
@@ -239,11 +247,13 @@ impl CoreEngine {
             .join("config.toml");
         let mem_config = MemoryConfig::load_from_toml(&config_path);
         let indexing_config = IndexingConfig::load_from_toml(&config_path);
-        // Apply [indexing] settings onto EngineConfig (config is already cloned into Arc).
-        // We update the local binding before it moves into the Arc below.
+        // Apply [indexing] settings onto EngineConfig.
         let mut config = config;
         if indexing_config.rust_expand_macros {
             config.rust_expand_macros = true;
+        }
+        if indexing_config.rust_rustdoc_types {
+            config.rust_rustdoc_types = true;
         }
 
         let memory = Arc::new(Mutex::new(
@@ -497,6 +507,32 @@ impl CoreEngine {
                     graph.warm_caches();
                 }
                 all_symbols.extend(expanded_symbols);
+            }
+        }
+
+        // ── rustdoc resolved-type enrichment ──────────────────────────────────
+        // Merge resolved return-types and trait-impl lists from
+        // `cargo +nightly doc --output-format json` into existing symbols.
+        // Runs after the macro-expansion pass so expanded symbols are also
+        // eligible for enrichment. Gated on Cargo.lock hash for incremental
+        // skipping.
+        if self.config.rust_rustdoc_types {
+            let enriched_count = {
+                let db = self.db.lock();
+                run_rustdoc_enrichment(&self.config.workspace_root, &mut all_symbols, &db)
+            };
+            if enriched_count > 0 {
+                tracing::info!(
+                    "rustdoc-enrich: resolved types for {} symbol(s)",
+                    enriched_count
+                );
+                // Flush updated resolved_type values back to SQLite.
+                let db = self.db.lock();
+                db.begin_transaction()?;
+                for sym in all_symbols.iter().filter(|s| s.resolved_type.is_some()) {
+                    db.upsert_symbol(sym)?;
+                }
+                db.commit_transaction()?;
             }
         }
 
