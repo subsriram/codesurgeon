@@ -6,6 +6,7 @@ target/
 
 # Embedding model cache (downloaded at runtime)
 .fastembed_cache/
+.cache/
 
 # Editor / OS
 *.swp
