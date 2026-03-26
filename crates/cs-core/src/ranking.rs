@@ -131,7 +131,10 @@ pub(crate) fn apply_structural_resort(
         .filter(|(id, _)| is_hub_type(*id))
         .map(|(id, accumulated)| {
             let c_in = graph.family_in_degree_score(*id);
-            (*id, c_in * STRUCTURAL_INDEGREE_WEIGHT + accumulated * STRUCTURAL_BM25_WEIGHT)
+            (
+                *id,
+                c_in * STRUCTURAL_INDEGREE_WEIGHT + accumulated * STRUCTURAL_BM25_WEIGHT,
+            )
         })
         .collect();
 
@@ -245,8 +248,7 @@ pub(crate) fn select_adjacents(
         _ => pivot_ids
             .iter()
             .flat_map(|&id| {
-                let mut adj: Vec<u64> =
-                    graph.dependencies(id).iter().map(|s| s.id).collect();
+                let mut adj: Vec<u64> = graph.dependencies(id).iter().map(|s| s.id).collect();
                 adj.extend(graph.dependents(id).iter().map(|s| s.id));
                 adj
             })

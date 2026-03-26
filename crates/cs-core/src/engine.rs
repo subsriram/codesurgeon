@@ -1,26 +1,24 @@
 use crate::capsule::{build_capsule, format_capsule, Capsule, MemoryEntry, DEFAULT_TOKEN_BUDGET};
 use crate::db::Database;
+use crate::diff::parse_diff_symbols;
 #[cfg(feature = "embeddings")]
 use crate::embedder::{cosine_similarity, Embedder};
-#[cfg(feature = "embeddings")]
-use instant_distance::{Builder as HnswBuilder, HnswMap, Search as HnswSearch};
 use crate::graph::CodeGraph;
 use crate::indexer::{
     extract_call_edges, extract_impl_edges, extract_import_edges, extract_shell_call_edges,
     extract_sql_ref_edges, extract_type_flow_edges, index_file,
 };
-use crate::diff::parse_diff_symbols;
 use crate::language::Language;
-use crate::module_docs::{detect_xcode_mcp, swift_enrichment_hint};
 use crate::memory::{new_session_id, MemoryConfig, MemoryStore};
+use crate::module_docs::{detect_xcode_mcp, swift_enrichment_hint};
+use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
-    dedup_by_fqn, graph_candidates, inject_structural_candidates, resolve_adjacents,
-    rrf_merge, select_adjacents, apply_structural_resort,
-    CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
+    apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
+    resolve_adjacents, rrf_merge, select_adjacents, CENTRALITY_BOOST, GRAPH_CANDIDATES,
+    MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
-use crate::ranking::BM25_POOL_SIZE;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
 use crate::symbol::Symbol;
@@ -29,10 +27,12 @@ use crate::symbol::SymbolKind;
 use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
 use ignore::WalkBuilder;
+#[cfg(feature = "embeddings")]
+use instant_distance::{Builder as HnswBuilder, HnswMap, Search as HnswSearch};
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "embeddings")]
@@ -178,13 +178,14 @@ impl instant_distance::Point for EmbeddingPoint {
 
 /// Build an HNSW index from the embedding cache. Returns `None` when the cache is empty.
 #[cfg(feature = "embeddings")]
-fn build_hnsw_index(
-    cache: &[(u64, Vec<f32>)],
-) -> Option<HnswMap<EmbeddingPoint, u64>> {
+fn build_hnsw_index(cache: &[(u64, Vec<f32>)]) -> Option<HnswMap<EmbeddingPoint, u64>> {
     if cache.is_empty() {
         return None;
     }
-    let points: Vec<EmbeddingPoint> = cache.iter().map(|(_, v)| EmbeddingPoint(v.clone())).collect();
+    let points: Vec<EmbeddingPoint> = cache
+        .iter()
+        .map(|(_, v)| EmbeddingPoint(v.clone()))
+        .collect();
     let values: Vec<u64> = cache.iter().map(|(id, _)| *id).collect();
     Some(HnswBuilder::default().build(points, values))
 }
@@ -225,13 +226,15 @@ impl CoreEngine {
 
         // Load optional memory config from .codesurgeon/config.toml
         let mem_config = {
-            let config_path = config.workspace_root.join(".codesurgeon").join("config.toml");
+            let config_path = config
+                .workspace_root
+                .join(".codesurgeon")
+                .join("config.toml");
             MemoryConfig::load_from_toml(&config_path)
         };
 
         let memory = Arc::new(Mutex::new(
-            MemoryStore::new(Arc::clone(&db), &config.session_id)
-                .with_config(mem_config),
+            MemoryStore::new(Arc::clone(&db), &config.session_id).with_config(mem_config),
         ));
 
         // Warm the in-memory graph and tantivy index from the persisted SQLite DB.
@@ -458,10 +461,9 @@ impl CoreEngine {
                 .par_iter()
                 .filter_map(|path| {
                     let content = std::fs::read_to_string(path).ok()?;
-                    let mut symbols =
-                        index_file(&self.config.workspace_root, path, &content)
-                            .ok()
-                            .unwrap_or_default();
+                    let mut symbols = index_file(&self.config.workspace_root, path, &content)
+                        .ok()
+                        .unwrap_or_default();
                     for sym in &mut symbols {
                         sym.is_stub = true;
                     }
@@ -507,8 +509,7 @@ impl CoreEngine {
                 graph.warm_caches();
             }
 
-            let stub_sym_count: usize =
-                stub_file_data.iter().map(|(_, _, s)| s.len()).sum();
+            let stub_sym_count: usize = stub_file_data.iter().map(|(_, _, s)| s.len()).sum();
             tracing::info!(
                 "Indexed {} stub symbols from {} files",
                 stub_sym_count,
@@ -698,7 +699,8 @@ impl CoreEngine {
 
         tracing::debug!("run_pipeline: intent={:?}, task={}", intent, task);
 
-        let capsule = self.build_context_capsule(task, budget, &intent, language, file_hint, None, None)?;
+        let capsule =
+            self.build_context_capsule(task, budget, &intent, language, file_hint, None, None)?;
         let mut out = format_capsule(&capsule);
 
         // Append Swift enrichment hint when Swift symbols appear in results.
@@ -718,7 +720,11 @@ impl CoreEngine {
 
         // Auto-capture this tool call as an observation for cross-session memory.
         let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
-        if let Err(e) = self.memory.lock().record_auto_observation(task, &pivot_fqns) {
+        if let Err(e) = self
+            .memory
+            .lock()
+            .record_auto_observation(task, &pivot_fqns)
+        {
             tracing::warn!("auto-observation failed: {}", e);
         }
 
@@ -735,11 +741,16 @@ impl CoreEngine {
     ) -> Result<String> {
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(query);
-        let capsule = self.build_context_capsule(query, budget, &intent, None, None, max_results, min_score)?;
+        let capsule =
+            self.build_context_capsule(query, budget, &intent, None, None, max_results, min_score)?;
 
         // Auto-capture this tool call as an observation for cross-session memory.
         let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
-        if let Err(e) = self.memory.lock().record_auto_observation(query, &pivot_fqns) {
+        if let Err(e) = self
+            .memory
+            .lock()
+            .record_auto_observation(query, &pivot_fqns)
+        {
             tracing::warn!("auto-observation failed: {}", e);
         }
 
@@ -781,8 +792,11 @@ impl CoreEngine {
 
         let is_test = |s: &SymbolRef| -> bool {
             let p = &s.file_path;
-            p.contains("/test") || p.contains("_test.") || p.contains("test_")
-                || p.contains("/spec") || p.contains("_spec.")
+            p.contains("/test")
+                || p.contains("_test.")
+                || p.contains("test_")
+                || p.contains("/spec")
+                || p.contains("_spec.")
         };
 
         let direct: Vec<SymbolRef> = graph
@@ -821,10 +835,10 @@ impl CoreEngine {
             .iter()
             .filter(|sym| {
                 if let Some(depth) = max_depth {
-                    let sym_depth = sym.fqn
-                        .splitn(2, "::")
-                        .nth(1)
-                        .map(|rest| rest.matches("::").count() as u32 + 1)
+                    let sym_depth = sym
+                        .fqn
+                        .split_once("::")
+                        .map(|(_, rest)| rest.matches("::").count() as u32 + 1)
                         .unwrap_or(1);
                     sym_depth <= depth
                 } else {
@@ -905,7 +919,10 @@ impl CoreEngine {
         let mem = self.memory.lock();
         let observations = mem.get_recent_observations(50)?;
         let staleness_score = mem.staleness_score()?;
-        Ok(SessionContext { observations, staleness_score })
+        Ok(SessionContext {
+            observations,
+            staleness_score,
+        })
     }
 
     /// Delete an observation by ID. Returns true if found and deleted.
@@ -1152,7 +1169,9 @@ impl CoreEngine {
     /// Returns `(symbol_id, cosine_similarity)` pairs, sorted descending by similarity.
     #[cfg(feature = "embeddings")]
     fn ann_candidates(&self, query: &str, k: usize) -> Vec<(u64, f32)> {
-        let Some(emb) = self.embedder.get() else { return vec![] };
+        let Some(emb) = self.embedder.get() else {
+            return vec![];
+        };
         let query_vec = match emb.embed_one(query) {
             Ok(v) => v,
             Err(e) => {
@@ -1161,7 +1180,9 @@ impl CoreEngine {
             }
         };
         let index_guard = self.ann_index.read();
-        let Some(index) = index_guard.as_ref() else { return vec![] };
+        let Some(index) = index_guard.as_ref() else {
+            return vec![];
+        };
         let query_point = EmbeddingPoint(query_vec);
         let mut search = HnswSearch::default();
         index
@@ -1191,6 +1212,7 @@ impl CoreEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_context_capsule(
         &self,
         query: &str,
@@ -1302,8 +1324,7 @@ impl CoreEngine {
             .take(max_pivots)
             .map(|(id, _)| *id)
             .collect();
-        let adjacent_ids =
-            select_adjacents(&graph, &pivot_ids, intent, self.config.max_adjacent);
+        let adjacent_ids = select_adjacents(&graph, &pivot_ids, intent, self.config.max_adjacent);
 
         // 7. Resolve IDs → Symbols with filtering
         let filter_adjacents = matches!(intent, SearchIntent::Structural | SearchIntent::Explore);
@@ -1586,13 +1607,13 @@ fn file_contains_api_key(path: &Path) -> bool {
 
     // (prefix, minimum length of the token after the prefix)
     const PREFIXES: &[(&str, usize)] = &[
-        ("AKIA", 12),        // AWS access key ID
-        ("sk-", 24),         // OpenAI-style secret key
-        ("ghp_", 16),        // GitHub personal access token
-        ("github_pat_", 8),  // GitHub fine-grained PAT
-        ("glpat-", 16),      // GitLab personal access token
-        ("xoxb-", 8),        // Slack bot token
-        ("xoxp-", 8),        // Slack user token
+        ("AKIA", 12),       // AWS access key ID
+        ("sk-", 24),        // OpenAI-style secret key
+        ("ghp_", 16),       // GitHub personal access token
+        ("github_pat_", 8), // GitHub fine-grained PAT
+        ("glpat-", 16),     // GitLab personal access token
+        ("xoxb-", 8),       // Slack bot token
+        ("xoxp-", 8),       // Slack user token
     ];
 
     for (prefix, min_after) in PREFIXES {
@@ -1728,5 +1749,3 @@ mod secrets_tests {
         assert!(!file_contains_api_key(f.path()));
     }
 }
-
-

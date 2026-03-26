@@ -85,11 +85,7 @@ fn search_with_negative_budget_exits_nonzero() {
 fn status_on_empty_workspace_exits_zero() {
     let dir = tempfile::tempdir().unwrap();
     let out = run(&dir, &["status"]);
-    assert!(
-        out.status.success(),
-        "status failed: {}",
-        stderr(&out)
-    );
+    assert!(out.status.success(), "status failed: {}", stderr(&out));
     let text = stdout(&out);
     assert!(
         text.contains("Symbols"),
@@ -220,7 +216,10 @@ fn memory_delete_removes_observation() {
 
     let mem = run(&dir, &["memory"]);
     let out = stdout(&mem);
-    assert!(out.contains(sentinel), "observation not found before delete");
+    assert!(
+        out.contains(sentinel),
+        "observation not found before delete"
+    );
 
     // Extract the id from the output line containing the sentinel
     let id = out
@@ -251,7 +250,10 @@ fn memory_delete_removes_observation() {
 #[test]
 fn memory_delete_nonexistent_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
-    let del = run(&dir, &["memory", "--delete", "00000000-0000-0000-0000-000000000000"]);
+    let del = run(
+        &dir,
+        &["memory", "--delete", "00000000-0000-0000-0000-000000000000"],
+    );
     assert!(
         !del.status.success(),
         "expected non-zero exit for unknown id"

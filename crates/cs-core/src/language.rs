@@ -77,4 +77,3 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         _ => None,
     }
 }
-

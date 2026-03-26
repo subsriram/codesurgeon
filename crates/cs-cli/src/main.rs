@@ -178,7 +178,10 @@ async fn main() -> Result<()> {
             }
             for obs in &observations.observations {
                 let stale = if obs.is_stale { " [STALE]" } else { "" };
-                println!("[{}]{} (id: {}): {}", obs.created_at, stale, obs.id, obs.content);
+                println!(
+                    "[{}]{} (id: {}): {}",
+                    obs.created_at, stale, obs.id, obs.content
+                );
             }
         }
 

@@ -471,7 +471,9 @@ fn parent_is_alive() -> bool {
 async fn run_stdio_loop(cell: EngineCell) {
     // Move stdin into a dedicated blocking thread. Messages are sent back via a channel.
     // This lets us add a timeout around reads to detect orphaned processes.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Option<(String, transport::Format)>, std::io::Error>>(8);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<
+        Result<Option<(String, transport::Format)>, std::io::Error>,
+    >(8);
 
     std::thread::spawn(move || {
         let mut stdin_reader = std::io::BufReader::new(std::io::stdin());

@@ -1163,8 +1163,13 @@ fn heading_text<'a>(node: &Node, source: &'a str) -> &'a str {
     let mut cursor2 = node.walk();
     for child in node.children(&mut cursor2) {
         match child.kind() {
-            "setext_h1_underline" | "setext_h2_underline" | "atx_h1_marker"
-            | "atx_h2_marker" | "atx_h3_marker" | "atx_h4_marker" | "atx_h5_marker"
+            "setext_h1_underline"
+            | "setext_h2_underline"
+            | "atx_h1_marker"
+            | "atx_h2_marker"
+            | "atx_h3_marker"
+            | "atx_h4_marker"
+            | "atx_h5_marker"
             | "atx_h6_marker" => continue,
             _ => {
                 let text = node_text(&child, source).trim();
@@ -1454,7 +1459,11 @@ $$ LANGUAGE plpgsql;
         // Must not panic and must be valid UTF-8.
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
         // Must be no longer than max_chars + the ellipsis.
-        assert!(result.chars().count() <= 6, "snippet too long: {:?}", result);
+        assert!(
+            result.chars().count() <= 6,
+            "snippet too long: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1462,7 +1471,11 @@ $$ LANGUAGE plpgsql;
         let src = b"foo()";
         // args_start points at the char after '('
         let result = crate::edges::extract_args_snippet(src, 4, 60);
-        assert!(result.is_empty(), "expected empty snippet, got {:?}", result);
+        assert!(
+            result.is_empty(),
+            "expected empty snippet, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1631,7 +1644,10 @@ CREATE VIEW active_users AS SELECT * FROM users WHERE active = true;
 "#;
         let symbols = extract_sql("schema.sql", src).expect("sql parse");
         let edges = extract_sql_ref_edges(&symbols);
-        let users_sym = symbols.iter().find(|s| s.name == "users").expect("users table");
+        let users_sym = symbols
+            .iter()
+            .find(|s| s.name == "users")
+            .expect("users table");
         let view_sym = symbols
             .iter()
             .find(|s| s.name == "active_users")
@@ -1660,8 +1676,14 @@ $$ LANGUAGE plpgsql;
 "#;
         let symbols = extract_sql("schema.sql", src).expect("sql parse");
         let edges = extract_sql_ref_edges(&symbols);
-        let users_sym = symbols.iter().find(|s| s.name == "users").expect("users table");
-        let fn_sym = symbols.iter().find(|s| s.name == "get_user").expect("get_user");
+        let users_sym = symbols
+            .iter()
+            .find(|s| s.name == "users")
+            .expect("users table");
+        let fn_sym = symbols
+            .iter()
+            .find(|s| s.name == "get_user")
+            .expect("get_user");
         assert!(
             edges
                 .iter()

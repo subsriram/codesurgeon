@@ -12,7 +12,10 @@ fn detects_python() {
 /// `.pyi` stub files (Python type stubs) must be detected as Python.
 #[test]
 fn detects_pyi_as_python() {
-    assert_eq!(detect_language(&PathBuf::from("requests.pyi")), Some(Language::Python));
+    assert_eq!(
+        detect_language(&PathBuf::from("requests.pyi")),
+        Some(Language::Python)
+    );
 }
 
 /// `.swiftinterface` stub files must be detected as Swift.

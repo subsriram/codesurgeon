@@ -203,10 +203,7 @@ impl CodeGraph {
         };
         let incoming = self.graph.neighbors_directed(idx, Direction::Incoming);
         let outgoing = self.graph.neighbors_directed(idx, Direction::Outgoing);
-        incoming
-            .chain(outgoing)
-            .map(|n| self.graph[n].id)
-            .collect()
+        incoming.chain(outgoing).map(|n| self.graph[n].id).collect()
     }
 
     /// Symbols in the same file.

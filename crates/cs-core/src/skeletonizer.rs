@@ -200,4 +200,3 @@ pub fn skeleton_token_estimate(sym: &Symbol) -> u32 {
     let skeleton = skeletonize(sym);
     (skeleton.len() / 4) as u32
 }
-

@@ -18,7 +18,10 @@ pub fn extract_shell_call_edges(symbols: &[Symbol]) -> Vec<Edge> {
     let mut name_to_ids: HashMap<&str, Vec<u64>> = HashMap::new();
     for sym in symbols {
         if sym.language == Language::Shell {
-            name_to_ids.entry(sym.name.as_str()).or_default().push(sym.id);
+            name_to_ids
+                .entry(sym.name.as_str())
+                .or_default()
+                .push(sym.id);
         }
     }
     if name_to_ids.is_empty() {
@@ -102,17 +105,16 @@ pub fn extract_sql_ref_edges(symbols: &[Symbol]) -> Vec<Edge> {
 /// skipping shell built-ins and keywords.
 fn shell_command_names(body: &str) -> Vec<String> {
     const SHELL_KEYWORDS: &[&str] = &[
-        "if", "then", "else", "elif", "fi", "for", "in", "do", "done", "while", "until",
-        "case", "esac", "function", "return", "local", "export", "echo", "printf", "read",
-        "test", "true", "false", "exit", "break", "continue", "shift", "set", "unset",
-        "declare", "source", "eval", "exec", "cd", "pwd", "ls", "mkdir", "rm", "cp", "mv",
-        "grep", "sed", "awk", "cat", "head", "tail", "sort", "uniq", "wc", "find", "xargs",
-        "tr", "cut", "touch", "chmod", "chown",
+        "if", "then", "else", "elif", "fi", "for", "in", "do", "done", "while", "until", "case",
+        "esac", "function", "return", "local", "export", "echo", "printf", "read", "test", "true",
+        "false", "exit", "break", "continue", "shift", "set", "unset", "declare", "source", "eval",
+        "exec", "cd", "pwd", "ls", "mkdir", "rm", "cp", "mv", "grep", "sed", "awk", "cat", "head",
+        "tail", "sort", "uniq", "wc", "find", "xargs", "tr", "cut", "touch", "chmod", "chown",
     ];
 
     // Split the body on characters that end a "statement" or begin a new one.
     let mut names = Vec::new();
-    for segment in body.split(|c| matches!(c, '\n' | ';' | '|' | '&' | '{' | '(')) {
+    for segment in body.split(['\n', ';', '|', '&', '{', '(']) {
         let word = segment
             .trim()
             // Strip variable-expansion prefix, e.g. `$(cmd` → `cmd`
@@ -127,7 +129,7 @@ fn shell_command_names(body: &str) -> Vec<String> {
             && word
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_alphabetic() || c == '_')
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
             && word
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
@@ -153,22 +155,24 @@ fn sql_table_references(body: &str) -> Vec<String> {
     let mut refs = Vec::new();
     for (i, tok) in tokens.iter().enumerate() {
         // Strip trailing punctuation from the keyword token itself (e.g. `FROM,`)
-        let kw = tok.trim_end_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        let kw = tok
+            .trim_end_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
         if TABLE_KEYWORDS.contains(&kw.as_str()) {
             if let Some(next) = tokens.get(i + 1) {
                 // Strip trailing punctuation (`,`, `)`, `;`) and schema prefix
                 let name = next
                     .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_')
                     .split('.')
-                    .last()
+                    .next_back()
                     .unwrap_or(next);
                 // Strip quoting characters
                 let name = name.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
-                if name.len() >= 1
+                if !name.is_empty()
                     && name
                         .chars()
                         .next()
-                        .map_or(false, |c| c.is_alphabetic() || c == '_')
+                        .is_some_and(|c| c.is_alphabetic() || c == '_')
                     && name.chars().all(|c| c.is_alphanumeric() || c == '_')
                 {
                     refs.push(name.to_string());
@@ -186,7 +190,10 @@ fn sql_table_references(body: &str) -> Vec<String> {
 pub fn extract_import_edges(symbols: &[Symbol]) -> Vec<Edge> {
     let mut name_to_ids: HashMap<&str, Vec<u64>> = HashMap::new();
     for sym in symbols {
-        name_to_ids.entry(sym.name.as_str()).or_default().push(sym.id);
+        name_to_ids
+            .entry(sym.name.as_str())
+            .or_default()
+            .push(sym.id);
     }
 
     let mut edges = Vec::new();
@@ -214,7 +221,10 @@ pub fn extract_import_edges(symbols: &[Symbol]) -> Vec<Edge> {
 pub fn extract_impl_edges(symbols: &[Symbol]) -> Vec<Edge> {
     let mut name_to_ids: HashMap<&str, Vec<u64>> = HashMap::new();
     for sym in symbols {
-        name_to_ids.entry(sym.name.as_str()).or_default().push(sym.id);
+        name_to_ids
+            .entry(sym.name.as_str())
+            .or_default()
+            .push(sym.id);
     }
 
     let mut edges = Vec::new();
@@ -250,7 +260,10 @@ pub fn extract_impl_edges(symbols: &[Symbol]) -> Vec<Edge> {
 pub fn extract_call_edges(symbols: &[Symbol]) -> Vec<Edge> {
     let mut name_to_ids: HashMap<&str, Vec<u64>> = HashMap::new();
     for sym in symbols {
-        name_to_ids.entry(sym.name.as_str()).or_default().push(sym.id);
+        name_to_ids
+            .entry(sym.name.as_str())
+            .or_default()
+            .push(sym.id);
         if let Some(simple) = sym.name.rsplit("::").next() {
             if simple != sym.name {
                 name_to_ids.entry(simple).or_default().push(sym.id);
@@ -292,7 +305,10 @@ pub fn extract_type_flow_edges(symbols: &[Symbol]) -> Vec<Edge> {
     let mut type_name_to_ids: HashMap<&str, Vec<u64>> = HashMap::new();
     for sym in symbols {
         if sym.kind.is_type_definition() {
-            type_name_to_ids.entry(sym.name.as_str()).or_default().push(sym.id);
+            type_name_to_ids
+                .entry(sym.name.as_str())
+                .or_default()
+                .push(sym.id);
         }
     }
     if type_name_to_ids.is_empty() {
@@ -394,11 +410,52 @@ fn extract_imported_names(sym: &Symbol) -> Vec<String> {
 /// Returns `(callee_name, args_snippet)` pairs.
 fn calls_in_body(body: &str) -> Vec<(String, String)> {
     const SKIP: &[&str] = &[
-        "if", "for", "while", "match", "fn", "let", "mut", "pub", "use", "mod", "struct",
-        "enum", "impl", "trait", "type", "async", "await", "return", "where", "loop",
-        "continue", "break", "Some", "None", "Ok", "Err", "Box", "Vec", "HashMap", "HashSet",
-        "BTreeMap", "String", "Option", "Result", "Arc", "Mutex", "RwLock", "format",
-        "println", "eprintln", "print", "eprint", "vec", "assert", "panic", "todo",
+        "if",
+        "for",
+        "while",
+        "match",
+        "fn",
+        "let",
+        "mut",
+        "pub",
+        "use",
+        "mod",
+        "struct",
+        "enum",
+        "impl",
+        "trait",
+        "type",
+        "async",
+        "await",
+        "return",
+        "where",
+        "loop",
+        "continue",
+        "break",
+        "Some",
+        "None",
+        "Ok",
+        "Err",
+        "Box",
+        "Vec",
+        "HashMap",
+        "HashSet",
+        "BTreeMap",
+        "String",
+        "Option",
+        "Result",
+        "Arc",
+        "Mutex",
+        "RwLock",
+        "format",
+        "println",
+        "eprintln",
+        "print",
+        "eprint",
+        "vec",
+        "assert",
+        "panic",
+        "todo",
         "unimplemented",
     ];
 

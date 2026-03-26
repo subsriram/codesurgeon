@@ -88,7 +88,11 @@ fn run_pipeline_language_filter_excludes_other_langs() {
     let out = engine
         .run_pipeline("fn", Some(4000), Some("rust"), None)
         .expect("run_pipeline failed");
-    assert!(!out.contains("script.py"), "Python file should be filtered out: {}", out);
+    assert!(
+        !out.contains("script.py"),
+        "Python file should be filtered out: {}",
+        out
+    );
 }
 
 /// `run_pipeline` with `file_hint` must restrict results to matching file paths.
@@ -99,7 +103,11 @@ fn run_pipeline_file_hint_restricts_to_matching_file() {
     let out = engine
         .run_pipeline("fn", Some(4000), None, Some("script.py"))
         .expect("run_pipeline failed");
-    assert!(!out.contains("lib.rs"), "Rust file should be filtered out: {}", out);
+    assert!(
+        !out.contains("lib.rs"),
+        "Rust file should be filtered out: {}",
+        out
+    );
 }
 
 /// `get_context_capsule` with `max_results=1` must return at most one pivot.
@@ -111,7 +119,12 @@ fn get_context_capsule_max_results_caps_pivots() {
         .get_context_capsule("fn", Some(4000), Some(1), None)
         .expect("get_context_capsule failed");
     let pivot_count = out.matches("#### `").count();
-    assert!(pivot_count <= 1, "expected ≤1 pivot, got {}: {}", pivot_count, out);
+    assert!(
+        pivot_count <= 1,
+        "expected ≤1 pivot, got {}: {}",
+        pivot_count,
+        out
+    );
 }
 
 /// `get_context_capsule` with `min_score` above any real score yields no pivots.
@@ -122,7 +135,11 @@ fn get_context_capsule_min_score_filters_all_below_threshold() {
     let out = engine
         .get_context_capsule("fn", Some(4000), None, Some(f32::MAX))
         .expect("get_context_capsule failed");
-    assert!(!out.contains("#### `"), "expected no pivots with max min_score: {}", out);
+    assert!(
+        !out.contains("#### `"),
+        "expected no pivots with max min_score: {}",
+        out
+    );
 }
 
 /// `get_impact_graph` with `include_tests=false` must exclude test files.
@@ -142,8 +159,12 @@ fn get_impact_graph_exclude_tests_filters_test_files() {
     let engine = test_engine(&dir);
     engine.index_workspace().expect("index failed");
 
-    let with_tests = engine.get_impact_graph("lib.rs::target", None, true).unwrap();
-    let without_tests = engine.get_impact_graph("lib.rs::target", None, false).unwrap();
+    let with_tests = engine
+        .get_impact_graph("lib.rs::target", None, true)
+        .unwrap();
+    let without_tests = engine
+        .get_impact_graph("lib.rs::target", None, false)
+        .unwrap();
     for dep in &without_tests.direct_dependents {
         assert!(
             !dep.file_path.contains("_test"),
@@ -166,8 +187,12 @@ fn get_impact_graph_max_depth_limits_traversal() {
     let engine = test_engine(&dir);
     engine.index_workspace().expect("index failed");
 
-    let shallow = engine.get_impact_graph("lib.rs::base", Some(1), true).unwrap();
-    let deep = engine.get_impact_graph("lib.rs::base", Some(5), true).unwrap();
+    let shallow = engine
+        .get_impact_graph("lib.rs::base", Some(1), true)
+        .unwrap();
+    let deep = engine
+        .get_impact_graph("lib.rs::base", Some(5), true)
+        .unwrap();
     assert!(
         shallow.total_affected <= deep.total_affected,
         "shallow traversal should find ≤ symbols than deep"
@@ -207,14 +232,22 @@ fn get_skeleton_max_depth_filters_nested_symbols() {
 fn run_pipeline_writes_auto_observation() {
     let dir = tempfile::tempdir().unwrap();
     let engine = indexed_engine_with_two_langs(&dir);
-    engine.run_pipeline("rust fn", Some(4000), None, None).expect("run_pipeline failed");
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .expect("run_pipeline failed");
 
-    let observations = engine.get_session_context().expect("get_session_context failed").observations;
+    let observations = engine
+        .get_session_context()
+        .expect("get_session_context failed")
+        .observations;
     let auto_obs: Vec<_> = observations
         .iter()
         .filter(|o| o.kind.as_str() == "auto")
         .collect();
-    assert!(!auto_obs.is_empty(), "expected at least one auto observation after run_pipeline");
+    assert!(
+        !auto_obs.is_empty(),
+        "expected at least one auto observation after run_pipeline"
+    );
     assert!(
         auto_obs[0].content.starts_with("Agent queried:"),
         "unexpected auto observation format: {}",
@@ -231,12 +264,18 @@ fn get_context_capsule_writes_auto_observation() {
         .get_context_capsule("py fn", Some(4000), None, None)
         .expect("get_context_capsule failed");
 
-    let observations = engine.get_session_context().expect("get_session_context failed").observations;
+    let observations = engine
+        .get_session_context()
+        .expect("get_session_context failed")
+        .observations;
     let auto_obs: Vec<_> = observations
         .iter()
         .filter(|o| o.kind.as_str() == "auto")
         .collect();
-    assert!(!auto_obs.is_empty(), "expected at least one auto observation after get_context_capsule");
+    assert!(
+        !auto_obs.is_empty(),
+        "expected at least one auto observation after get_context_capsule"
+    );
 }
 
 /// Calling `run_pipeline` twice with the same task must deduplicate — only one auto observation.
@@ -244,15 +283,25 @@ fn get_context_capsule_writes_auto_observation() {
 fn run_pipeline_deduplicates_auto_observations() {
     let dir = tempfile::tempdir().unwrap();
     let engine = indexed_engine_with_two_langs(&dir);
-    engine.run_pipeline("rust fn", Some(4000), None, None).expect("first call failed");
-    engine.run_pipeline("rust fn", Some(4000), None, None).expect("second call failed");
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .expect("first call failed");
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .expect("second call failed");
 
-    let observations = engine.get_session_context().expect("get_session_context failed").observations;
+    let observations = engine
+        .get_session_context()
+        .expect("get_session_context failed")
+        .observations;
     let auto_count = observations
         .iter()
         .filter(|o| o.kind.as_str() == "auto" && o.content.contains("rust fn"))
         .count();
-    assert_eq!(auto_count, 1, "duplicate auto observation should have been suppressed");
+    assert_eq!(
+        auto_count, 1,
+        "duplicate auto observation should have been suppressed"
+    );
 }
 
 /// `run_pipeline` with no matching symbols must not write an auto observation.
@@ -264,7 +313,10 @@ fn run_pipeline_no_pivots_skips_auto_observation() {
         .run_pipeline("xyzzy no match", Some(4000), None, None)
         .expect("run_pipeline failed");
 
-    let observations = engine.get_session_context().expect("get_session_context failed").observations;
+    let observations = engine
+        .get_session_context()
+        .expect("get_session_context failed")
+        .observations;
     let auto_obs: Vec<_> = observations
         .iter()
         .filter(|o| o.kind.as_str() == "auto")
@@ -284,7 +336,11 @@ fn stub_files_indexed_but_not_returned_as_pivots() {
     let dir = tempfile::tempdir().unwrap();
 
     // Project source file
-    std::fs::write(dir.path().join("app.ts"), "export function greet(name: string): string { return `Hello ${name}`; }\n").unwrap();
+    std::fs::write(
+        dir.path().join("app.ts"),
+        "export function greet(name: string): string { return `Hello ${name}`; }\n",
+    )
+    .unwrap();
 
     // Simulate a .d.ts stub under node_modules/@types/
     let types_dir = dir.path().join("node_modules").join("@types").join("node");
@@ -292,16 +348,22 @@ fn stub_files_indexed_but_not_returned_as_pivots() {
     std::fs::write(
         types_dir.join("index.d.ts"),
         "declare function require(id: string): any;\ndeclare var process: NodeJS.Process;\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let engine = test_engine(&dir);
     engine.index_workspace().expect("index_workspace failed");
 
     let stats = engine.index_stats().expect("index_stats failed");
-    assert!(stats.stub_symbol_count > 0, "expected stub symbols to be indexed");
+    assert!(
+        stats.stub_symbol_count > 0,
+        "expected stub symbols to be indexed"
+    );
 
     // run_pipeline on a stub-only query — stubs must not appear as pivots
-    let out = engine.run_pipeline("require", Some(4000), None, None).expect("run_pipeline failed");
+    let out = engine
+        .run_pipeline("require", Some(4000), None, None)
+        .expect("run_pipeline failed");
     // Pivots are formatted as `#### \`...\``; stub symbols must not be pivots
     assert!(
         !out.contains("#### `node_modules/"),
@@ -320,7 +382,10 @@ fn project_files_are_not_stubs() {
     engine.index_workspace().expect("index_workspace failed");
 
     let stats = engine.index_stats().expect("index_stats failed");
-    assert_eq!(stats.stub_symbol_count, 0, "project symbols should not be stubs");
+    assert_eq!(
+        stats.stub_symbol_count, 0,
+        "project symbols should not be stubs"
+    );
     assert!(stats.symbol_count > 0, "project symbols should be indexed");
 }
 
@@ -348,7 +413,10 @@ fn python_pyi_stubs_indexed() {
     engine.index_workspace().expect("index_workspace failed");
 
     let stats = engine.index_stats().expect("index_stats failed");
-    assert!(stats.stub_symbol_count > 0, "Python pyi stubs should be indexed");
+    assert!(
+        stats.stub_symbol_count > 0,
+        "Python pyi stubs should be indexed"
+    );
 }
 
 /// Swift `.swiftinterface` stubs under `.build/` must be indexed and marked as stubs.
@@ -357,11 +425,7 @@ fn swift_swiftinterface_stubs_indexed() {
     let dir = tempfile::tempdir().unwrap();
 
     // Simulate .build/release/Modules/Foundation.swiftinterface
-    let modules_dir = dir
-        .path()
-        .join(".build")
-        .join("release")
-        .join("Modules");
+    let modules_dir = dir.path().join(".build").join("release").join("Modules");
     std::fs::create_dir_all(&modules_dir).unwrap();
     std::fs::write(
         modules_dir.join("MyLib.swiftinterface"),
@@ -373,7 +437,10 @@ fn swift_swiftinterface_stubs_indexed() {
     engine.index_workspace().expect("index_workspace failed");
 
     let stats = engine.index_stats().expect("index_stats failed");
-    assert!(stats.stub_symbol_count > 0, "Swift swiftinterface stubs should be indexed");
+    assert!(
+        stats.stub_symbol_count > 0,
+        "Swift swiftinterface stubs should be indexed"
+    );
 }
 
 /// When `index_stubs = false`, stub directories are skipped entirely.
@@ -397,7 +464,10 @@ fn index_stubs_false_skips_stub_files() {
     engine.index_workspace().expect("index_workspace failed");
 
     let stats = engine.index_stats().expect("index_stats failed");
-    assert_eq!(stats.stub_symbol_count, 0, "stubs should not be indexed when disabled");
+    assert_eq!(
+        stats.stub_symbol_count, 0,
+        "stubs should not be indexed when disabled"
+    );
 }
 
 /// Sensitive files (.env, *.key, files named *secret*, etc.) must not be indexed.
@@ -421,9 +491,21 @@ fn sensitive_files_are_not_indexed() {
         .run_pipeline("hello", Some(4000), None, None)
         .expect("run_pipeline failed");
 
-    assert!(!out.contains(".env"), "env file should be excluded: {}", out);
-    assert!(!out.contains("my_secret"), "secret file should be excluded: {}", out);
-    assert!(!out.contains("credentials"), "credentials file should be excluded: {}", out);
+    assert!(
+        !out.contains(".env"),
+        "env file should be excluded: {}",
+        out
+    );
+    assert!(
+        !out.contains("my_secret"),
+        "secret file should be excluded: {}",
+        out
+    );
+    assert!(
+        !out.contains("credentials"),
+        "credentials file should be excluded: {}",
+        out
+    );
 }
 
 /// Files containing known API key patterns in the first 4 KB must not be indexed.
@@ -447,7 +529,11 @@ fn file_with_api_key_content_is_not_indexed() {
         .run_pipeline("AWS_KEY safe", Some(4000), None, None)
         .expect("run_pipeline failed");
 
-    assert!(!out.contains("config.py"), "file with embedded API key should be excluded: {}", out);
+    assert!(
+        !out.contains("config.py"),
+        "file with embedded API key should be excluded: {}",
+        out
+    );
 }
 
 /// Files listed in `.codesurgeonignore` must not appear in the index.
@@ -466,7 +552,11 @@ fn codesurgeonignore_excludes_files() {
         .run_pipeline("generated keep", Some(4000), None, None)
         .expect("run_pipeline failed");
 
-    assert!(!out.contains("generated.py"), "ignored file should be excluded: {}", out);
+    assert!(
+        !out.contains("generated.py"),
+        "ignored file should be excluded: {}",
+        out
+    );
 }
 
 /// Glob patterns in `.codesurgeonignore` must work (e.g. `fixtures/`).
@@ -489,7 +579,11 @@ fn codesurgeonignore_glob_pattern_excludes_directory() {
         .run_pipeline("fixture_fn", Some(4000), None, None)
         .expect("run_pipeline failed");
 
-    assert!(!out.contains("fixtures/"), "fixtures dir should be excluded: {}", out);
+    assert!(
+        !out.contains("fixtures/"),
+        "fixtures dir should be excluded: {}",
+        out
+    );
 }
 
 /// (possibly with partial results) and must not panic.
@@ -523,15 +617,18 @@ fn query_during_indexing_does_not_panic() {
 
 // ── TTL / compression / staleness tests ───────────────────────────────────────
 
-use cs_core::memory::{MemoryConfig, MemoryStore, Observation, ObservationKind};
 use cs_core::db::Database;
+use cs_core::memory::{MemoryConfig, MemoryStore, Observation, ObservationKind};
 use parking_lot::Mutex;
 
 /// Auto observations must have a non-None `expires_at` set 7 days out.
 #[test]
 fn auto_observation_gets_7_day_ttl() {
     let obs = Observation::new("s", "content", None, None, ObservationKind::Auto);
-    assert!(obs.expires_at.is_some(), "auto observations must have expires_at");
+    assert!(
+        obs.expires_at.is_some(),
+        "auto observations must have expires_at"
+    );
     let expires: chrono::DateTime<chrono::Utc> = obs
         .expires_at
         .as_ref()
@@ -540,14 +637,21 @@ fn auto_observation_gets_7_day_ttl() {
         .expect("invalid rfc3339");
     let diff = expires - chrono::Utc::now();
     // Allow ±1 minute for clock skew during test runs
-    assert!(diff.num_days() >= 6 && diff.num_days() <= 7, "expected ~7 day TTL, got {:?}", diff);
+    assert!(
+        diff.num_days() >= 6 && diff.num_days() <= 7,
+        "expected ~7 day TTL, got {:?}",
+        diff
+    );
 }
 
 /// Manual observations must have `expires_at = None` by default (never expire).
 #[test]
 fn manual_observation_has_no_ttl_by_default() {
     let obs = Observation::new("s", "content", None, None, ObservationKind::Manual);
-    assert!(obs.expires_at.is_none(), "manual observations must not expire by default");
+    assert!(
+        obs.expires_at.is_none(),
+        "manual observations must not expire by default"
+    );
 }
 
 /// `MemoryConfig` loaded from config.toml overrides default TTLs.
@@ -555,7 +659,11 @@ fn manual_observation_has_no_ttl_by_default() {
 fn memory_config_toml_overrides_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "[memory]\nauto_ttl_days = 3\nmanual_ttl_days = 30\n").unwrap();
+    std::fs::write(
+        &config_path,
+        "[memory]\nauto_ttl_days = 3\nmanual_ttl_days = 30\n",
+    )
+    .unwrap();
     let cfg = MemoryConfig::load_from_toml(&config_path);
     assert_eq!(cfg.auto_ttl_days, 3);
     assert_eq!(cfg.manual_ttl_days, Some(30));
@@ -575,16 +683,18 @@ fn prune_expired_removes_past_ttl_observations() {
     let dir = tempfile::tempdir().unwrap();
     let db_dir = dir.path().join(".codesurgeon");
     std::fs::create_dir_all(&db_dir).unwrap();
-    let db = Arc::new(Mutex::new(
-        Database::open(&db_dir.join("mem.db")).unwrap(),
-    ));
+    let db = Arc::new(Mutex::new(Database::open(&db_dir.join("mem.db")).unwrap()));
     let store = MemoryStore::new(Arc::clone(&db), "test-session");
 
     // Insert an observation with an already-elapsed expires_at
-    let mut obs = Observation::new("test-session", "old content", None, None, ObservationKind::Auto);
-    obs.expires_at = Some(
-        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+    let mut obs = Observation::new(
+        "test-session",
+        "old content",
+        None,
+        None,
+        ObservationKind::Auto,
     );
+    obs.expires_at = Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
     db.lock().insert_observation(&obs).unwrap();
 
     // Save a regular (non-expired) manual observation too
@@ -603,7 +713,9 @@ fn prune_expired_removes_past_ttl_observations() {
 fn staleness_score_zero_when_no_stale() {
     let dir = tempfile::tempdir().unwrap();
     let engine = indexed_engine_with_two_langs(&dir);
-    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .unwrap();
     let ctx = engine.get_session_context().unwrap();
     assert_eq!(ctx.staleness_score, 0.0);
 }
@@ -614,18 +726,21 @@ fn staleness_score_nonzero_after_stale_mark() {
     let dir = tempfile::tempdir().unwrap();
     let db_dir = dir.path().join(".codesurgeon");
     std::fs::create_dir_all(&db_dir).unwrap();
-    let db = Arc::new(Mutex::new(
-        Database::open(&db_dir.join("mem.db")).unwrap(),
-    ));
+    let db = Arc::new(Mutex::new(Database::open(&db_dir.join("mem.db")).unwrap()));
     let store = MemoryStore::new(Arc::clone(&db), "test-session");
 
     // Save a symbol-linked observation
-    store.save("insight about foo", Some("foo::bar"), Some("hash-1")).unwrap();
+    store
+        .save("insight about foo", Some("foo::bar"), Some("hash-1"))
+        .unwrap();
     // Simulate code change — mark stale by providing a different hash
     store.check_and_mark_stale("foo::bar", "hash-2").unwrap();
 
     let score = store.staleness_score().unwrap();
-    assert!(score > 0.0, "staleness_score should be > 0 after marking stale");
+    assert!(
+        score > 0.0,
+        "staleness_score should be > 0 after marking stale"
+    );
 }
 
 /// After 3+ observations accumulate for the same symbol, `compress_observations`
@@ -635,15 +750,17 @@ fn compress_observations_merges_symbol_observations() {
     let dir = tempfile::tempdir().unwrap();
     let db_dir = dir.path().join(".codesurgeon");
     std::fs::create_dir_all(&db_dir).unwrap();
-    let db = Arc::new(Mutex::new(
-        Database::open(&db_dir.join("mem.db")).unwrap(),
-    ));
+    let db = Arc::new(Mutex::new(Database::open(&db_dir.join("mem.db")).unwrap()));
     let store = MemoryStore::new(Arc::clone(&db), "test-session");
 
     // Save 3 symbol-linked observations for the same FQN
     for i in 0..3u8 {
         store
-            .save(&format!("observation {i}"), Some("my::Symbol"), Some("hash"))
+            .save(
+                &format!("observation {i}"),
+                Some("my::Symbol"),
+                Some("hash"),
+            )
             .unwrap();
     }
 
@@ -652,13 +769,26 @@ fn compress_observations_merges_symbol_observations() {
 
     // After compression, non-expired visible observations should be just the Summary
     let visible = store.get_recent_observations(50).unwrap();
-    let summaries: Vec<_> = visible.iter().filter(|o| o.kind.as_str() == "summary").collect();
-    assert_eq!(summaries.len(), 1, "expected exactly 1 summary after compression");
+    let summaries: Vec<_> = visible
+        .iter()
+        .filter(|o| o.kind.as_str() == "summary")
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "expected exactly 1 summary after compression"
+    );
     assert!(summaries[0].content.contains("[summary of 3 observations]"));
 
     // The originals must no longer appear (they were expired)
-    let originals: Vec<_> = visible.iter().filter(|o| o.kind.as_str() == "manual").collect();
-    assert!(originals.is_empty(), "original observations should be expired after compression");
+    let originals: Vec<_> = visible
+        .iter()
+        .filter(|o| o.kind.as_str() == "manual")
+        .collect();
+    assert!(
+        originals.is_empty(),
+        "original observations should be expired after compression"
+    );
 }
 
 /// `get_session_context` wraps observations and staleness_score together.
@@ -666,7 +796,9 @@ fn compress_observations_merges_symbol_observations() {
 fn get_session_context_returns_session_context_struct() {
     let dir = tempfile::tempdir().unwrap();
     let engine = indexed_engine_with_two_langs(&dir);
-    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .unwrap();
     let ctx = engine.get_session_context().unwrap();
     assert!(!ctx.observations.is_empty(), "expected observations");
     // staleness_score is a valid percentage

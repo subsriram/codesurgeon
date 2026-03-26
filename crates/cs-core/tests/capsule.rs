@@ -15,8 +15,14 @@ fn chunk_for_query_returns_relevant_window() {
     body.push('}');
 
     let chunk = chunk_for_query(&body, "jwt token validate", 500);
-    assert!(chunk.contains("jwt"), "chunk should contain query-relevant content");
-    assert!(chunk.contains("validate_signature"), "chunk should include the target lines");
+    assert!(
+        chunk.contains("jwt"),
+        "chunk should contain query-relevant content"
+    );
+    assert!(
+        chunk.contains("validate_signature"),
+        "chunk should include the target lines"
+    );
 }
 
 #[test]

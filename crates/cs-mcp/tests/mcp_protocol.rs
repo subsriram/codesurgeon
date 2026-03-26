@@ -141,9 +141,7 @@ impl Session {
                 r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"index_status","arguments":{}}}"#,
             );
             let resp = self.recv();
-            let text = resp["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap_or("");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
             if !text.contains("still initializing") {
                 return;
             }
@@ -529,8 +527,22 @@ fn concurrent_sessions_both_serve_tools_list() {
     let (init1, tools1) = h1.join().expect("thread 1 panicked");
     let (init2, tools2) = h2.join().expect("thread 2 panicked");
 
-    assert_eq!(init1["jsonrpc"].as_str(), Some("2.0"), "session1 init: {init1}");
-    assert_eq!(init2["jsonrpc"].as_str(), Some("2.0"), "session2 init: {init2}");
-    assert!(tools1["result"]["tools"].is_array(), "session1 tools/list: {tools1}");
-    assert!(tools2["result"]["tools"].is_array(), "session2 tools/list: {tools2}");
+    assert_eq!(
+        init1["jsonrpc"].as_str(),
+        Some("2.0"),
+        "session1 init: {init1}"
+    );
+    assert_eq!(
+        init2["jsonrpc"].as_str(),
+        Some("2.0"),
+        "session2 init: {init2}"
+    );
+    assert!(
+        tools1["result"]["tools"].is_array(),
+        "session1 tools/list: {tools1}"
+    );
+    assert!(
+        tools2["result"]["tools"].is_array(),
+        "session2 tools/list: {tools2}"
+    );
 }

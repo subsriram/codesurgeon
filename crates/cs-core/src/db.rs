@@ -97,10 +97,9 @@ impl Database {
             "ALTER TABLE symbols ADD COLUMN is_stub INTEGER NOT NULL DEFAULT 0",
             [],
         );
-        let _ = self.conn.execute(
-            "ALTER TABLE observations ADD COLUMN expires_at TEXT",
-            [],
-        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE observations ADD COLUMN expires_at TEXT", []);
         // Index may already exist on new databases; ignore error.
         let _ = self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_obs_expires ON observations(expires_at);",
@@ -371,10 +370,9 @@ impl Database {
     }
 
     pub fn delete_observation(&self, id: &str) -> Result<bool> {
-        let count = self.conn.execute(
-            "DELETE FROM observations WHERE id = ?1",
-            params![id],
-        )?;
+        let count = self
+            .conn
+            .execute("DELETE FROM observations WHERE id = ?1", params![id])?;
         Ok(count > 0)
     }
 

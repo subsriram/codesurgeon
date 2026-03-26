@@ -1,7 +1,7 @@
 use crate::db::Database;
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -162,9 +162,9 @@ impl Observation {
         symbol_hash: Option<&str>,
         kind: ObservationKind,
     ) -> Self {
-        let expires_at = kind.default_ttl_days().map(|days| {
-            (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
-        });
+        let expires_at = kind
+            .default_ttl_days()
+            .map(|days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339());
         Observation {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -432,7 +432,10 @@ impl MemoryStore {
     /// Returns the number of symbols compressed.
     pub fn compress_observations(&self) -> Result<usize> {
         const COMPRESSION_THRESHOLD: usize = 3;
-        let fqns = self.db.lock().fqns_needing_compression(COMPRESSION_THRESHOLD)?;
+        let fqns = self
+            .db
+            .lock()
+            .fqns_needing_compression(COMPRESSION_THRESHOLD)?;
         let count = fqns.len();
         for fqn in &fqns {
             let obs = self.db.lock().get_observations_for_fqn(fqn)?;
@@ -460,8 +463,7 @@ impl MemoryStore {
             )
             .with_ttl(&self.config);
 
-            let ids_to_expire: Vec<String> =
-                to_compress.iter().map(|o| o.id.clone()).collect();
+            let ids_to_expire: Vec<String> = to_compress.iter().map(|o| o.id.clone()).collect();
             {
                 let db = self.db.lock();
                 db.insert_observation(&summary)?;
@@ -473,9 +475,7 @@ impl MemoryStore {
 
     /// Retrieve observations for the current session.
     pub fn get_session_observations(&self) -> Result<Vec<Observation>> {
-        self.db
-            .lock()
-            .get_session_observations(&self.session_id)
+        self.db.lock().get_session_observations(&self.session_id)
     }
 
     /// Retrieve recent observations across all sessions (for cross-session context).

@@ -322,4 +322,3 @@ fn sym_to_skeleton(sym: &Symbol) -> SkeletonEntry {
 pub fn estimate_tokens(text: &str) -> u32 {
     (text.len() / 4) as u32
 }
-
