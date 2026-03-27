@@ -532,6 +532,11 @@ impl MemoryStore {
         self.db.lock().get_recent_observations(limit)
     }
 
+    /// Keyword search over observation content and symbol FQN.
+    pub fn search_observations(&self, query: &str, max_results: usize) -> Result<Vec<Observation>> {
+        self.db.lock().search_observations(query, max_results)
+    }
+
     /// Returns the fraction (0.0–100.0) of non-expired observations that are stale.
     pub fn staleness_score(&self) -> Result<f32> {
         let (stale, total) = self.db.lock().observation_staleness_counts()?;

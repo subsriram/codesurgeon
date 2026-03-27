@@ -213,7 +213,39 @@ fn tool_list() -> Value {
                 "description": "Returns observations from current and previous sessions. Shows what was explored, decided, and learned. Stale observations are flagged.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "detail_level": {
+                            "type": "string",
+                            "enum": ["L1", "L2", "L3"],
+                            "description": "L1: timestamp + FQN + headline only (~20 tokens each). L2 (default): full content + symbol context. L3: full content + symbol body from graph.",
+                            "default": "L2"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "search_memory",
+                "description": "Keyword search over saved observations. Direct query interface for past insights — complements get_session_context (which returns recent observations). Use when you need to find a specific past decision or note.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search terms, e.g. 'retry backoff' or 'auth token validation'"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum results to return (default: 10)",
+                            "default": 10
+                        },
+                        "detail_level": {
+                            "type": "string",
+                            "enum": ["L1", "L2", "L3"],
+                            "description": "L1: timestamp + FQN + headline only. L2 (default): full content. L3: full content + symbol body.",
+                            "default": "L2"
+                        }
+                    },
+                    "required": ["query"]
                 }
             },
             {
@@ -667,6 +699,67 @@ const INDEX_DEPENDENT_TOOLS: &[&str] = &[
     "generate_module_docs",
 ];
 
+/// Format a list of observations at the requested detail level.
+///
+/// - L1: `[timestamp] (re: fqn): first 80 chars`
+/// - L2 (default): full content + symbol FQN + stale flag
+/// - L3: L2 + full symbol body fetched from the engine graph
+fn format_observations(
+    obs: &[cs_core::Observation],
+    detail_level: &str,
+    engine: &Arc<CoreEngine>,
+) -> String {
+    if obs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for o in obs {
+        let ts = &o.created_at;
+        let stale = if o.is_stale { " ⚠️ [stale]" } else { "" };
+        let sym_label = o
+            .symbol_fqn
+            .as_deref()
+            .map(|f| format!(" (re: `{}`)", f))
+            .unwrap_or_default();
+
+        match detail_level {
+            "L1" => {
+                // Headline only: timestamp + fqn + first 80 chars of content
+                let headline: String = o.content.chars().take(80).collect();
+                let ellipsis = if o.content.len() > 80 { "…" } else { "" };
+                out.push_str(&format!(
+                    "- [{}]{}{}: {}{}\n",
+                    ts, sym_label, stale, headline, ellipsis
+                ));
+            }
+            "L3" => {
+                // Full content + symbol body from graph
+                out.push_str(&format!(
+                    "- [{}]{}{}: {}\n",
+                    ts, sym_label, stale, o.content
+                ));
+                if let Some(fqn) = &o.symbol_fqn {
+                    if let Some((sig, body)) = engine.get_symbol_snippet(fqn) {
+                        out.push_str(&format!(
+                            "  ```\n  {}\n  {}\n  ```\n",
+                            sig.trim(),
+                            body
+                        ));
+                    }
+                }
+            }
+            _ => {
+                // L2: current default behaviour
+                out.push_str(&format!(
+                    "- [{}]{}{}: {}\n",
+                    ts, sym_label, stale, o.content
+                ));
+            }
+        }
+    }
+    out
+}
+
 async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Result<String> {
     // Block index-dependent tools only when the index is genuinely empty (first-ever
     // run with no persisted data). When a warm index exists in SQLite we serve from it
@@ -793,29 +886,44 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
         }
 
         "get_session_context" => {
+            let detail_level = args
+                .get("detail_level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("L2")
+                .to_string();
             let ctx = engine.get_session_context()?;
             if ctx.observations.is_empty() {
                 return Ok("No session observations yet.".to_string());
             }
             let mut out = "## Session memory\n\n".to_string();
-            for obs in &ctx.observations {
-                let stale = if obs.is_stale { " ⚠️ [stale]" } else { "" };
-                let sym = obs
-                    .symbol_fqn
-                    .as_deref()
-                    .map(|f| format!(" (re: `{}`)", f))
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "- [{}]{}{}: {}\n",
-                    obs.created_at, sym, stale, obs.content
-                ));
-            }
+            out.push_str(&format_observations(&ctx.observations, &detail_level, &engine));
             if ctx.staleness_score > 0.0 {
                 out.push_str(&format!(
                     "\n⚠️ Staleness: {:.0}% of observations refer to code that has since changed.\n",
                     ctx.staleness_score
                 ));
             }
+            Ok(out)
+        }
+
+        "search_memory" => {
+            let query = string_arg(&args, "query")?;
+            let max_results = args.get("max_results").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let detail_level = args
+                .get("detail_level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("L2")
+                .to_string();
+            let observations = engine.search_memory(&query, max_results)?;
+            if observations.is_empty() {
+                return Ok(format!("No observations matching `{}`.", query));
+            }
+            let mut out = format!(
+                "## Memory search: `{}`\n{} result(s)\n\n",
+                query,
+                observations.len()
+            );
+            out.push_str(&format_observations(&observations, &detail_level, &engine));
             Ok(out)
         }
 

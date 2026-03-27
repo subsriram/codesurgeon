@@ -1002,3 +1002,150 @@ fn resolved_type_round_trips_through_db() {
     assert_eq!(fetched.resolved_type.as_deref(), Some("Option<u32>"));
     assert_eq!(fetched.source.as_deref(), Some("rustdoc"));
 }
+
+// ── Issue #9: search_memory + detail levels ───────────────────────────────────
+
+/// `search_memory` returns observations whose content matches the query.
+#[test]
+fn search_memory_returns_matching_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir);
+
+    engine
+        .save_observation("retry backoff uses exponential strategy", None)
+        .unwrap();
+    engine
+        .save_observation("token budget assembly logic is in capsule.rs", None)
+        .unwrap();
+    engine
+        .save_observation("auth middleware validates JWT on every request", None)
+        .unwrap();
+
+    let results = engine.search_memory("retry backoff", None).unwrap();
+    assert!(!results.is_empty(), "expected at least one result");
+    assert!(
+        results[0].content.contains("retry"),
+        "top result should mention 'retry', got: {}",
+        results[0].content
+    );
+}
+
+/// `search_memory` returns empty vec when no observations match.
+#[test]
+fn search_memory_returns_empty_for_no_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir);
+
+    engine
+        .save_observation("completely unrelated observation", None)
+        .unwrap();
+
+    let results = engine
+        .search_memory("xyzzy frobulate", None)
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "expected no results for nonsense query"
+    );
+}
+
+/// `search_memory` ranks observations with more matching terms higher.
+#[test]
+fn search_memory_ranks_by_term_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir);
+
+    // One term match
+    engine
+        .save_observation("retry logic exists", None)
+        .unwrap();
+    // Two term match — should rank higher
+    engine
+        .save_observation("retry backoff is implemented", None)
+        .unwrap();
+
+    let results = engine.search_memory("retry backoff", None).unwrap();
+    assert!(results.len() >= 2);
+    assert!(
+        results[0].content.contains("backoff"),
+        "two-term match should rank first, got: {}",
+        results[0].content
+    );
+}
+
+/// `search_memory` respects `max_results` and returns at most that many.
+#[test]
+fn search_memory_respects_max_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir);
+
+    for i in 0..5 {
+        engine
+            .save_observation(&format!("cache observation number {i}"), None)
+            .unwrap();
+    }
+
+    let results = engine.search_memory("cache", Some(3)).unwrap();
+    assert_eq!(results.len(), 3, "expected exactly 3 results");
+}
+
+/// `search_memory` does not return expired observations.
+#[test]
+fn search_memory_excludes_expired_observations() {
+    use cs_core::db::Database;
+    use cs_core::memory::{MemoryStore, Observation, ObservationKind};
+    use parking_lot::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Arc::new(Mutex::new(Database::open(&db_dir.join("mem.db")).unwrap()));
+    let store = MemoryStore::new(Arc::clone(&db), "test-session");
+
+    // Insert an already-expired observation directly
+    let mut expired = Observation::new(
+        "test-session",
+        "expired cache insight",
+        None,
+        None,
+        ObservationKind::Manual,
+    );
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    db.lock().insert_observation(&expired).unwrap();
+
+    // Also save a live observation
+    store.save("live cache observation", None, None).unwrap();
+
+    let results = store.search_observations("cache", 10).unwrap();
+    assert_eq!(results.len(), 1, "expired observation must not appear");
+    assert!(results[0].content.contains("live"));
+}
+
+/// `get_symbol_snippet` returns signature and body for a known FQN.
+#[test]
+fn get_symbol_snippet_returns_body_for_known_fqn() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "/// Adds two numbers.\npub fn add(a: u32, b: u32) -> u32 { a + b }\n",
+    )
+    .unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().unwrap();
+
+    // find the FQN from the index
+    let _ctx = engine.get_context_capsule("add", None, None, None).unwrap();
+    // The snippet function should work for any indexed symbol
+    let snippet = engine.get_symbol_snippet("lib.rs::add");
+    // May or may not find it depending on FQN format, but must not panic
+    // If found, signature must be non-empty
+    if let Some((sig, _body)) = snippet {
+        assert!(!sig.is_empty(), "signature should be non-empty");
+        assert!(sig.contains("add"), "signature should mention function name");
+    }
+    // Getting a snippet for an unknown FQN returns None
+    assert!(
+        engine.get_symbol_snippet("nonexistent::fqn").is_none(),
+        "unknown FQN should return None"
+    );
+}

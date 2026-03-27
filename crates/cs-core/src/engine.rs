@@ -1010,6 +1010,32 @@ impl CoreEngine {
         })
     }
 
+    /// Look up a symbol by FQN and return its signature + first 20 lines of body.
+    /// Returns `None` if the symbol is not in the graph.
+    pub fn get_symbol_snippet(&self, fqn: &str) -> Option<(String, String)> {
+        let graph = self.graph.read();
+        graph.find_by_fqn(fqn).map(|sym| {
+            let body_preview = sym
+                .body
+                .lines()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            (sym.signature.clone(), body_preview)
+        })
+    }
+
+    /// Keyword search over saved observations. Returns up to `max_results` matches
+    /// ranked by term overlap then recency.
+    pub fn search_memory(
+        &self,
+        query: &str,
+        max_results: Option<usize>,
+    ) -> Result<Vec<crate::memory::Observation>> {
+        let limit = max_results.unwrap_or(10);
+        self.memory.lock().search_observations(query, limit)
+    }
+
     /// Delete an observation by ID. Returns true if found and deleted.
     pub fn delete_observation(&self, id: &str) -> Result<bool> {
         self.memory.lock().delete(id)

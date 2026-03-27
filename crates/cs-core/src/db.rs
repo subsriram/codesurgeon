@@ -464,6 +464,70 @@ impl Database {
         Ok(results)
     }
 
+    /// Multi-term keyword search over observation content and symbol_fqn.
+    /// Splits `query` on whitespace, requires at least one term to match (OR logic),
+    /// and ranks results by how many terms match (descending), then recency.
+    pub fn search_observations(&self, query: &str, limit: usize) -> Result<Vec<Observation>> {
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .map(|t| format!("%{}%", t.to_lowercase()))
+            .collect();
+        if terms.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build a score expression: one point per matching term.
+        let score_expr: String = terms
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    "(CASE WHEN lower(content) LIKE ?{i} OR lower(coalesce(symbol_fqn,'')) LIKE ?{i} THEN 1 ELSE 0 END)",
+                    i = i + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+
+        // WHERE: at least one term must match.
+        let where_clause: String = terms
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    "lower(content) LIKE ?{i} OR lower(coalesce(symbol_fqn,'')) LIKE ?{i}",
+                    i = i + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let sql = format!(
+            "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
+             created_at, is_stale, kind, expires_at, ({score}) as _score \
+             FROM observations \
+             WHERE ({where_clause}) \
+               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+             ORDER BY _score DESC, created_at DESC \
+             LIMIT {limit}",
+            score = score_expr,
+            where_clause = where_clause,
+            limit = limit,
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_vec: Vec<&dyn rusqlite::types::ToSql> =
+            terms.iter().map(|t| t as &dyn rusqlite::types::ToSql).collect();
+        let results = stmt
+            .query_map(params_vec.as_slice(), |row| {
+                // row_to_observation reads columns 0..9; column 10 is _score (ignored)
+                row_to_observation(row)
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(results)
+    }
+
     /// Returns (stale_count, total_count) for non-expired observations.
     pub fn observation_staleness_counts(&self) -> Result<(u64, u64)> {
         let total: i64 = self.conn.query_row(
