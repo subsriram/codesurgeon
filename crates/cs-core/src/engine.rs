@@ -23,7 +23,7 @@ use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
 use crate::rustdoc_enrich::run_rustdoc_enrichment;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
-use crate::symbol::Symbol;
+use crate::symbol::{EdgeKind, LspEdge, Symbol};
 #[cfg(feature = "embeddings")]
 use crate::symbol::SymbolKind;
 use crate::watcher::{hash_content, ChangeKind};
@@ -119,6 +119,7 @@ impl EngineConfig {
 pub struct IndexStats {
     pub symbol_count: u64,
     pub edge_count: u64,
+    pub lsp_edge_count: u64,
     pub file_count: u64,
     pub stub_symbol_count: u64,
     pub session_id: String,
@@ -278,12 +279,29 @@ impl CoreEngine {
                 graph_guard.add_edge(edge.from_id, edge.to_id, edge.kind.clone());
             }
 
+            // Load LSP-pushed edges, resolving FQNs to IDs via the graph.
+            let lsp_edges = db_guard.load_lsp_edges()?;
+            let mut lsp_loaded = 0usize;
+            for lsp in &lsp_edges {
+                if let (Some(from_sym), Some(to_sym)) = (
+                    graph_guard.find_by_fqn(&lsp.from_fqn),
+                    graph_guard.find_by_fqn(&lsp.to_fqn),
+                ) {
+                    let from_id = from_sym.id;
+                    let to_id = to_sym.id;
+                    let kind = lsp_kind_to_edge_kind(&lsp.kind);
+                    graph_guard.add_edge(from_id, to_id, kind);
+                    lsp_loaded += 1;
+                }
+            }
+
             search_guard.commit()?;
             graph_guard.warm_caches();
             tracing::info!(
-                "Warmed index: {} symbols, {} edges",
+                "Warmed index: {} symbols, {} edges, {} LSP edges",
                 symbols.len(),
-                edges.len()
+                edges.len(),
+                lsp_loaded
             );
         }
 
@@ -673,7 +691,10 @@ impl CoreEngine {
 
         // Phase 1: Remove stale db rows (brief, independent db lock).
         {
-            self.db.lock().delete_file_symbols(&rel)?;
+            let db = self.db.lock();
+            db.delete_file_symbols(&rel)?;
+            // LSP edges from this file are now stale; the IDE hook will re-submit after save.
+            db.delete_lsp_edges_for_file(&rel)?;
         }
         // Phase 2: Remove from in-memory graph (brief, independent graph lock).
         {
@@ -986,12 +1007,62 @@ impl CoreEngine {
         })
     }
 
+    /// Accept LSP-resolved edges pushed by an IDE extension or Claude Code hook.
+    ///
+    /// Each edge is stored in the `lsp_edges` table and immediately reflected in the
+    /// in-memory graph. Edges whose `from_fqn` refers to an unknown symbol are skipped
+    /// (the IDE may have sent them before the index was fully built; it can re-submit).
+    /// Edges are invalidated automatically when the source file is re-indexed.
+    pub fn submit_lsp_edges(&self, edges: &[LspEdge]) -> Result<String> {
+        let mut accepted = 0usize;
+        let mut skipped = 0usize;
+
+        let db = self.db.lock();
+        let mut graph = self.graph.write();
+
+        for lsp in edges {
+            // Derive source_file from the from_fqn (everything before the first "::").
+            let source_file = lsp.from_fqn.splitn(2, "::").next().unwrap_or(&lsp.from_fqn);
+
+            // Resolve both FQNs to symbol IDs in the current graph.
+            let from_id = graph.find_by_fqn(&lsp.from_fqn).map(|s| s.id);
+            let to_id = graph.find_by_fqn(&lsp.to_fqn).map(|s| s.id);
+
+            match (from_id, to_id) {
+                (Some(fid), Some(tid)) => {
+                    db.upsert_lsp_edge(
+                        &lsp.from_fqn,
+                        &lsp.to_fqn,
+                        &lsp.kind,
+                        lsp.resolved_type.as_deref(),
+                        source_file,
+                    )?;
+                    graph.add_edge(fid, tid, lsp_kind_to_edge_kind(&lsp.kind));
+                    accepted += 1;
+                }
+                _ => {
+                    skipped += 1;
+                }
+            }
+        }
+
+        if accepted > 0 {
+            graph.warm_caches();
+        }
+
+        Ok(format!(
+            "{} edge(s) accepted, {} skipped (unknown symbol FQN).",
+            accepted, skipped
+        ))
+    }
+
     /// Index statistics and health.
     pub fn index_stats(&self) -> Result<IndexStats> {
         let db = self.db.lock();
         Ok(IndexStats {
             symbol_count: db.symbol_count()?,
             edge_count: db.edge_count()?,
+            lsp_edge_count: db.lsp_edge_count()?,
             file_count: db.file_count()?,
             stub_symbol_count: db.stub_symbol_count()?,
             session_id: self.config.session_id.clone(),
@@ -1757,6 +1828,18 @@ fn is_sensitive_file(path: &Path) -> bool {
         return true;
     }
     false
+}
+
+/// Map the string kind accepted by `submit_lsp_edges` to an `EdgeKind`.
+/// "extends" is an alias for "inherits"; anything unrecognised → `References`.
+fn lsp_kind_to_edge_kind(kind: &str) -> EdgeKind {
+    match kind {
+        "calls" => EdgeKind::Calls,
+        "imports" => EdgeKind::Imports,
+        "implements" => EdgeKind::Implements,
+        "extends" | "inherits" => EdgeKind::Inherits,
+        _ => EdgeKind::References,
+    }
 }
 
 fn sym_ref(s: &Symbol) -> SymbolRef {

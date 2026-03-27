@@ -1149,3 +1149,104 @@ fn get_symbol_snippet_returns_body_for_known_fqn() {
         "unknown FQN should return None"
     );
 }
+
+// ── submit_lsp_edges ──────────────────────────────────────────────────────────
+
+use cs_core::symbol::LspEdge;
+
+/// Accepted edges are reflected in `index_stats().lsp_edge_count`.
+#[test]
+fn submit_lsp_edges_accepted_count() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.py"), "def caller(): pass\n").unwrap();
+    std::fs::write(dir.path().join("b.py"), "def callee(): pass\n").unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().unwrap();
+
+    let result = engine
+        .submit_lsp_edges(&[LspEdge {
+            from_fqn: "a.py::caller".to_string(),
+            to_fqn: "b.py::callee".to_string(),
+            kind: "calls".to_string(),
+            resolved_type: None,
+        }])
+        .unwrap();
+
+    assert!(result.contains("1 edge(s) accepted"), "got: {result}");
+    let stats = engine.index_stats().unwrap();
+    assert_eq!(stats.lsp_edge_count, 1);
+}
+
+/// Edges referencing unknown FQNs are skipped without returning an error.
+#[test]
+fn submit_lsp_edges_unknown_fqn_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().unwrap();
+
+    let result = engine
+        .submit_lsp_edges(&[LspEdge {
+            from_fqn: "ghost.py::missing".to_string(),
+            to_fqn: "also_gone.py::missing".to_string(),
+            kind: "calls".to_string(),
+            resolved_type: None,
+        }])
+        .unwrap();
+
+    assert!(result.contains("skipped"), "got: {result}");
+    let stats = engine.index_stats().unwrap();
+    assert_eq!(stats.lsp_edge_count, 0);
+}
+
+/// Submitting the same edge twice must not duplicate it in the DB.
+#[test]
+fn submit_lsp_edges_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.py"), "def f(): pass\n").unwrap();
+    std::fs::write(dir.path().join("b.py"), "def g(): pass\n").unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().unwrap();
+
+    let edge = vec![LspEdge {
+        from_fqn: "a.py::f".to_string(),
+        to_fqn: "b.py::g".to_string(),
+        kind: "calls".to_string(),
+        resolved_type: None,
+    }];
+    engine.submit_lsp_edges(&edge).unwrap();
+    engine.submit_lsp_edges(&edge).unwrap();
+
+    let stats = engine.index_stats().unwrap();
+    assert_eq!(stats.lsp_edge_count, 1, "duplicate edges must not accumulate");
+}
+
+/// LSP edges for a file are deleted when that file is re-indexed.
+#[test]
+fn submit_lsp_edges_invalidated_on_reindex() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_a = dir.path().join("a.py");
+    std::fs::write(&file_a, "def f(): pass\n").unwrap();
+    std::fs::write(dir.path().join("b.py"), "def g(): pass\n").unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().unwrap();
+
+    engine
+        .submit_lsp_edges(&[LspEdge {
+            from_fqn: "a.py::f".to_string(),
+            to_fqn: "b.py::g".to_string(),
+            kind: "calls".to_string(),
+            resolved_type: None,
+        }])
+        .unwrap();
+    assert_eq!(engine.index_stats().unwrap().lsp_edge_count, 1);
+
+    // Re-indexing a.py must invalidate edges sourced from it.
+    std::fs::write(&file_a, "def f(): pass\ndef f2(): pass\n").unwrap();
+    engine.reindex_file(&file_a, ChangeKind::Modified).unwrap();
+
+    assert_eq!(
+        engine.index_stats().unwrap().lsp_edge_count,
+        0,
+        "LSP edges must be invalidated when source file is re-indexed"
+    );
+}

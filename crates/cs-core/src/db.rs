@@ -121,6 +121,18 @@ impl Database {
         let _ = self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_obs_expires ON observations(expires_at);",
         );
+        // LSP edges — pushed by IDE extensions or Claude Code hooks.
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS lsp_edges ( \
+                 from_fqn      TEXT NOT NULL, \
+                 to_fqn        TEXT NOT NULL, \
+                 kind          TEXT NOT NULL, \
+                 resolved_type TEXT, \
+                 source_file   TEXT NOT NULL, \
+                 PRIMARY KEY (from_fqn, to_fqn, kind) \
+             ); \
+             CREATE INDEX IF NOT EXISTS idx_lsp_edges_source ON lsp_edges(source_file);",
+        );
         Ok(())
     }
 
@@ -260,6 +272,54 @@ impl Database {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    // ── LSP edges ─────────────────────────────────────────────────────────────
+
+    pub fn upsert_lsp_edge(
+        &self,
+        from_fqn: &str,
+        to_fqn: &str,
+        kind: &str,
+        resolved_type: Option<&str>,
+        source_file: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO lsp_edges \
+             (from_fqn, to_fqn, kind, resolved_type, source_file) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![from_fqn, to_fqn, kind, resolved_type, source_file],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_lsp_edges_for_file(&self, source_file: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM lsp_edges WHERE source_file = ?1",
+            params![source_file],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_lsp_edges(&self) -> Result<Vec<crate::symbol::LspEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_fqn, to_fqn, kind, resolved_type FROM lsp_edges",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::symbol::LspEdge {
+                from_fqn: r.get(0)?,
+                to_fqn: r.get(1)?,
+                kind: r.get(2)?,
+                resolved_type: r.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn lsp_edge_count(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM lsp_edges", [], |r| r.get::<_, i64>(0))? as u64)
     }
 
     // ── Files ─────────────────────────────────────────────────────────────────

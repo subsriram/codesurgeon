@@ -244,3 +244,17 @@ impl Edge {
         self
     }
 }
+
+/// An edge submitted by an external LSP client (e.g. VS Code extension or Claude Code hook).
+/// Uses FQNs instead of numeric IDs; resolved to IDs when stored in the in-memory graph.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LspEdge {
+    /// FQN of the source symbol, e.g. `src/http.ts::fetchUser`
+    pub from_fqn: String,
+    /// FQN of the target symbol, e.g. `node_modules/@types/node::http.ClientRequest`
+    pub to_fqn: String,
+    /// Relationship kind: "calls", "imports", "implements", "extends"
+    pub kind: String,
+    /// Optional resolved type string from the LSP
+    pub resolved_type: Option<String>,
+}

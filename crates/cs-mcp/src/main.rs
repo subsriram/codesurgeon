@@ -16,7 +16,7 @@
 //! ```
 
 use anyhow::Result;
-use cs_core::{engine::EngineConfig, watcher::FileWatcher, CoreEngine};
+use cs_core::{engine::EngineConfig, symbol::LspEdge, watcher::FileWatcher, CoreEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -297,6 +297,43 @@ fn tool_list() -> Value {
                             "default": false
                         }
                     }
+                }
+            },
+            {
+                "name": "submit_lsp_edges",
+                "description": "Push LSP-resolved edges into the codesurgeon index. Call this from a VS Code extension or Claude Code hook (e.g. on file save) to enrich the graph with type-resolved cross-file edges that tree-sitter cannot see. Edges are stored persistently and loaded on next startup. They are automatically invalidated when the source file changes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "edges": {
+                            "type": "array",
+                            "description": "List of LSP-resolved edges to add",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "from_fqn": {
+                                        "type": "string",
+                                        "description": "FQN of the source symbol, e.g. 'src/http.ts::fetchUser'"
+                                    },
+                                    "to_fqn": {
+                                        "type": "string",
+                                        "description": "FQN of the target symbol, e.g. 'node_modules/@types/node::http.ClientRequest'"
+                                    },
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": ["calls", "imports", "implements", "extends"],
+                                        "description": "Relationship kind"
+                                    },
+                                    "resolved_type": {
+                                        "type": "string",
+                                        "description": "Optional resolved type string from the LSP (e.g. 'http.ClientRequest')"
+                                    }
+                                },
+                                "required": ["from_fqn", "to_fqn", "kind"]
+                            }
+                        }
+                    },
+                    "required": ["edges"]
                 }
             }
         ]
@@ -863,15 +900,22 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
             } else {
                 "- Swift enrichment: Xcode MCP not detected — tree-sitter only (see README for setup)\n"
             };
+            let lsp_line = if stats.lsp_edge_count > 0 {
+                format!("- LSP edges: {}\n", stats.lsp_edge_count)
+            } else {
+                String::new()
+            };
             let mut status = format!(
                 "## codesurgeon index status\n\
                  - Indexing: {}\n\
                  - Symbols: {}\n\
                  - Edges: {}\n\
+                 {}\
                  - Files: {}\n",
                 if indexing { "in progress" } else { "ready" },
                 stats.symbol_count,
                 stats.edge_count,
+                lsp_line,
                 stats.file_count,
             );
             if stats.stub_symbol_count > 0 {
@@ -949,6 +993,15 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             engine.generate_module_docs(write_files)
+        }
+
+        "submit_lsp_edges" => {
+            let raw = args
+                .get("edges")
+                .ok_or_else(|| anyhow::anyhow!("Missing required argument: edges"))?;
+            let edges: Vec<LspEdge> = serde_json::from_value(raw.clone())
+                .map_err(|e| anyhow::anyhow!("Invalid edges array: {}", e))?;
+            engine.submit_lsp_edges(&edges)
         }
 
         other => Err(anyhow::anyhow!("Unknown tool: {}", other)),
