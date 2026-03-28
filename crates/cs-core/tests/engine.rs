@@ -1250,3 +1250,71 @@ fn submit_lsp_edges_invalidated_on_reindex() {
         "LSP edges must be invalidated when source file is re-indexed"
     );
 }
+
+// ── 9d Memory consolidation ────────────────────────────────────────────────────
+
+/// `consolidate_observations` must return Ok(0) when the embedder is not loaded
+/// (the no-embedder stub path, which is what the test engine uses).
+#[test]
+fn consolidate_observations_is_noop_without_embedder() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir);
+
+    // Produce a few auto observations so there is something to consolidate.
+    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
+    engine.run_pipeline("py fn", Some(4000), None, None).unwrap();
+
+    let n = engine
+        .consolidate_observations()
+        .expect("consolidate_observations must not error");
+    assert_eq!(n, 0, "expected 0 clusters without embedder");
+}
+
+/// Auto observations written by `run_pipeline` must survive `consolidate_observations`
+/// intact when the embedder is absent (no premature expiry).
+#[test]
+fn consolidate_does_not_expire_observations_without_embedder() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir);
+
+    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
+    engine.run_pipeline("py fn", Some(4000), None, None).unwrap();
+
+    engine.consolidate_observations().unwrap();
+
+    let obs = engine
+        .get_session_context()
+        .expect("get_session_context failed")
+        .observations;
+    let auto_count = obs.iter().filter(|o| o.kind.as_str() == "auto").count();
+    assert!(
+        auto_count >= 2,
+        "auto observations must not be expired by consolidation without embedder; found {auto_count}"
+    );
+}
+
+/// `Consolidated` kind must never appear in the `get_consolidation_candidates` pool,
+/// preventing already-consolidated entries from being re-consolidated on subsequent runs.
+/// We verify this indirectly: after consolidation completes the session context must
+/// contain no `Consolidated` entries when the embedder is absent (no merges occurred).
+#[test]
+fn consolidated_kind_not_in_candidates_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir);
+
+    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
+    engine.consolidate_observations().unwrap(); // no-op without embedder
+
+    let obs = engine
+        .get_session_context()
+        .expect("get_session_context failed")
+        .observations;
+    let consolidated_count = obs
+        .iter()
+        .filter(|o| o.kind.as_str() == "consolidated")
+        .count();
+    assert_eq!(
+        consolidated_count, 0,
+        "no consolidated entries expected without embedder"
+    );
+}

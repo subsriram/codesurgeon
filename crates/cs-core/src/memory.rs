@@ -23,6 +23,8 @@ pub enum ObservationKind {
     Auto,
     /// Compressed summary created by the compression pass; replaces 3+ originals
     Summary,
+    /// Semantically consolidated entry — merges 2+ similar auto-observations by embedding similarity
+    Consolidated,
 }
 
 impl ObservationKind {
@@ -35,6 +37,7 @@ impl ObservationKind {
             ObservationKind::Insight => "insight",
             ObservationKind::Auto => "auto",
             ObservationKind::Summary => "summary",
+            ObservationKind::Consolidated => "consolidated",
         }
     }
 
@@ -46,6 +49,7 @@ impl ObservationKind {
             "insight" => ObservationKind::Insight,
             "auto" => ObservationKind::Auto,
             "summary" => ObservationKind::Summary,
+            "consolidated" => ObservationKind::Consolidated,
             _ => ObservationKind::Manual,
         }
     }
@@ -59,6 +63,7 @@ impl ObservationKind {
             ObservationKind::FileThrash => Some(7),
             ObservationKind::DeadEnd => Some(7),
             ObservationKind::Summary => Some(90),
+            ObservationKind::Consolidated => Some(90),
             ObservationKind::Manual => None,
             ObservationKind::Insight => None,
         }
@@ -173,8 +178,10 @@ impl MemoryConfig {
             | ObservationKind::FileThrash
             | ObservationKind::DeadEnd => Some(self.auto_ttl_days),
             ObservationKind::Manual | ObservationKind::Insight => self.manual_ttl_days,
-            // Summaries get the manual TTL (or 90 days if manual never expires)
-            ObservationKind::Summary => self.manual_ttl_days.or(Some(90)),
+            // Summaries and consolidated entries get the manual TTL (or 90 days if manual never expires)
+            ObservationKind::Summary | ObservationKind::Consolidated => {
+                self.manual_ttl_days.or(Some(90))
+            }
         }?;
         let ts = chrono::Utc::now() + chrono::Duration::days(days);
         Some(ts.to_rfc3339())
@@ -340,6 +347,10 @@ impl MemoryStore {
     pub fn with_config(mut self, config: MemoryConfig) -> Self {
         self.config = config;
         self
+    }
+
+    pub fn config(&self) -> &MemoryConfig {
+        &self.config
     }
 
     /// Save a manual observation (from agent or user).
@@ -548,6 +559,45 @@ impl MemoryStore {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+}
+
+#[cfg(test)]
+mod obs_kind_tests {
+    use super::*;
+
+    #[test]
+    fn consolidated_as_str() {
+        assert_eq!(ObservationKind::Consolidated.as_str(), "consolidated");
+    }
+
+    #[test]
+    fn consolidated_parse_kind_roundtrip() {
+        assert!(matches!(
+            ObservationKind::parse_kind("consolidated"),
+            ObservationKind::Consolidated
+        ));
+    }
+
+    #[test]
+    fn consolidated_default_ttl_is_90_days() {
+        assert_eq!(ObservationKind::Consolidated.default_ttl_days(), Some(90));
+    }
+
+    #[test]
+    fn consolidated_expires_at_is_set_on_new() {
+        let obs = Observation::new("s", "content", None, None, ObservationKind::Consolidated);
+        assert!(obs.expires_at.is_some(), "Consolidated must have an expires_at");
+    }
+
+    /// expires_at() on MemoryConfig should assign a non-None TTL for Consolidated.
+    #[test]
+    fn memory_config_expires_at_for_consolidated() {
+        let cfg = MemoryConfig::default();
+        assert!(
+            cfg.expires_at(&ObservationKind::Consolidated).is_some(),
+            "MemoryConfig::expires_at must return Some for Consolidated"
+        );
     }
 }
 

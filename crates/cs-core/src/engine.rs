@@ -377,6 +377,11 @@ impl CoreEngine {
             Ok(e) => {
                 let _ = self.embedder.set(e);
                 tracing::info!("Embedder loaded (NomicEmbedTextV15Q, 768-dim)");
+                match self.consolidate_observations() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("Consolidated {n} observation cluster(s)"),
+                    Err(e) => tracing::warn!("Observation consolidation failed: {}", e),
+                }
             }
             Err(e) => {
                 tracing::warn!("Embedder unavailable, falling back to BM25: {}", e);
@@ -1125,6 +1130,93 @@ impl CoreEngine {
         mem.save(content, symbol_fqn, symbol_hash.as_deref())
     }
 
+    /// Semantic consolidation pass: clusters auto/passive observations by embedding cosine
+    /// similarity (threshold 0.92) and merges each cluster of ≥ 2 into a single
+    /// `Consolidated` entry whose content captures the unique queries and pivot FQNs.
+    /// No-op when the embedder is not loaded.
+    /// Returns the number of clusters merged.
+    #[cfg(feature = "embeddings")]
+    pub fn consolidate_observations(&self) -> Result<usize> {
+        use crate::embedder::cosine_similarity;
+        const SIMILARITY_THRESHOLD: f32 = 0.92;
+        const MIN_CLUSTER_SIZE: usize = 2;
+
+        let Some(emb) = self.embedder.get() else {
+            return Ok(0);
+        };
+
+        let candidates = self.db.lock().get_consolidation_candidates()?;
+        if candidates.len() < MIN_CLUSTER_SIZE {
+            return Ok(0);
+        }
+
+        let texts: Vec<&str> = candidates.iter().map(|o| o.content.as_str()).collect();
+        let embeddings = match emb.embed_batch(&texts) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("consolidation embed failed: {}", e);
+                return Ok(0);
+            }
+        };
+
+        // Greedy clustering: for each unvisited observation, start a new cluster and pull
+        // in all remaining unvisited observations whose similarity exceeds the threshold.
+        let n = candidates.len();
+        let mut assigned = vec![false; n];
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+
+        for i in 0..n {
+            if assigned[i] {
+                continue;
+            }
+            let mut cluster = vec![i];
+            assigned[i] = true;
+            for j in (i + 1)..n {
+                if !assigned[j]
+                    && cosine_similarity(&embeddings[i], &embeddings[j]) >= SIMILARITY_THRESHOLD
+                {
+                    cluster.push(j);
+                    assigned[j] = true;
+                }
+            }
+            if cluster.len() >= MIN_CLUSTER_SIZE {
+                clusters.push(cluster);
+            }
+        }
+
+        let mem = self.memory.lock();
+        let mem_config = mem.config().clone();
+        let session_id = &self.config.session_id;
+
+        for cluster in &clusters {
+            let cluster_obs: Vec<&crate::memory::Observation> =
+                cluster.iter().map(|&i| &candidates[i]).collect();
+
+            let merged = merge_cluster_content(&cluster_obs);
+            let consolidated = crate::memory::Observation::new(
+                session_id,
+                &merged,
+                None,
+                None,
+                crate::memory::ObservationKind::Consolidated,
+            )
+            .with_ttl(&mem_config);
+
+            let ids_to_expire: Vec<String> =
+                cluster_obs.iter().map(|o| o.id.clone()).collect();
+            let db = self.db.lock();
+            db.insert_observation(&consolidated)?;
+            db.expire_observations(&ids_to_expire)?;
+        }
+
+        Ok(clusters.len())
+    }
+
+    #[cfg(not(feature = "embeddings"))]
+    pub fn consolidate_observations(&self) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Diff-aware capsule: parse a git diff and return context for changed symbols.
     /// Identifies changed functions/methods, their callers, and any related test files.
     pub fn get_diff_capsule(&self, diff: &str, budget: Option<u32>) -> Result<String> {
@@ -1851,6 +1943,57 @@ fn sym_ref(s: &Symbol) -> SymbolRef {
     }
 }
 
+/// Merge a cluster of observations into a single content string.
+/// Extracts unique query phrases and unique pivot FQNs from auto-observation content.
+/// Falls back to a generic summary for non-standard content.
+#[cfg(any(feature = "embeddings", test))]
+fn merge_cluster_content(obs: &[&crate::memory::Observation]) -> String {
+    let mut queries: Vec<String> = Vec::new();
+    let mut pivots: Vec<String> = Vec::new();
+
+    for o in obs {
+        // Auto-observations have the format: Agent queried: "task" — pivots: fqn1, fqn2
+        if let Some(rest) = o.content.strip_prefix("Agent queried: \"") {
+            if let Some(q_end) = rest.find("\" — pivots: ") {
+                let query = rest[..q_end].to_string();
+                let pivot_part = &rest[q_end + "\" — pivots: ".len()..];
+                if !queries.contains(&query) {
+                    queries.push(query);
+                }
+                for p in pivot_part.split(", ") {
+                    let p = p.to_string();
+                    if !p.is_empty() && !pivots.contains(&p) {
+                        pivots.push(p);
+                    }
+                }
+                continue;
+            }
+        }
+        // Fallback: treat entire content as a unique phrase
+        if !queries.contains(&o.content) {
+            queries.push(o.content.clone());
+        }
+    }
+
+    let count = obs.len();
+    if queries.is_empty() {
+        return format!("[consolidated from {count} observations]");
+    }
+    let query_str = queries
+        .iter()
+        .map(|q| format!("\"{q}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if pivots.is_empty() {
+        format!("[consolidated from {count} observations] Queries: {query_str}")
+    } else {
+        format!(
+            "[consolidated from {count} observations] Queries: {query_str} — pivots: {}",
+            pivots.join(", ")
+        )
+    }
+}
+
 #[cfg(test)]
 mod secrets_tests {
     use super::*;
@@ -1941,5 +2084,83 @@ mod secrets_tests {
         // "sk-" with only 3 chars after — below the min_after=24 threshold
         let f = tmp_with("let x = \"sk-abc\";\n");
         assert!(!file_contains_api_key(f.path()));
+    }
+}
+
+#[cfg(test)]
+mod consolidation_tests {
+    use super::*;
+    use crate::memory::{Observation, ObservationKind};
+
+    fn auto_obs(content: &str) -> Observation {
+        Observation::new("session-test", content, None, None, ObservationKind::Auto)
+    }
+
+    /// Standard auto-observation format: unique queries and pivots are extracted.
+    #[test]
+    fn merge_standard_auto_format() {
+        let a = auto_obs("Agent queried: \"fix auth\" — pivots: mod::auth, mod::user");
+        let b = auto_obs("Agent queried: \"fix login\" — pivots: mod::auth, mod::token");
+        let merged = merge_cluster_content(&[&a, &b]);
+
+        assert!(
+            merged.starts_with("[consolidated from 2 observations]"),
+            "unexpected prefix: {merged}"
+        );
+        assert!(merged.contains("\"fix auth\""), "missing query: {merged}");
+        assert!(merged.contains("\"fix login\""), "missing query: {merged}");
+        assert!(merged.contains("mod::auth"), "missing shared pivot: {merged}");
+        assert!(merged.contains("mod::token"), "missing unique pivot: {merged}");
+        // mod::auth must appear only once (deduplication)
+        assert_eq!(
+            merged.matches("mod::auth").count(),
+            1,
+            "pivot mod::auth should appear exactly once: {merged}"
+        );
+    }
+
+    /// Identical queries in the cluster are deduplicated.
+    #[test]
+    fn merge_deduplicates_identical_queries() {
+        let a = auto_obs("Agent queried: \"refactor engine\" — pivots: engine::run");
+        let b = auto_obs("Agent queried: \"refactor engine\" — pivots: engine::run");
+        let merged = merge_cluster_content(&[&a, &b]);
+
+        assert_eq!(
+            merged.matches("\"refactor engine\"").count(),
+            1,
+            "duplicate query should appear only once: {merged}"
+        );
+        assert_eq!(
+            merged.matches("engine::run").count(),
+            1,
+            "duplicate pivot should appear only once: {merged}"
+        );
+    }
+
+    /// Non-standard content falls back to listing unique phrases verbatim.
+    #[test]
+    fn merge_fallback_for_non_standard_content() {
+        let a = auto_obs("Some free-form note A");
+        let b = auto_obs("Some free-form note B");
+        let merged = merge_cluster_content(&[&a, &b]);
+
+        assert!(
+            merged.starts_with("[consolidated from 2 observations]"),
+            "unexpected prefix: {merged}"
+        );
+        assert!(merged.contains("Some free-form note A"), "missing content A: {merged}");
+        assert!(merged.contains("Some free-form note B"), "missing content B: {merged}");
+    }
+
+    /// Cluster of size 1 should produce a valid (if trivial) merged string.
+    #[test]
+    fn merge_single_item_cluster() {
+        let a = auto_obs("Agent queried: \"search\" — pivots: mod::search");
+        let merged = merge_cluster_content(&[&a]);
+        assert!(
+            merged.starts_with("[consolidated from 1 observation"),
+            "unexpected prefix: {merged}"
+        );
     }
 }

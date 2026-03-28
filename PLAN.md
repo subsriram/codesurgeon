@@ -685,18 +685,15 @@ budget when a capsule already contains the relevant code.
 
 ---
 
-#### 9d — Memory consolidation (Med effort)
+#### 9d — Memory consolidation ✅
 
-Semantically similar auto-observations are merged into a single consolidated entry.
-codesurgeon currently accumulates duplicates — e.g. 20 `run_pipeline` calls on the same
-module produce 20 near-identical observations.
-
-Implementation:
-- On session compression (9b), cluster auto-observations by embedding cosine similarity
-  (threshold ~0.92) using the existing embeddings stack
-- Replace each cluster with a single `ObservationKind::Consolidated` entry whose content
-  merges the unique terms across the cluster
-- Manual observations never merge
+Shipped in issue #11. After the embedder loads, `consolidate_observations()` clusters all
+non-expired auto/passive observations by embedding cosine similarity (threshold 0.92).
+Clusters of ≥ 2 observations are replaced by a single `ObservationKind::Consolidated`
+entry whose content merges the unique query phrases and pivot FQNs from the cluster.
+Manual and Insight observations are never merged. Consolidated entries expire after 90 days
+(same as Summary). The pass runs once at startup inside `load_embedder()`, after the
+embedding model is ready.
 
 ---
 

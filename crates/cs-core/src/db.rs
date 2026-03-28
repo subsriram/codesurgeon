@@ -506,19 +506,37 @@ impl Database {
     }
 
     /// Returns all distinct symbol FQNs that have ≥ `threshold` non-expired,
-    /// non-summary observations. Used to find candidates for compression.
+    /// non-summary/consolidated observations. Used to find candidates for compression.
     pub fn fqns_needing_compression(&self, threshold: usize) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol_fqn, COUNT(*) as cnt \
              FROM observations \
              WHERE symbol_fqn IS NOT NULL \
-               AND kind != 'summary' \
+               AND kind NOT IN ('summary', 'consolidated') \
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
              GROUP BY symbol_fqn \
              HAVING cnt >= ?1",
         )?;
         let results = stmt
             .query_map(params![threshold as i64], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(results)
+    }
+
+    /// Returns all non-expired auto/passive observations that are not already summary or
+    /// consolidated. These are the candidates for semantic consolidation by the engine.
+    pub fn get_consolidation_candidates(&self) -> Result<Vec<Observation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
+             created_at, is_stale, kind, expires_at \
+             FROM observations \
+             WHERE kind IN ('auto', 'passive') \
+               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+             ORDER BY created_at ASC",
+        )?;
+        let results = stmt
+            .query_map([], row_to_observation)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(results)
