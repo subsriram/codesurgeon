@@ -117,9 +117,10 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE observations ADD COLUMN expires_at TEXT", []);
-        let _ = self
-            .conn
-            .execute("ALTER TABLE observations ADD COLUMN change_category TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE observations ADD COLUMN change_category TEXT",
+            [],
+        );
         // Index may already exist on new databases; ignore error.
         let _ = self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_obs_expires ON observations(expires_at);",

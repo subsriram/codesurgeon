@@ -280,7 +280,10 @@ pub struct SymbolChange {
 
 impl SymbolChange {
     pub fn new(fqn: impl Into<String>, category: &'static str) -> Self {
-        SymbolChange { fqn: fqn.into(), category }
+        SymbolChange {
+            fqn: fqn.into(),
+            category,
+        }
     }
 }
 

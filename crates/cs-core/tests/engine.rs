@@ -1380,7 +1380,11 @@ fn reindex_new_symbol_sets_change_category() {
     engine.index_workspace().unwrap();
 
     // Add a new function.
-    std::fs::write(dir.path().join("lib.py"), "def foo(): pass\ndef bar(): pass\n").unwrap();
+    std::fs::write(
+        dir.path().join("lib.py"),
+        "def foo(): pass\ndef bar(): pass\n",
+    )
+    .unwrap();
     engine
         .reindex_file(&dir.path().join("lib.py"), ChangeKind::Modified)
         .unwrap();
@@ -1404,7 +1408,11 @@ fn reindex_new_symbol_sets_change_category() {
 #[test]
 fn reindex_deleted_symbol_sets_change_category() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("lib.py"), "def foo(): pass\ndef bar(): pass\n").unwrap();
+    std::fs::write(
+        dir.path().join("lib.py"),
+        "def foo(): pass\ndef bar(): pass\n",
+    )
+    .unwrap();
     let engine = test_engine(&dir);
     engine.index_workspace().unwrap();
 
@@ -1475,9 +1483,9 @@ fn reindex_import_sets_dependency_added() {
     let has_dep = obs
         .iter()
         .any(|o| o.change_category.as_deref() == Some("dependency_added"));
-    let has_new = obs.iter().any(|o| {
-        o.change_category.as_deref() == Some("new_symbol") && o.content.contains("os")
-    });
+    let has_new = obs
+        .iter()
+        .any(|o| o.change_category.as_deref() == Some("new_symbol") && o.content.contains("os"));
     // Either dependency_added or the import is absorbed into new_symbol — either is fine,
     // but the observation must not claim a function was added.
     assert!(
