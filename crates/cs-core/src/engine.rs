@@ -12,6 +12,7 @@ use crate::language::Language;
 use crate::macro_expand::run_macro_enrichment;
 use crate::memory::{new_session_id, IndexingConfig, MemoryConfig, MemoryStore};
 use crate::module_docs::{detect_xcode_mcp, swift_enrichment_hint};
+use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
@@ -23,9 +24,9 @@ use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
 use crate::rustdoc_enrich::run_rustdoc_enrichment;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
-use crate::symbol::{EdgeKind, LspEdge, Symbol};
 #[cfg(feature = "embeddings")]
 use crate::symbol::SymbolKind;
+use crate::symbol::{EdgeKind, LspEdge, Symbol};
 use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -34,7 +35,7 @@ use instant_distance::{Builder as HnswBuilder, HnswMap, Search as HnswSearch};
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -87,6 +88,18 @@ pub struct EngineConfig {
     /// Set via `[indexing] rust_rustdoc_types = true` in `config.toml`.
     /// Default: false.
     pub rust_rustdoc_types: bool,
+
+    /// When true, run `pyright --outputjson` and merge resolved type
+    /// annotations into existing Python symbols.
+    /// Set via `[indexing] python_pyright = true` in `config.toml`.
+    /// Default: false.
+    pub python_pyright: bool,
+
+    /// When true, `manifest.json` is omitted from `.codesurgeon/.gitignore`
+    /// so it can be committed and shared.
+    /// Set via `CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true`
+    /// in `config.toml`. Default: false.
+    pub track_manifest: bool,
 }
 
 impl EngineConfig {
@@ -106,6 +119,8 @@ impl EngineConfig {
             index_stubs: true,
             rust_expand_macros: false,
             rust_rustdoc_types: false,
+            python_pyright: false,
+            track_manifest: false,
         }
     }
 
@@ -113,6 +128,19 @@ impl EngineConfig {
         self.load_embedder = false;
         self
     }
+}
+
+// ── Manifest ──────────────────────────────────────────────────────────────────
+
+/// On-disk manifest written to `.codesurgeon/manifest.json` after each full index.
+/// Stores per-file blake3 hashes — enables incremental re-indexing and optional
+/// git-tracking for shared fast-clone workflows.
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    version: u32,
+    workspace: String,
+    updated_at: String,
+    files: HashMap<String, String>,
 }
 
 // ── Output types ──────────────────────────────────────────────────────────────
@@ -130,6 +158,10 @@ pub struct IndexStats {
     /// types and live diagnostics; codesurgeon remains the fallback for semantic search
     /// and session memory.
     pub xcode_mcp_available: bool,
+    /// Number of files recorded in the manifest, if present.
+    pub manifest_file_count: Option<u64>,
+    /// ISO-8601 timestamp from the manifest's `updated_at` field, if present.
+    pub manifest_updated_at: Option<String>,
 }
 
 /// Return value of `get_session_context`.
@@ -250,13 +282,33 @@ impl CoreEngine {
             .join("config.toml");
         let mem_config = MemoryConfig::load_from_toml(&config_path);
         let indexing_config = IndexingConfig::load_from_toml(&config_path);
-        // Apply [indexing] settings onto EngineConfig.
+        // Apply [indexing] / [git] settings onto EngineConfig.
         let mut config = config;
         if indexing_config.rust_expand_macros {
             config.rust_expand_macros = true;
         }
         if indexing_config.rust_rustdoc_types {
             config.rust_rustdoc_types = true;
+        }
+        if indexing_config.python_pyright {
+            config.python_pyright = true;
+        }
+        if indexing_config.track_manifest {
+            config.track_manifest = true;
+        }
+
+        // Write .codesurgeon/.gitignore if absent, excluding index.db always
+        // and manifest.json unless track_manifest is enabled.
+        let gitignore_path = config
+            .workspace_root
+            .join(".codesurgeon")
+            .join(".gitignore");
+        if !gitignore_path.exists() {
+            let mut contents = "index.db\n".to_string();
+            if !config.track_manifest {
+                contents.push_str("manifest.json\n");
+            }
+            let _ = std::fs::write(&gitignore_path, contents);
         }
 
         let memory = Arc::new(Mutex::new(
@@ -394,6 +446,35 @@ impl CoreEngine {
     #[cfg(not(feature = "embeddings"))]
     pub fn load_embedder(&self) {}
 
+    // ── Manifest ──────────────────────────────────────────────────────────────
+
+    fn manifest_path(&self) -> PathBuf {
+        self.config
+            .workspace_root
+            .join(".codesurgeon")
+            .join("manifest.json")
+    }
+
+    /// Write `.codesurgeon/manifest.json` with the current files-table hashes.
+    fn write_manifest(&self) -> Result<()> {
+        let file_hashes = self.db.lock().all_file_hashes()?;
+        let manifest = Manifest {
+            version: 1,
+            workspace: self.config.workspace_root.to_string_lossy().to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            files: file_hashes,
+        };
+        let json = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(self.manifest_path(), json)?;
+        Ok(())
+    }
+
+    /// Read `.codesurgeon/manifest.json`. Returns `None` if absent or unparseable.
+    fn read_manifest(&self) -> Option<Manifest> {
+        let text = std::fs::read_to_string(self.manifest_path()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
     // ── Indexing ──────────────────────────────────────────────────────────────
 
     /// Returns true while index_workspace is running.
@@ -422,17 +503,52 @@ impl CoreEngine {
             tracing::info!("Found {} stub files", stub_files.len());
         }
 
-        // Parse files in parallel with rayon
+        // Load baseline hashes for incremental skip:
+        // - When DB has data: use the files table (handles re-index after git pull/checkout)
+        // - When DB is empty: no baseline — full index required
+        let baseline_hashes: HashMap<String, String> = {
+            let db = self.db.lock();
+            if db.file_count().unwrap_or(0) > 0 {
+                db.all_file_hashes().unwrap_or_default()
+            } else {
+                HashMap::new()
+            }
+        };
+
+        // Parse files in parallel with rayon, skipping files whose hash matches baseline.
         let results: Vec<(PathBuf, String, Vec<Symbol>)> = files
             .par_iter()
             .filter_map(|path| {
                 let content = std::fs::read_to_string(path).ok()?;
+                // Compute hash first — cheap. Skip parse if file hasn't changed.
+                let hash = hash_content(content.as_bytes());
+                let rel = path
+                    .strip_prefix(&self.config.workspace_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                if baseline_hashes
+                    .get(&rel)
+                    .map(|h| h == &hash)
+                    .unwrap_or(false)
+                {
+                    return None; // unchanged — skip
+                }
                 let symbols = index_file(&self.config.workspace_root, path, &content)
                     .ok()
                     .unwrap_or_default();
                 Some((path.clone(), content, symbols))
             })
             .collect();
+
+        let skipped = files.len() - results.len();
+        if skipped > 0 {
+            tracing::info!(
+                "Incremental: skipped {} unchanged file(s), re-indexing {}",
+                skipped,
+                results.len()
+            );
+        }
 
         // Pre-process parsed results into (rel_path, file_hash, symbols) tuples.
         // All of this is lock-free — results is already fully computed.
@@ -561,6 +677,33 @@ impl CoreEngine {
             }
         }
 
+        // ── Pyright Python type enrichment ───────────────────────────────────
+        // Merge resolved return types and inferred type annotations from
+        // `pyright --outputjson` into existing Python symbols.
+        // Gated on Python file stats hash for incremental skipping.
+        if self.config.python_pyright {
+            let enriched_count = {
+                let db = self.db.lock();
+                run_pyright_enrichment(&self.config.workspace_root, &mut all_symbols, &db)
+            };
+            if enriched_count > 0 {
+                tracing::info!(
+                    "pyright-enrich: resolved types for {} symbol(s)",
+                    enriched_count
+                );
+                // Flush updated resolved_type values back to SQLite.
+                let db = self.db.lock();
+                db.begin_transaction()?;
+                for sym in all_symbols
+                    .iter()
+                    .filter(|s| s.source.as_deref() == Some("pyright"))
+                {
+                    db.upsert_symbol(sym)?;
+                }
+                db.commit_transaction()?;
+            }
+        }
+
         // ── Stub file indexing ────────────────────────────────────────────────
         // Parse stub files in parallel, mark every symbol with is_stub=true,
         // then flush to SQLite and update the in-memory graph/search.
@@ -683,6 +826,11 @@ impl CoreEngine {
             self.refresh_embedding_cache();
         }
 
+        // Write manifest after a successful index pass.
+        if let Err(e) = self.write_manifest() {
+            tracing::warn!("Failed to write manifest: {}", e);
+        }
+
         self.index_stats()
     }
 
@@ -696,13 +844,15 @@ impl CoreEngine {
 
         tracing::debug!("Re-indexing file: {} ({:?})", rel, kind);
 
-        // Phase 1: Remove stale db rows (brief, independent db lock).
-        {
+        // Phase 1: Snapshot old symbols + remove stale db rows (same db lock).
+        let old_symbols = {
             let db = self.db.lock();
+            let snap = db.all_symbols_for_file(&rel)?;
             db.delete_file_symbols(&rel)?;
             // LSP edges from this file are now stale; the IDE hook will re-submit after save.
             db.delete_lsp_edges_for_file(&rel)?;
-        }
+            snap
+        };
         // Phase 2: Remove from in-memory graph (brief, independent graph lock).
         {
             self.graph.write().remove_file(&rel);
@@ -716,6 +866,46 @@ impl CoreEngine {
         let content = std::fs::read_to_string(path)?;
         let file_hash = hash_content(content.as_bytes());
         let symbols = index_file(&self.config.workspace_root, path, &content)?;
+
+        // Classify the diff between old and new symbol lists.
+        let changes = {
+            use crate::memory::SymbolChange;
+            use crate::symbol::SymbolKind;
+            use std::collections::HashMap;
+
+            let old_map: HashMap<&str, &crate::symbol::Symbol> =
+                old_symbols.iter().map(|s| (s.fqn.as_str(), s)).collect();
+            let new_map: HashMap<&str, &crate::symbol::Symbol> =
+                symbols.iter().map(|s| (s.fqn.as_str(), s)).collect();
+
+            let mut changes: Vec<SymbolChange> = Vec::new();
+
+            for sym in &symbols {
+                match old_map.get(sym.fqn.as_str()) {
+                    None => {
+                        let cat = if sym.kind == SymbolKind::Import {
+                            "dependency_added"
+                        } else {
+                            "new_symbol"
+                        };
+                        changes.push(SymbolChange::new(&sym.fqn, cat));
+                    }
+                    Some(old) => {
+                        if old.signature != sym.signature {
+                            changes.push(SymbolChange::new(&sym.fqn, "signature_change"));
+                        } else if old.body != sym.body {
+                            changes.push(SymbolChange::new(&sym.fqn, "body_change"));
+                        }
+                    }
+                }
+            }
+            for old in &old_symbols {
+                if !new_map.contains_key(old.fqn.as_str()) {
+                    changes.push(SymbolChange::new(&old.fqn, "deleted_symbol"));
+                }
+            }
+            changes
+        };
 
         // Phase 4: Write new rows to SQLite in one transaction (brief db lock).
         // db lock is acquired fresh here — no overlap with graph/search locks.
@@ -745,8 +935,7 @@ impl CoreEngine {
         // Phase 6: Notify memory of the change (brief, independent memory lock).
         {
             let mut mem = self.memory.lock();
-            let change_summary = format!("{} symbol(s) re-indexed", symbols.len());
-            let _ = mem.record_file_edit(&rel, &change_summary);
+            let _ = mem.record_file_edit(&rel, &changes);
         }
 
         // Phase 7: Re-embed new symbols and refresh cache (brief db lock, no other locks held).
@@ -1186,7 +1375,7 @@ impl CoreEngine {
 
         for lsp in edges {
             // Derive source_file from the from_fqn (everything before the first "::").
-            let source_file = lsp.from_fqn.splitn(2, "::").next().unwrap_or(&lsp.from_fqn);
+            let source_file = lsp.from_fqn.split("::").next().unwrap_or(&lsp.from_fqn);
 
             // Resolve both FQNs to symbol IDs in the current graph.
             let from_id = graph.find_by_fqn(&lsp.from_fqn).map(|s| s.id);
@@ -1223,6 +1412,7 @@ impl CoreEngine {
     /// Index statistics and health.
     pub fn index_stats(&self) -> Result<IndexStats> {
         let db = self.db.lock();
+        let manifest = self.read_manifest();
         Ok(IndexStats {
             symbol_count: db.symbol_count()?,
             edge_count: db.edge_count()?,
@@ -1231,6 +1421,8 @@ impl CoreEngine {
             stub_symbol_count: db.stub_symbol_count()?,
             session_id: self.config.session_id.clone(),
             xcode_mcp_available: detect_xcode_mcp(),
+            manifest_file_count: manifest.as_ref().map(|m| m.files.len() as u64),
+            manifest_updated_at: manifest.map(|m| m.updated_at),
         })
     }
 
@@ -1250,12 +1442,7 @@ impl CoreEngine {
     pub fn get_symbol_snippet(&self, fqn: &str) -> Option<(String, String)> {
         let graph = self.graph.read();
         graph.find_by_fqn(fqn).map(|sym| {
-            let body_preview = sym
-                .body
-                .lines()
-                .take(20)
-                .collect::<Vec<_>>()
-                .join("\n  ");
+            let body_preview = sym.body.lines().take(20).collect::<Vec<_>>().join("\n  ");
             (sym.signature.clone(), body_preview)
         })
     }
@@ -1361,8 +1548,7 @@ impl CoreEngine {
             )
             .with_ttl(&mem_config);
 
-            let ids_to_expire: Vec<String> =
-                cluster_obs.iter().map(|o| o.id.clone()).collect();
+            let ids_to_expire: Vec<String> = cluster_obs.iter().map(|o| o.id.clone()).collect();
             let db = self.db.lock();
             db.insert_observation(&consolidated)?;
             db.expire_observations(&ids_to_expire)?;
@@ -2268,8 +2454,14 @@ mod consolidation_tests {
         );
         assert!(merged.contains("\"fix auth\""), "missing query: {merged}");
         assert!(merged.contains("\"fix login\""), "missing query: {merged}");
-        assert!(merged.contains("mod::auth"), "missing shared pivot: {merged}");
-        assert!(merged.contains("mod::token"), "missing unique pivot: {merged}");
+        assert!(
+            merged.contains("mod::auth"),
+            "missing shared pivot: {merged}"
+        );
+        assert!(
+            merged.contains("mod::token"),
+            "missing unique pivot: {merged}"
+        );
         // mod::auth must appear only once (deduplication)
         assert_eq!(
             merged.matches("mod::auth").count(),
@@ -2308,8 +2500,14 @@ mod consolidation_tests {
             merged.starts_with("[consolidated from 2 observations]"),
             "unexpected prefix: {merged}"
         );
-        assert!(merged.contains("Some free-form note A"), "missing content A: {merged}");
-        assert!(merged.contains("Some free-form note B"), "missing content B: {merged}");
+        assert!(
+            merged.contains("Some free-form note A"),
+            "missing content A: {merged}"
+        );
+        assert!(
+            merged.contains("Some free-form note B"),
+            "missing content B: {merged}"
+        );
     }
 
     /// Cluster of size 1 should produce a valid (if trivial) merged string.

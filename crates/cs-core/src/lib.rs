@@ -10,6 +10,7 @@ pub mod language;
 pub mod macro_expand;
 pub mod memory;
 pub mod module_docs;
+pub mod pyright_enrich;
 pub mod ranking;
 pub mod rustdoc_enrich;
 pub mod search;
