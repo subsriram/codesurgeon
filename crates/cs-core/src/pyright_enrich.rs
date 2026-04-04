@@ -560,4 +560,140 @@ mod tests {
         let count = run_pyright_enrichment(dir.path(), &mut [], &db);
         assert_eq!(count, 0);
     }
+
+    // ── parse_pyright_diagnostics ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_diagnostics_extracts_information_entries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let abs_path = workspace.path().join("src/app.py");
+        let json = serde_json::json!({
+            "generalDiagnostics": [
+                {
+                    "severity": "information",
+                    "file": abs_path.to_str().unwrap(),
+                    "message": "Type of \"compute\" is \"str\"",
+                    "range": { "start": { "line": 4, "character": 0 } }
+                }
+            ]
+        })
+        .to_string();
+        let map = parse_pyright_diagnostics(&json, workspace.path());
+        assert_eq!(map.len(), 1);
+        let key = ("src/app.py".to_string(), 5); // 0-based → 1-based
+        assert_eq!(map[&key].resolved_type, "str");
+    }
+
+    #[test]
+    fn parse_diagnostics_ignores_non_information_severity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let abs_path = workspace.path().join("src/app.py");
+        let json = serde_json::json!({
+            "generalDiagnostics": [
+                {
+                    "severity": "error",
+                    "file": abs_path.to_str().unwrap(),
+                    "message": "Type of \"x\" is \"str\"",
+                    "range": { "start": { "line": 0, "character": 0 } }
+                },
+                {
+                    "severity": "warning",
+                    "file": abs_path.to_str().unwrap(),
+                    "message": "Type of \"y\" is \"int\"",
+                    "range": { "start": { "line": 1, "character": 0 } }
+                }
+            ]
+        })
+        .to_string();
+        let map = parse_pyright_diagnostics(&json, workspace.path());
+        assert!(map.is_empty(), "error/warning diagnostics should be ignored");
+    }
+
+    #[test]
+    fn parse_diagnostics_handles_malformed_json() {
+        let workspace = tempfile::tempdir().unwrap();
+        let map = parse_pyright_diagnostics("not json at all", workspace.path());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_diagnostics_handles_empty_diagnostics_array() {
+        let workspace = tempfile::tempdir().unwrap();
+        let json = r#"{"generalDiagnostics": []}"#;
+        let map = parse_pyright_diagnostics(json, workspace.path());
+        assert!(map.is_empty());
+    }
+
+    // ── python_files_hash ─────────────────────────────────────────────────────
+
+    #[test]
+    fn python_files_hash_changes_when_file_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = python_files_hash(dir.path());
+        std::fs::write(dir.path().join("mod.py"), "def f(): pass").unwrap();
+        let h2 = python_files_hash(dir.path());
+        assert_ne!(h1, h2, "hash must change after adding a .py file");
+    }
+
+    #[test]
+    fn python_files_hash_ignores_non_python_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = python_files_hash(dir.path());
+        std::fs::write(dir.path().join("README.md"), "hello").unwrap();
+        let h2 = python_files_hash(dir.path());
+        assert_eq!(h1, h2, "hash must not change for non-.py files");
+    }
+
+    #[test]
+    fn python_files_hash_skips_pycache_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("__pycache__");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("mod.cpython-311.pyc"), "bytecode").unwrap();
+        // Also write a .py file in __pycache__ (shouldn't happen in practice but
+        // ensures the directory skip is applied before checking extensions)
+        std::fs::write(cache.join("hidden.py"), "").unwrap();
+        let h1 = python_files_hash(dir.path());
+        // Modifying content inside __pycache__ must not affect the hash
+        std::fs::write(cache.join("hidden.py"), "changed").unwrap();
+        let h2 = python_files_hash(dir.path());
+        assert_eq!(h1, h2, "__pycache__ contents must be ignored");
+    }
+
+    // ── incremental cache ─────────────────────────────────────────────────────
+
+    #[test]
+    fn enrichment_cache_hit_returns_zero() {
+        use crate::db::Database;
+        use crate::symbol::Symbol;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Database::open(&db_path).expect("db open");
+
+        // Write a Python file so the hash is non-trivial
+        std::fs::write(dir.path().join("app.py"), "def f(): pass").unwrap();
+        let py_hash = python_files_hash(dir.path());
+
+        // Prime the cache with the current hash
+        db.set_macro_expand_hash("__pyright__", &py_hash).unwrap();
+
+        // Build a Python symbol so Gate 1 passes
+        let mut sym = Symbol::new(
+            "app.py",
+            "f",
+            SymbolKind::Function,
+            1,
+            1,
+            "def f():".to_string(),
+            None,
+            "def f(): pass".to_string(),
+            Language::Python,
+        );
+
+        // Even with pyright not installed, the cache hit gate fires first →
+        // returns 0 without attempting to call pyright.
+        let count = run_pyright_enrichment(dir.path(), std::slice::from_mut(&mut sym), &db);
+        assert_eq!(count, 0, "cache hit should short-circuit to 0");
+        assert!(sym.resolved_type.is_none(), "symbol must not be mutated on cache hit");
+    }
 }
