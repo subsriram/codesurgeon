@@ -220,6 +220,10 @@ pub struct Observation {
     /// RFC-3339 timestamp after which this observation is considered expired.
     /// `None` means it never expires automatically (manual/insight with no TTL set).
     pub expires_at: Option<String>,
+    /// AST-level change category for file-change observations.
+    /// One of: `new_symbol`, `deleted_symbol`, `signature_change`, `body_change`, `dependency_added`.
+    /// `None` for non-file-change observations (manual, auto, consolidated, etc.).
+    pub change_category: Option<String>,
 }
 
 impl Observation {
@@ -244,7 +248,13 @@ impl Observation {
             is_stale: false,
             kind,
             expires_at,
+            change_category: None,
         }
+    }
+
+    pub fn with_change_category(mut self, cat: &str) -> Self {
+        self.change_category = Some(cat.to_string());
+        self
     }
 
     /// Override the default `expires_at` with a value derived from `MemoryConfig`.
@@ -256,6 +266,21 @@ impl Observation {
     pub fn with_agent(mut self, agent_id: &str) -> Self {
         self.agent_id = Some(agent_id.to_string());
         self
+    }
+}
+
+// ── Symbol change classification ──────────────────────────────────────────────
+
+/// One classified change detected during `reindex_file`.
+#[derive(Debug, Clone)]
+pub struct SymbolChange {
+    pub fqn: String,
+    pub category: &'static str,
+}
+
+impl SymbolChange {
+    pub fn new(fqn: impl Into<String>, category: &'static str) -> Self {
+        SymbolChange { fqn: fqn.into(), category }
     }
 }
 
@@ -388,16 +413,65 @@ impl MemoryStore {
     }
 
     /// Record a file edit passively. Auto-generates an observation if thrashing detected.
-    pub fn record_file_edit(&mut self, file_path: &str, change_summary: &str) -> Result<()> {
-        // Passive observation about the change
-        let obs = Observation::new(
+    ///
+    /// `changes` is the classified diff produced by `reindex_file`. When non-empty the
+    /// observation content is a structured breakdown; when empty a generic fallback is used.
+    pub fn record_file_edit(&mut self, file_path: &str, changes: &[SymbolChange]) -> Result<()> {
+        let (content, change_category) = if changes.is_empty() {
+            (format!("File changed: {file_path}"), None)
+        } else {
+            // Priority order for the single top-level category tag.
+            const PRIORITY: &[&str] = &[
+                "new_symbol",
+                "deleted_symbol",
+                "signature_change",
+                "dependency_added",
+                "body_change",
+            ];
+
+            // Group FQNs by category.
+            let mut by_cat: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for sc in changes {
+                by_cat.entry(sc.category).or_default().push(&sc.fqn);
+            }
+
+            // Build a human-readable summary, categories in priority order.
+            let mut parts: Vec<String> = Vec::new();
+            for &cat in PRIORITY {
+                if let Some(fqns) = by_cat.get(cat) {
+                    let listed = if fqns.len() <= 3 {
+                        fqns.join(", ")
+                    } else {
+                        format!("{}, … ({} total)", fqns[..2].join(", "), fqns.len())
+                    };
+                    parts.push(format!("{cat}: {listed}"));
+                }
+            }
+
+            let top_cat = PRIORITY
+                .iter()
+                .find(|&&c| by_cat.contains_key(c))
+                .copied()
+                .unwrap_or("body_change");
+
+            (
+                format!("File changed: {file_path} — {}", parts.join("; ")),
+                Some(top_cat),
+            )
+        };
+
+        let mut obs = Observation::new(
             &self.session_id,
-            &format!("File changed: {} — {}", file_path, change_summary),
+            &content,
             None,
             None,
             ObservationKind::Passive,
         )
         .with_ttl(&self.config);
+        if let Some(cat) = change_category {
+            obs = obs.with_change_category(cat);
+        }
         self.db.lock().insert_observation(&obs)?;
 
         // Check for file thrashing

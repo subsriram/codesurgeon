@@ -732,13 +732,15 @@ impl CoreEngine {
 
         tracing::debug!("Re-indexing file: {} ({:?})", rel, kind);
 
-        // Phase 1: Remove stale db rows (brief, independent db lock).
-        {
+        // Phase 1: Snapshot old symbols + remove stale db rows (same db lock).
+        let old_symbols = {
             let db = self.db.lock();
+            let snap = db.all_symbols_for_file(&rel)?;
             db.delete_file_symbols(&rel)?;
             // LSP edges from this file are now stale; the IDE hook will re-submit after save.
             db.delete_lsp_edges_for_file(&rel)?;
-        }
+            snap
+        };
         // Phase 2: Remove from in-memory graph (brief, independent graph lock).
         {
             self.graph.write().remove_file(&rel);
@@ -752,6 +754,46 @@ impl CoreEngine {
         let content = std::fs::read_to_string(path)?;
         let file_hash = hash_content(content.as_bytes());
         let symbols = index_file(&self.config.workspace_root, path, &content)?;
+
+        // Classify the diff between old and new symbol lists.
+        let changes = {
+            use crate::memory::SymbolChange;
+            use crate::symbol::SymbolKind;
+            use std::collections::HashMap;
+
+            let old_map: HashMap<&str, &crate::symbol::Symbol> =
+                old_symbols.iter().map(|s| (s.fqn.as_str(), s)).collect();
+            let new_map: HashMap<&str, &crate::symbol::Symbol> =
+                symbols.iter().map(|s| (s.fqn.as_str(), s)).collect();
+
+            let mut changes: Vec<SymbolChange> = Vec::new();
+
+            for sym in &symbols {
+                match old_map.get(sym.fqn.as_str()) {
+                    None => {
+                        let cat = if sym.kind == SymbolKind::Import {
+                            "dependency_added"
+                        } else {
+                            "new_symbol"
+                        };
+                        changes.push(SymbolChange::new(&sym.fqn, cat));
+                    }
+                    Some(old) => {
+                        if old.signature != sym.signature {
+                            changes.push(SymbolChange::new(&sym.fqn, "signature_change"));
+                        } else if old.body != sym.body {
+                            changes.push(SymbolChange::new(&sym.fqn, "body_change"));
+                        }
+                    }
+                }
+            }
+            for old in &old_symbols {
+                if !new_map.contains_key(old.fqn.as_str()) {
+                    changes.push(SymbolChange::new(&old.fqn, "deleted_symbol"));
+                }
+            }
+            changes
+        };
 
         // Phase 4: Write new rows to SQLite in one transaction (brief db lock).
         // db lock is acquired fresh here — no overlap with graph/search locks.
@@ -781,8 +823,7 @@ impl CoreEngine {
         // Phase 6: Notify memory of the change (brief, independent memory lock).
         {
             let mut mem = self.memory.lock();
-            let change_summary = format!("{} symbol(s) re-indexed", symbols.len());
-            let _ = mem.record_file_edit(&rel, &change_summary);
+            let _ = mem.record_file_edit(&rel, &changes);
         }
 
         // Phase 7: Re-embed new symbols and refresh cache (brief db lock, no other locks held).
