@@ -81,6 +81,9 @@ impl ObservationKind {
 /// rust_expand_macros  = true
 /// rust_rustdoc_types  = true
 /// python_pyright      = true
+///
+/// [git]
+/// track_manifest = true
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct IndexingConfig {
@@ -104,6 +107,12 @@ pub struct IndexingConfig {
     /// Re-run is gated on a hash of Python file stats — skipped when unchanged.
     /// Default: false.
     pub python_pyright: bool,
+
+    /// When true, omit `manifest.json` from `.codesurgeon/.gitignore` so it
+    /// can be committed and shared across clones.
+    /// Set via `CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true`
+    /// in `config.toml`. Default: false (manifest.json is gitignored).
+    pub track_manifest: bool,
 }
 
 impl IndexingConfig {
@@ -126,6 +135,15 @@ impl IndexingConfig {
             if let Some(v) = indexing.get("python_pyright").and_then(|v| v.as_bool()) {
                 cfg.python_pyright = v;
             }
+        }
+        if let Some(git) = table.get("git").and_then(|v| v.as_table()) {
+            if let Some(v) = git.get("track_manifest").and_then(|v| v.as_bool()) {
+                cfg.track_manifest = v;
+            }
+        }
+        // CS_TRACK_MANIFEST env var overrides config.toml
+        if std::env::var("CS_TRACK_MANIFEST").as_deref() == Ok("1") {
+            cfg.track_manifest = true;
         }
         cfg
     }

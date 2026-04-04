@@ -926,6 +926,13 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
                 ));
             }
             status.push_str(&format!("- Session: {}\n", stats.session_id));
+            if let Some(updated_at) = &stats.manifest_updated_at {
+                let file_count = stats.manifest_file_count.unwrap_or(0);
+                status.push_str(&format!(
+                    "- Manifest: {} file(s), written {}\n",
+                    file_count, updated_at
+                ));
+            }
             status.push_str(xcode_line);
             Ok(status)
         }

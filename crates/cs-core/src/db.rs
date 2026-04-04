@@ -3,6 +3,7 @@ use crate::memory::Observation;
 use crate::symbol::{Edge, EdgeKind, Symbol, SymbolKind};
 use anyhow::Result;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct Database {
@@ -351,6 +352,18 @@ impl Database {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// Return all (path, content_hash) pairs from the files table.
+    pub fn all_file_hashes(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, content_hash FROM files")?;
+        let map = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(map)
     }
 
     // ── Embeddings ────────────────────────────────────────────────────────────
