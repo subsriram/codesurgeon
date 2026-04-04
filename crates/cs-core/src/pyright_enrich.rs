@@ -53,10 +53,7 @@ pub fn run_pyright_enrichment(
     db: &Database,
 ) -> usize {
     // Gate 1: must have Python symbols to enrich
-    if !all_symbols
-        .iter()
-        .any(|s| s.language == Language::Python)
-    {
+    if !all_symbols.iter().any(|s| s.language == Language::Python) {
         return 0;
     }
 
@@ -137,10 +134,7 @@ fn collect_py_stats(dir: &Path, parts: &mut Vec<String>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // Skip hidden dirs and common virtual-env / cache directories
             if name.starts_with('.')
                 || name == "node_modules"
@@ -217,28 +211,19 @@ fn parse_pyright_diagnostics(
         return map;
     };
 
-    let Some(diags) = root
-        .get("generalDiagnostics")
-        .and_then(|v| v.as_array())
-    else {
+    let Some(diags) = root.get("generalDiagnostics").and_then(|v| v.as_array()) else {
         return map;
     };
 
     for diag in diags {
-        let severity = diag
-            .get("severity")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let severity = diag.get("severity").and_then(|v| v.as_str()).unwrap_or("");
         // Only information-level diagnostics carry inferred-type messages
         if severity != "information" {
             continue;
         }
 
         let file = diag.get("file").and_then(|v| v.as_str()).unwrap_or("");
-        let message = diag
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let message = diag.get("message").and_then(|v| v.as_str()).unwrap_or("");
         // pyright reports 0-based lines; we store 1-based to match Symbol::start_line
         let line = diag
             .pointer("/range/start/line")
@@ -421,9 +406,7 @@ mod tests {
     fn extract_return_type_callable_default() {
         // Signature contains "->" inside a default value; rfind picks the last one
         assert_eq!(
-            extract_return_type_from_sig(
-                "def f(cb: Callable[[], int] = lambda: 0) -> str:"
-            ),
+            extract_return_type_from_sig("def f(cb: Callable[[], int] = lambda: 0) -> str:"),
             Some("str".to_string())
         );
     }
@@ -544,10 +527,7 @@ mod tests {
         let diag_map = HashMap::new();
         let count = merge_pyright_types(std::slice::from_mut(&mut sym), &diag_map);
         assert_eq!(count, 1);
-        assert_eq!(
-            sym.resolved_type.as_deref(),
-            Some("APIView, LogMixin")
-        );
+        assert_eq!(sym.resolved_type.as_deref(), Some("APIView, LogMixin"));
     }
 
     #[test]
@@ -606,7 +586,10 @@ mod tests {
         })
         .to_string();
         let map = parse_pyright_diagnostics(&json, workspace.path());
-        assert!(map.is_empty(), "error/warning diagnostics should be ignored");
+        assert!(
+            map.is_empty(),
+            "error/warning diagnostics should be ignored"
+        );
     }
 
     #[test]
@@ -694,6 +677,9 @@ mod tests {
         // returns 0 without attempting to call pyright.
         let count = run_pyright_enrichment(dir.path(), std::slice::from_mut(&mut sym), &db);
         assert_eq!(count, 0, "cache hit should short-circuit to 0");
-        assert!(sym.resolved_type.is_none(), "symbol must not be mutated on cache hit");
+        assert!(
+            sym.resolved_type.is_none(),
+            "symbol must not be mutated on cache hit"
+        );
     }
 }
