@@ -777,11 +777,7 @@ fn format_observations(
                 ));
                 if let Some(fqn) = &o.symbol_fqn {
                     if let Some((sig, body)) = engine.get_symbol_snippet(fqn) {
-                        out.push_str(&format!(
-                            "  ```\n  {}\n  {}\n  ```\n",
-                            sig.trim(),
-                            body
-                        ));
+                        out.push_str(&format!("  ```\n  {}\n  {}\n  ```\n", sig.trim(), body));
                     }
                 }
             }

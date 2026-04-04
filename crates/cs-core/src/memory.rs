@@ -599,7 +599,10 @@ mod obs_kind_tests {
     #[test]
     fn consolidated_expires_at_is_set_on_new() {
         let obs = Observation::new("s", "content", None, None, ObservationKind::Consolidated);
-        assert!(obs.expires_at.is_some(), "Consolidated must have an expires_at");
+        assert!(
+            obs.expires_at.is_some(),
+            "Consolidated must have an expires_at"
+        );
     }
 
     /// expires_at() on MemoryConfig should assign a non-None TTL for Consolidated.
