@@ -865,7 +865,7 @@ effort, risk, dogfooding opportunity (can codesurgeon benefit on itself immediat
 | 11 | 9d Memory consolidation | Med | Deduplicates auto-observations; depends on 9b compression being in place |
 | 12 | 7d pyright | Low-med | Fallback for non-IDE Python users after `submit_lsp_edges` lands |
 | 13 | 9e Richer AST change categories | Med | Improves observation quality; depends on 9a auto-capture |
-| 14 | 10a Manifest + 10c opt-out | Low | Incremental rebuild on clone; almost free given existing blake3/files table |
+| ✅ done | 10a Manifest + 10c opt-out | Low | Incremental rebuild on clone; almost free given existing blake3/files table |
 | 15 | 11c+d Local observability (stats CLI + `get_stats`) | Low | `query_log` table + `codesurgeon stats`; makes token savings concrete and visible |
 | 16 | Phase 6 distribution | Med | `cargo install` / Homebrew; gate on product maturity |
 | 17 | 7c TS compiler shim | Med | Lower priority — `submit_lsp_edges` covers VS Code TS users |
@@ -979,11 +979,13 @@ so there's something to enrich.
 
 ---
 
-**#14 — 10a Manifest + 10c opt-out** · Low effort
-Serialise the existing `files` table to `.codesurgeon/manifest.json` after each index pass.
-On a fresh clone with no `index.db`, read the manifest and re-index only files whose hashes
-differ — seconds instead of a full re-index. `CS_TRACK_MANIFEST=false` to opt out. Almost
-entirely free given blake3 hashing and incremental re-indexing are already in place.
+**✅ done — 10a Manifest + 10c opt-out** · issue #14
+`.codesurgeon/manifest.json` written after each index pass (file path → blake3 hash).
+Incremental re-indexing: subsequent `index_workspace` calls skip files whose hash matches the
+DB, updating only changed files. `.codesurgeon/.gitignore` auto-written on first run —
+excludes `index.db` always, excludes `manifest.json` by default (opt-in to git-tracking via
+`CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true` in `config.toml`).
+`index_status` reports manifest file count and timestamp.
 
 ---
 
@@ -1127,7 +1129,7 @@ unchanged files. The manifest is effectively the `files` table serialised to JSO
 
 ---
 
-#### 10a — Manifest file: `.codesurgeon/manifest.json` (Low effort)
+#### 10a — Manifest file: `.codesurgeon/manifest.json` ✅ (Low effort)
 
 After each index pass, write a `manifest.json` alongside `index.db`:
 
@@ -1187,11 +1189,12 @@ result to `%A`. Exit 0 on success, 1 if it cannot resolve.
 
 ---
 
-#### 10c — Auto-commit index equivalent: `CS_TRACK_MANIFEST` (Low effort)
+#### 10c — `CS_TRACK_MANIFEST` opt-in ✅ (Low effort)
 
-Environment variable (default: `true`) to opt out of manifest tracking — for users who
-prefer to gitignore `.codesurgeon/` entirely. When `false`, `write_manifest()` is skipped
-and the `.codesurgeon/` directory is not expected to be git-tracked.
+`CS_TRACK_MANIFEST=1` env var (or `[git] track_manifest = true` in `config.toml`) opts in
+to git-tracking the manifest. Off by default — `.codesurgeon/.gitignore` excludes
+`manifest.json` unless the opt-in is set. Users who want shared manifests set the flag and
+commit `.codesurgeon/manifest.json` explicitly.
 
 ---
 

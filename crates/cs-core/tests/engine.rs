@@ -1493,3 +1493,123 @@ fn reindex_import_sets_dependency_added() {
         "re-indexing after adding an import must produce at least one classified observation"
     );
 }
+
+// ── Manifest tests ────────────────────────────────────────────────────────────
+
+/// After `index_workspace`, a manifest.json must exist in `.codesurgeon/`.
+#[test]
+fn manifest_written_after_index() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn hello() {}\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    let manifest_path = dir.path().join(".codesurgeon").join("manifest.json");
+    assert!(manifest_path.exists(), "manifest.json should be written");
+
+    let text = std::fs::read_to_string(&manifest_path).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(manifest["version"], 1);
+    assert!(manifest["files"].is_object(), "files should be an object");
+    assert!(
+        manifest["files"]["lib.rs"].is_string(),
+        "lib.rs should appear in manifest"
+    );
+}
+
+/// `index_stats` reports manifest file count and timestamp when manifest is present.
+#[test]
+fn index_stats_reports_manifest_info() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "def foo(): pass\n").unwrap();
+    std::fs::write(dir.path().join("util.py"), "def bar(): pass\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    let stats = engine.index_stats().expect("index_stats failed");
+    assert!(
+        stats.manifest_file_count.is_some(),
+        "manifest_file_count should be Some after index"
+    );
+    assert!(
+        stats.manifest_updated_at.is_some(),
+        "manifest_updated_at should be Some after index"
+    );
+    // Manifest should account for all indexed source files
+    assert_eq!(
+        stats.manifest_file_count.unwrap(),
+        stats.file_count,
+        "manifest file count should match DB file count"
+    );
+}
+
+/// Second `index_workspace` call should skip unchanged files (incremental).
+#[test]
+fn incremental_index_skips_unchanged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn stable() {}\n").unwrap();
+    std::fs::write(dir.path().join("other.rs"), "pub fn other() {}\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("first index failed");
+
+    let stats_before = engine.index_stats().expect("stats failed");
+    let count_before = stats_before.symbol_count;
+
+    // Modify one file and re-index
+    std::fs::write(dir.path().join("other.rs"), "pub fn other() {}\npub fn new_fn() {}\n")
+        .unwrap();
+    engine.index_workspace().expect("second index failed");
+
+    let stats_after = engine.index_stats().expect("stats failed");
+    // new_fn was added — symbol count should increase
+    assert!(
+        stats_after.symbol_count > count_before,
+        "new symbol should be picked up"
+    );
+    // stable() was unchanged — should still be present
+    let out = engine
+        .run_pipeline("stable", Some(2000), None, None)
+        .expect("run_pipeline failed");
+    assert!(out.contains("stable"), "unchanged symbol should still be indexed");
+}
+
+/// `.codesurgeon/.gitignore` is created on `CoreEngine::new()` and excludes manifest.json
+/// by default (track_manifest = false).
+#[test]
+fn gitignore_written_on_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir);
+    drop(engine); // ensure new() completes
+
+    let gitignore = dir.path().join(".codesurgeon").join(".gitignore");
+    assert!(gitignore.exists(), ".gitignore should be created");
+    let contents = std::fs::read_to_string(&gitignore).unwrap();
+    assert!(contents.contains("index.db"), "should exclude index.db");
+    assert!(
+        contents.contains("manifest.json"),
+        "should exclude manifest.json by default"
+    );
+}
+
+/// With `track_manifest = true`, `.gitignore` must NOT exclude `manifest.json`.
+#[test]
+fn gitignore_omits_manifest_when_tracked() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cs_core::EngineConfig {
+        track_manifest: true,
+        ..cs_core::EngineConfig::new(dir.path()).without_embedder()
+    };
+    let engine = cs_core::CoreEngine::new(config).expect("engine init failed");
+    drop(engine);
+
+    let gitignore = dir.path().join(".codesurgeon").join(".gitignore");
+    let contents = std::fs::read_to_string(&gitignore).unwrap();
+    assert!(contents.contains("index.db"), "should still exclude index.db");
+    assert!(
+        !contents.contains("manifest.json"),
+        "manifest.json should not be excluded when track_manifest=true"
+    );
+}

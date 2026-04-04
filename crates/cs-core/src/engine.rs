@@ -35,6 +35,7 @@ use instant_distance::{Builder as HnswBuilder, HnswMap, Search as HnswSearch};
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -92,6 +93,12 @@ pub struct EngineConfig {
     /// Set via `[indexing] python_pyright = true` in `config.toml`.
     /// Default: false.
     pub python_pyright: bool,
+
+    /// When true, `manifest.json` is omitted from `.codesurgeon/.gitignore`
+    /// so it can be committed and shared.
+    /// Set via `CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true`
+    /// in `config.toml`. Default: false.
+    pub track_manifest: bool,
 }
 
 impl EngineConfig {
@@ -112,6 +119,7 @@ impl EngineConfig {
             rust_expand_macros: false,
             rust_rustdoc_types: false,
             python_pyright: false,
+            track_manifest: false,
         }
     }
 
@@ -119,6 +127,19 @@ impl EngineConfig {
         self.load_embedder = false;
         self
     }
+}
+
+// ── Manifest ──────────────────────────────────────────────────────────────────
+
+/// On-disk manifest written to `.codesurgeon/manifest.json` after each full index.
+/// Stores per-file blake3 hashes — enables incremental re-indexing and optional
+/// git-tracking for shared fast-clone workflows.
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    version: u32,
+    workspace: String,
+    updated_at: String,
+    files: HashMap<String, String>,
 }
 
 // ── Output types ──────────────────────────────────────────────────────────────
@@ -136,6 +157,10 @@ pub struct IndexStats {
     /// types and live diagnostics; codesurgeon remains the fallback for semantic search
     /// and session memory.
     pub xcode_mcp_available: bool,
+    /// Number of files recorded in the manifest, if present.
+    pub manifest_file_count: Option<u64>,
+    /// ISO-8601 timestamp from the manifest's `updated_at` field, if present.
+    pub manifest_updated_at: Option<String>,
 }
 
 /// Return value of `get_session_context`.
@@ -256,7 +281,7 @@ impl CoreEngine {
             .join("config.toml");
         let mem_config = MemoryConfig::load_from_toml(&config_path);
         let indexing_config = IndexingConfig::load_from_toml(&config_path);
-        // Apply [indexing] settings onto EngineConfig.
+        // Apply [indexing] / [git] settings onto EngineConfig.
         let mut config = config;
         if indexing_config.rust_expand_macros {
             config.rust_expand_macros = true;
@@ -266,6 +291,23 @@ impl CoreEngine {
         }
         if indexing_config.python_pyright {
             config.python_pyright = true;
+        }
+        if indexing_config.track_manifest {
+            config.track_manifest = true;
+        }
+
+        // Write .codesurgeon/.gitignore if absent, excluding index.db always
+        // and manifest.json unless track_manifest is enabled.
+        let gitignore_path = config
+            .workspace_root
+            .join(".codesurgeon")
+            .join(".gitignore");
+        if !gitignore_path.exists() {
+            let mut contents = "index.db\n".to_string();
+            if !config.track_manifest {
+                contents.push_str("manifest.json\n");
+            }
+            let _ = std::fs::write(&gitignore_path, contents);
         }
 
         let memory = Arc::new(Mutex::new(
@@ -403,6 +445,36 @@ impl CoreEngine {
     #[cfg(not(feature = "embeddings"))]
     pub fn load_embedder(&self) {}
 
+    // ── Manifest ──────────────────────────────────────────────────────────────
+
+    fn manifest_path(&self) -> PathBuf {
+        self.config
+            .workspace_root
+            .join(".codesurgeon")
+            .join("manifest.json")
+    }
+
+    /// Write `.codesurgeon/manifest.json` with the current files-table hashes.
+    fn write_manifest(&self) -> Result<()> {
+        let file_hashes = self.db.lock().all_file_hashes()?;
+        let manifest = Manifest {
+            version: 1,
+            workspace: self.config.workspace_root.to_string_lossy().to_string(),
+            updated_at: chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            files: file_hashes,
+        };
+        let json = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(self.manifest_path(), json)?;
+        Ok(())
+    }
+
+    /// Read `.codesurgeon/manifest.json`. Returns `None` if absent or unparseable.
+    fn read_manifest(&self) -> Option<Manifest> {
+        let text = std::fs::read_to_string(self.manifest_path()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
     // ── Indexing ──────────────────────────────────────────────────────────────
 
     /// Returns true while index_workspace is running.
@@ -431,17 +503,48 @@ impl CoreEngine {
             tracing::info!("Found {} stub files", stub_files.len());
         }
 
-        // Parse files in parallel with rayon
+        // Load baseline hashes for incremental skip:
+        // - When DB has data: use the files table (handles re-index after git pull/checkout)
+        // - When DB is empty: no baseline — full index required
+        let baseline_hashes: HashMap<String, String> = {
+            let db = self.db.lock();
+            if db.file_count().unwrap_or(0) > 0 {
+                db.all_file_hashes().unwrap_or_default()
+            } else {
+                HashMap::new()
+            }
+        };
+
+        // Parse files in parallel with rayon, skipping files whose hash matches baseline.
         let results: Vec<(PathBuf, String, Vec<Symbol>)> = files
             .par_iter()
             .filter_map(|path| {
                 let content = std::fs::read_to_string(path).ok()?;
+                // Compute hash first — cheap. Skip parse if file hasn't changed.
+                let hash = hash_content(content.as_bytes());
+                let rel = path
+                    .strip_prefix(&self.config.workspace_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                if baseline_hashes.get(&rel).map(|h| h == &hash).unwrap_or(false) {
+                    return None; // unchanged — skip
+                }
                 let symbols = index_file(&self.config.workspace_root, path, &content)
                     .ok()
                     .unwrap_or_default();
                 Some((path.clone(), content, symbols))
             })
             .collect();
+
+        let skipped = files.len() - results.len();
+        if skipped > 0 {
+            tracing::info!(
+                "Incremental: skipped {} unchanged file(s), re-indexing {}",
+                skipped,
+                results.len()
+            );
+        }
 
         // Pre-process parsed results into (rel_path, file_hash, symbols) tuples.
         // All of this is lock-free — results is already fully computed.
@@ -717,6 +820,11 @@ impl CoreEngine {
             }
             tracing::info!("Embeddings stored for {} symbols", all_symbols.len());
             self.refresh_embedding_cache();
+        }
+
+        // Write manifest after a successful index pass.
+        if let Err(e) = self.write_manifest() {
+            tracing::warn!("Failed to write manifest: {}", e);
         }
 
         self.index_stats()
@@ -1143,6 +1251,7 @@ impl CoreEngine {
     /// Index statistics and health.
     pub fn index_stats(&self) -> Result<IndexStats> {
         let db = self.db.lock();
+        let manifest = self.read_manifest();
         Ok(IndexStats {
             symbol_count: db.symbol_count()?,
             edge_count: db.edge_count()?,
@@ -1151,6 +1260,8 @@ impl CoreEngine {
             stub_symbol_count: db.stub_symbol_count()?,
             session_id: self.config.session_id.clone(),
             xcode_mcp_available: detect_xcode_mcp(),
+            manifest_file_count: manifest.as_ref().map(|m| m.files.len() as u64),
+            manifest_updated_at: manifest.map(|m| m.updated_at),
         })
     }
 
