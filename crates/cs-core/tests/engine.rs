@@ -1388,20 +1388,46 @@ fn get_stats_empty_log_returns_no_data_message() {
 #[test]
 fn get_stats_counts_logged_queries() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("lib.rs"), "pub fn foo() {}\npub fn bar() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn foo() {}\npub fn bar() {}\n",
+    )
+    .unwrap();
     let engine = test_engine(&dir);
     engine.index_workspace().expect("index failed");
 
-    engine.run_pipeline("fix bug in foo", Some(500), None, None).unwrap();
-    engine.run_pipeline("add new feature bar", Some(500), None, None).unwrap();
-    engine.run_pipeline("refactor foo and bar", Some(500), None, None).unwrap();
+    engine
+        .run_pipeline("fix bug in foo", Some(500), None, None)
+        .unwrap();
+    engine
+        .run_pipeline("add new feature bar", Some(500), None, None)
+        .unwrap();
+    engine
+        .run_pipeline("refactor foo and bar", Some(500), None, None)
+        .unwrap();
 
     let out = engine.get_stats(Some(30)).expect("get_stats failed");
-    assert!(out.contains("Total queries:        3"), "wrong count: {}", out);
-    assert!(out.contains("Token savings:"), "missing savings line: {}", out);
+    assert!(
+        out.contains("Total queries:        3"),
+        "wrong count: {}",
+        out
+    );
+    assert!(
+        out.contains("Token savings:"),
+        "missing savings line: {}",
+        out
+    );
     assert!(out.contains("Latency"), "missing latency section: {}", out);
-    assert!(out.contains("Intent breakdown"), "missing intent section: {}", out);
-    assert!(out.contains("Language distribution"), "missing lang section: {}", out);
+    assert!(
+        out.contains("Intent breakdown"),
+        "missing intent section: {}",
+        out
+    );
+    assert!(
+        out.contains("Language distribution"),
+        "missing lang section: {}",
+        out
+    );
 }
 
 /// `get_stats` with a very large `days` value must still return data logged moments ago.
@@ -1411,7 +1437,9 @@ fn get_stats_large_days_includes_recent_queries() {
     std::fs::write(dir.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
     let engine = test_engine(&dir);
     engine.index_workspace().unwrap();
-    engine.run_pipeline("fix foo", Some(500), None, None).unwrap();
+    engine
+        .run_pipeline("fix foo", Some(500), None, None)
+        .unwrap();
 
     let out = engine.get_stats(Some(9999)).expect("get_stats failed");
     assert!(
@@ -1434,7 +1462,9 @@ fn get_stats_savings_pct_in_valid_range() {
     engine.index_workspace().unwrap();
 
     for _ in 0..5 {
-        engine.run_pipeline("fix alpha", Some(200), None, None).unwrap();
+        engine
+            .run_pipeline("fix alpha", Some(200), None, None)
+            .unwrap();
     }
 
     let out = engine.get_stats(Some(30)).unwrap();
@@ -1447,7 +1477,10 @@ fn get_stats_savings_pct_in_valid_range() {
         .split_whitespace()
         .find(|t| t.ends_with('%'))
         .expect("no % token");
-    let pct: f64 = pct_str.trim_end_matches('%').parse().expect("non-numeric %");
+    let pct: f64 = pct_str
+        .trim_end_matches('%')
+        .parse()
+        .expect("non-numeric %");
     assert!(
         pct >= 0.0 && pct <= 100.0,
         "savings % out of range: {}",
