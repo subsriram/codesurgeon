@@ -730,30 +730,21 @@ impl Database {
 
     // ── Query log ─────────────────────────────────────────────────────────────
 
-    pub fn log_query(
-        &self,
-        timestamp: &str,
-        task: &str,
-        intent: &str,
-        pivot_count: usize,
-        total_tokens: u32,
-        candidate_file_tokens: u64,
-        latency_ms: u64,
-        languages_hit: &str,
-    ) -> Result<()> {
+    pub fn log_query(&self, entry: &QueryLogEntry) -> Result<()> {
         self.conn.execute(
             "INSERT INTO query_log \
-             (timestamp, task, intent, pivot_count, total_tokens, candidate_file_tokens, latency_ms, languages_hit) \
+             (timestamp, task, intent, pivot_count, total_tokens, \
+              candidate_file_tokens, latency_ms, languages_hit) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
-                timestamp,
-                task,
-                intent,
-                pivot_count as i64,
-                total_tokens as i64,
-                candidate_file_tokens as i64,
-                latency_ms as i64,
-                languages_hit,
+                entry.timestamp,
+                entry.task,
+                entry.intent,
+                entry.pivot_count as i64,
+                entry.total_tokens as i64,
+                entry.candidate_file_tokens as i64,
+                entry.latency_ms as i64,
+                entry.languages_hit,
             ],
         )?;
         Ok(())
@@ -787,13 +778,25 @@ impl Database {
 
     /// Total token estimate across all indexed symbols (rough workspace baseline).
     pub fn workspace_token_estimate(&self) -> Result<u64> {
-        let bytes: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(SUM(LENGTH(body)), 0) FROM symbols", [], |r| {
-                r.get(0)
-            })?;
+        let bytes: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(body)), 0) FROM symbols",
+            [],
+            |r| r.get(0),
+        )?;
         Ok((bytes as u64) / 4)
     }
+}
+
+/// Input record for `Database::log_query`.
+pub struct QueryLogEntry<'a> {
+    pub timestamp: &'a str,
+    pub task: &'a str,
+    pub intent: &'a str,
+    pub pivot_count: usize,
+    pub total_tokens: u32,
+    pub candidate_file_tokens: u64,
+    pub latency_ms: u64,
+    pub languages_hit: &'a str,
 }
 
 pub struct QueryLogRow {
@@ -951,16 +954,16 @@ mod tests {
     #[test]
     fn log_query_round_trip() {
         let (db, _dir) = open_temp_db();
-        db.log_query(
-            "2026-01-01T00:00:00Z",
-            "fix auth bug",
-            "debug",
-            3,
-            400,
-            2000,
-            120,
-            "rs",
-        )
+        db.log_query(&QueryLogEntry {
+            timestamp: "2026-01-01T00:00:00Z",
+            task: "fix auth bug",
+            intent: "debug",
+            pivot_count: 3,
+            total_tokens: 400,
+            candidate_file_tokens: 2000,
+            latency_ms: 120,
+            languages_hit: "rs",
+        })
         .unwrap();
 
         let rows = db.query_log_rows(365).unwrap();
@@ -977,8 +980,17 @@ mod tests {
     #[test]
     fn query_log_rows_zero_days_returns_empty() {
         let (db, _dir) = open_temp_db();
-        db.log_query("2026-01-01T00:00:00Z", "task", "general", 1, 100, 500, 50, "rs")
-            .unwrap();
+        db.log_query(&QueryLogEntry {
+            timestamp: "2026-01-01T00:00:00Z",
+            task: "task",
+            intent: "general",
+            pivot_count: 1,
+            total_tokens: 100,
+            candidate_file_tokens: 500,
+            latency_ms: 50,
+            languages_hit: "rs",
+        })
+        .unwrap();
         let rows = db.query_log_rows(0).unwrap();
         assert!(rows.is_empty(), "expected no rows for 0-day window");
     }
@@ -989,8 +1001,17 @@ mod tests {
         let (db, _dir) = open_temp_db();
         let now = chrono::Utc::now().to_rfc3339();
         for i in 0..5u64 {
-            db.log_query(&now, "task", "add", 1, 100 + i as u32, 500, 50 + i, "ts")
-                .unwrap();
+            db.log_query(&QueryLogEntry {
+                timestamp: &now,
+                task: "task",
+                intent: "add",
+                pivot_count: 1,
+                total_tokens: 100 + i as u32,
+                candidate_file_tokens: 500,
+                latency_ms: 50 + i,
+                languages_hit: "ts",
+            })
+            .unwrap();
         }
         let rows = db.query_log_rows(30).unwrap();
         assert_eq!(rows.len(), 5);

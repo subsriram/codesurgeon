@@ -39,9 +39,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 #[cfg(feature = "embeddings")]
 use std::sync::OnceLock;
+use std::time::Instant;
 
 #[cfg(feature = "embeddings")]
 fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
@@ -1033,8 +1033,11 @@ impl CoreEngine {
         }
 
         // Log query metrics.
-        let unique_files: HashSet<&str> =
-            capsule.pivots.iter().map(|p| p.file_path.as_str()).collect();
+        let unique_files: HashSet<&str> = capsule
+            .pivots
+            .iter()
+            .map(|p| p.file_path.as_str())
+            .collect();
         let candidate_file_tokens: u64 = {
             let db = self.db.lock();
             unique_files
@@ -1060,16 +1063,16 @@ impl CoreEngine {
         langs.sort();
         let languages_hit = langs.join(",");
         let timestamp = chrono::Utc::now().to_rfc3339();
-        if let Err(e) = self.db.lock().log_query(
-            &timestamp,
+        if let Err(e) = self.db.lock().log_query(&crate::db::QueryLogEntry {
+            timestamp: &timestamp,
             task,
-            intent.as_str(),
-            capsule.stats.pivot_count,
-            capsule.stats.total_tokens,
+            intent: intent.as_str(),
+            pivot_count: capsule.stats.pivot_count,
+            total_tokens: capsule.stats.total_tokens,
             candidate_file_tokens,
             latency_ms,
-            &languages_hit,
-        ) {
+            languages_hit: &languages_hit,
+        }) {
             tracing::warn!("query log failed: {}", e);
         }
 
