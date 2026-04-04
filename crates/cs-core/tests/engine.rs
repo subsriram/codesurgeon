@@ -218,7 +218,7 @@ fn get_skeleton_max_depth_filters_nested_symbols() {
         "max_depth=1 should have fewer symbols than unrestricted"
     );
     for sym in &shallow.symbols {
-        let after_file = sym.fqn.splitn(2, "::").nth(1).unwrap_or("");
+        let after_file = sym.fqn.split_once("::").map(|x| x.1).unwrap_or("");
         assert!(
             !after_file.contains("::"),
             "depth-1 symbol has nested FQN: {}",
@@ -1023,11 +1023,7 @@ fn indexing_config_reads_python_pyright() {
     use cs_core::memory::IndexingConfig;
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[indexing]\npython_pyright = true\n",
-    )
-    .unwrap();
+    std::fs::write(&config_path, "[indexing]\npython_pyright = true\n").unwrap();
     let cfg = IndexingConfig::load_from_toml(&config_path);
     assert!(cfg.python_pyright, "python_pyright should be true");
 }
@@ -1084,13 +1080,8 @@ fn search_memory_returns_empty_for_no_match() {
         .save_observation("completely unrelated observation", None)
         .unwrap();
 
-    let results = engine
-        .search_memory("xyzzy frobulate", None)
-        .unwrap();
-    assert!(
-        results.is_empty(),
-        "expected no results for nonsense query"
-    );
+    let results = engine.search_memory("xyzzy frobulate", None).unwrap();
+    assert!(results.is_empty(), "expected no results for nonsense query");
 }
 
 /// `search_memory` ranks observations with more matching terms higher.
@@ -1100,9 +1091,7 @@ fn search_memory_ranks_by_term_overlap() {
     let engine = test_engine(&dir);
 
     // One term match
-    engine
-        .save_observation("retry logic exists", None)
-        .unwrap();
+    engine.save_observation("retry logic exists", None).unwrap();
     // Two term match — should rank higher
     engine
         .save_observation("retry backoff is implemented", None)
@@ -1185,7 +1174,10 @@ fn get_symbol_snippet_returns_body_for_known_fqn() {
     // If found, signature must be non-empty
     if let Some((sig, _body)) = snippet {
         assert!(!sig.is_empty(), "signature should be non-empty");
-        assert!(sig.contains("add"), "signature should mention function name");
+        assert!(
+            sig.contains("add"),
+            "signature should mention function name"
+        );
     }
     // Getting a snippet for an unknown FQN returns None
     assert!(
@@ -1261,7 +1253,10 @@ fn submit_lsp_edges_idempotent() {
     engine.submit_lsp_edges(&edge).unwrap();
 
     let stats = engine.index_stats().unwrap();
-    assert_eq!(stats.lsp_edge_count, 1, "duplicate edges must not accumulate");
+    assert_eq!(
+        stats.lsp_edge_count, 1,
+        "duplicate edges must not accumulate"
+    );
 }
 
 /// LSP edges for a file are deleted when that file is re-indexed.
@@ -1305,8 +1300,12 @@ fn consolidate_observations_is_noop_without_embedder() {
     let engine = indexed_engine_with_two_langs(&dir);
 
     // Produce a few auto observations so there is something to consolidate.
-    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
-    engine.run_pipeline("py fn", Some(4000), None, None).unwrap();
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .unwrap();
+    engine
+        .run_pipeline("py fn", Some(4000), None, None)
+        .unwrap();
 
     let n = engine
         .consolidate_observations()
@@ -1321,8 +1320,12 @@ fn consolidate_does_not_expire_observations_without_embedder() {
     let dir = tempfile::tempdir().unwrap();
     let engine = indexed_engine_with_two_langs(&dir);
 
-    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
-    engine.run_pipeline("py fn", Some(4000), None, None).unwrap();
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .unwrap();
+    engine
+        .run_pipeline("py fn", Some(4000), None, None)
+        .unwrap();
 
     engine.consolidate_observations().unwrap();
 
@@ -1346,7 +1349,9 @@ fn consolidated_kind_not_in_candidates_pool() {
     let dir = tempfile::tempdir().unwrap();
     let engine = indexed_engine_with_two_langs(&dir);
 
-    engine.run_pipeline("rust fn", Some(4000), None, None).unwrap();
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .unwrap();
     engine.consolidate_observations().unwrap(); // no-op without embedder
 
     let obs = engine

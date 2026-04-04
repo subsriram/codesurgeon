@@ -12,6 +12,7 @@ use crate::language::Language;
 use crate::macro_expand::run_macro_enrichment;
 use crate::memory::{new_session_id, IndexingConfig, MemoryConfig, MemoryStore};
 use crate::module_docs::{detect_xcode_mcp, swift_enrichment_hint};
+use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
@@ -20,13 +21,12 @@ use crate::ranking::{
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
-use crate::pyright_enrich::run_pyright_enrichment;
 use crate::rustdoc_enrich::run_rustdoc_enrichment;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
-use crate::symbol::{EdgeKind, LspEdge, Symbol};
 #[cfg(feature = "embeddings")]
 use crate::symbol::SymbolKind;
+use crate::symbol::{EdgeKind, LspEdge, Symbol};
 use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -587,7 +587,10 @@ impl CoreEngine {
                 // Flush updated resolved_type values back to SQLite.
                 let db = self.db.lock();
                 db.begin_transaction()?;
-                for sym in all_symbols.iter().filter(|s| s.source.as_deref() == Some("pyright")) {
+                for sym in all_symbols
+                    .iter()
+                    .filter(|s| s.source.as_deref() == Some("pyright"))
+                {
                     db.upsert_symbol(sym)?;
                 }
                 db.commit_transaction()?;
@@ -1062,7 +1065,7 @@ impl CoreEngine {
 
         for lsp in edges {
             // Derive source_file from the from_fqn (everything before the first "::").
-            let source_file = lsp.from_fqn.splitn(2, "::").next().unwrap_or(&lsp.from_fqn);
+            let source_file = lsp.from_fqn.split("::").next().unwrap_or(&lsp.from_fqn);
 
             // Resolve both FQNs to symbol IDs in the current graph.
             let from_id = graph.find_by_fqn(&lsp.from_fqn).map(|s| s.id);
@@ -1126,12 +1129,7 @@ impl CoreEngine {
     pub fn get_symbol_snippet(&self, fqn: &str) -> Option<(String, String)> {
         let graph = self.graph.read();
         graph.find_by_fqn(fqn).map(|sym| {
-            let body_preview = sym
-                .body
-                .lines()
-                .take(20)
-                .collect::<Vec<_>>()
-                .join("\n  ");
+            let body_preview = sym.body.lines().take(20).collect::<Vec<_>>().join("\n  ");
             (sym.signature.clone(), body_preview)
         })
     }
@@ -1237,8 +1235,7 @@ impl CoreEngine {
             )
             .with_ttl(&mem_config);
 
-            let ids_to_expire: Vec<String> =
-                cluster_obs.iter().map(|o| o.id.clone()).collect();
+            let ids_to_expire: Vec<String> = cluster_obs.iter().map(|o| o.id.clone()).collect();
             let db = self.db.lock();
             db.insert_observation(&consolidated)?;
             db.expire_observations(&ids_to_expire)?;
@@ -2144,8 +2141,14 @@ mod consolidation_tests {
         );
         assert!(merged.contains("\"fix auth\""), "missing query: {merged}");
         assert!(merged.contains("\"fix login\""), "missing query: {merged}");
-        assert!(merged.contains("mod::auth"), "missing shared pivot: {merged}");
-        assert!(merged.contains("mod::token"), "missing unique pivot: {merged}");
+        assert!(
+            merged.contains("mod::auth"),
+            "missing shared pivot: {merged}"
+        );
+        assert!(
+            merged.contains("mod::token"),
+            "missing unique pivot: {merged}"
+        );
         // mod::auth must appear only once (deduplication)
         assert_eq!(
             merged.matches("mod::auth").count(),
@@ -2184,8 +2187,14 @@ mod consolidation_tests {
             merged.starts_with("[consolidated from 2 observations]"),
             "unexpected prefix: {merged}"
         );
-        assert!(merged.contains("Some free-form note A"), "missing content A: {merged}");
-        assert!(merged.contains("Some free-form note B"), "missing content B: {merged}");
+        assert!(
+            merged.contains("Some free-form note A"),
+            "missing content A: {merged}"
+        );
+        assert!(
+            merged.contains("Some free-form note B"),
+            "missing content B: {merged}"
+        );
     }
 
     /// Cluster of size 1 should produce a valid (if trivial) merged string.

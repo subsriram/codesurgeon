@@ -302,9 +302,9 @@ impl Database {
     }
 
     pub fn load_lsp_edges(&self) -> Result<Vec<crate::symbol::LspEdge>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT from_fqn, to_fqn, kind, resolved_type FROM lsp_edges",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT from_fqn, to_fqn, kind, resolved_type FROM lsp_edges")?;
         let rows = stmt.query_map([], |r| {
             Ok(crate::symbol::LspEdge {
                 from_fqn: r.get(0)?,
@@ -313,13 +313,15 @@ impl Database {
                 resolved_type: r.get(3)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn lsp_edge_count(&self) -> Result<u64> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM lsp_edges", [], |r| r.get::<_, i64>(0))? as u64)
+            .query_row("SELECT COUNT(*) FROM lsp_edges", [], |r| r.get::<_, i64>(0))?
+            as u64)
     }
 
     // ── Files ─────────────────────────────────────────────────────────────────
@@ -594,8 +596,10 @@ impl Database {
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let params_vec: Vec<&dyn rusqlite::types::ToSql> =
-            terms.iter().map(|t| t as &dyn rusqlite::types::ToSql).collect();
+        let params_vec: Vec<&dyn rusqlite::types::ToSql> = terms
+            .iter()
+            .map(|t| t as &dyn rusqlite::types::ToSql)
+            .collect();
         let results = stmt
             .query_map(params_vec.as_slice(), |row| {
                 // row_to_observation reads columns 0..9; column 10 is _score (ignored)
