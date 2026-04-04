@@ -5,7 +5,7 @@
 //! inferred types from pyright diagnostics) into existing Python symbols.
 //!
 //! Enabled by `[indexing] python_pyright = true` in `.codesurgeon/config.toml`.
-//! Default: true when `pyright` is found on PATH.
+//! Default: false.
 //!
 //! Graceful skip when:
 //! - no Python files exist in the workspace
@@ -128,6 +128,9 @@ fn python_files_hash(workspace_root: &Path) -> String {
 }
 
 fn collect_py_stats(dir: &Path, parts: &mut Vec<String>) {
+    // Note: uses std::fs::read_dir rather than ignore::WalkBuilder intentionally —
+    // we're only stat-ing files for the incremental hash, not indexing them,
+    // so .gitignore compliance is not required here.
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
