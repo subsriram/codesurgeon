@@ -117,6 +117,10 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE observations ADD COLUMN expires_at TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE observations ADD COLUMN change_category TEXT",
+            [],
+        );
         // Index may already exist on new databases; ignore error.
         let _ = self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_obs_expires ON observations(expires_at);",
@@ -389,8 +393,8 @@ impl Database {
     pub fn insert_observation(&self, obs: &Observation) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO observations \
-             (id, session_id, agent_id, content, symbol_fqn, symbol_hash, created_at, is_stale, kind, expires_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             (id, session_id, agent_id, content, symbol_fqn, symbol_hash, created_at, is_stale, kind, expires_at, change_category) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 obs.id,
                 obs.session_id,
@@ -402,6 +406,7 @@ impl Database {
                 obs.is_stale as i64,
                 obs.kind.as_str(),
                 obs.expires_at,
+                obs.change_category,
             ],
         )?;
         Ok(())
@@ -410,7 +415,7 @@ impl Database {
     pub fn get_session_observations(&self, session_id: &str) -> Result<Vec<Observation>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
-             created_at, is_stale, kind, expires_at \
+             created_at, is_stale, kind, expires_at, change_category \
              FROM observations \
              WHERE session_id = ?1 \
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
@@ -426,7 +431,7 @@ impl Database {
     pub fn get_recent_observations(&self, limit: usize) -> Result<Vec<Observation>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
-             created_at, is_stale, kind, expires_at \
+             created_at, is_stale, kind, expires_at, change_category \
              FROM observations \
              WHERE (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
              ORDER BY created_at DESC LIMIT ?1",
@@ -481,7 +486,7 @@ impl Database {
     pub fn get_observations_for_fqn(&self, fqn: &str) -> Result<Vec<Observation>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
-             created_at, is_stale, kind, expires_at \
+             created_at, is_stale, kind, expires_at, change_category \
              FROM observations \
              WHERE symbol_fqn = ?1 \
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
@@ -531,7 +536,7 @@ impl Database {
     pub fn get_consolidation_candidates(&self) -> Result<Vec<Observation>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
-             created_at, is_stale, kind, expires_at \
+             created_at, is_stale, kind, expires_at, change_category \
              FROM observations \
              WHERE kind IN ('auto', 'passive') \
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
@@ -584,7 +589,7 @@ impl Database {
 
         let sql = format!(
             "SELECT id, session_id, agent_id, content, symbol_fqn, symbol_hash, \
-             created_at, is_stale, kind, expires_at, ({score}) as _score \
+             created_at, is_stale, kind, expires_at, change_category, ({score}) as _score \
              FROM observations \
              WHERE ({where_clause}) \
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
@@ -596,15 +601,13 @@ impl Database {
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
+        // row_to_observation uses named column access; _score column is ignored automatically.
         let params_vec: Vec<&dyn rusqlite::types::ToSql> = terms
             .iter()
             .map(|t| t as &dyn rusqlite::types::ToSql)
             .collect();
         let results = stmt
-            .query_map(params_vec.as_slice(), |row| {
-                // row_to_observation reads columns 0..9; column 10 is _score (ignored)
-                row_to_observation(row)
-            })?
+            .query_map(params_vec.as_slice(), row_to_observation)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(results)
@@ -725,16 +728,17 @@ fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
 
 fn row_to_observation(row: &rusqlite::Row) -> rusqlite::Result<Observation> {
     Ok(Observation {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        agent_id: row.get(2)?,
-        content: row.get(3)?,
-        symbol_fqn: row.get(4)?,
-        symbol_hash: row.get(5)?,
-        created_at: row.get(6)?,
-        is_stale: row.get::<_, i64>(7)? != 0,
-        kind: crate::memory::ObservationKind::parse_kind(&row.get::<_, String>(8)?),
-        expires_at: row.get(9)?,
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        agent_id: row.get("agent_id")?,
+        content: row.get("content")?,
+        symbol_fqn: row.get("symbol_fqn")?,
+        symbol_hash: row.get("symbol_hash")?,
+        created_at: row.get("created_at")?,
+        is_stale: row.get::<_, i64>("is_stale")? != 0,
+        kind: crate::memory::ObservationKind::parse_kind(&row.get::<_, String>("kind")?),
+        expires_at: row.get("expires_at")?,
+        change_category: row.get("change_category")?,
     })
 }
 

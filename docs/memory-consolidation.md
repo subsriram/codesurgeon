@@ -122,13 +122,17 @@ deduplicated by exact content.
 | Kind | Written by | Merged by consolidation | Merged by compression | Default TTL |
 |------|-----------|------------------------|----------------------|-------------|
 | `auto` | engine (passive, on query) | yes | yes | 7d |
-| `passive` | engine (file watcher) | yes | yes | 7d |
+| `passive` | engine (file watcher, on `reindex_file`) | yes | yes | 7d |
 | `file_thrash` | engine | yes | yes | 7d |
 | `dead_end` | engine | yes | yes | 7d |
 | `manual` | `save_observation` tool | **no** | yes (per-symbol) | none |
 | `insight` | `save_observation` tool | **no** | **no** | none |
 | `summary` | compression pass | **no** | **no** | 90d |
 | `consolidated` | consolidation pass | **no** | **no** | 90d |
+
+**`passive` observations** carry an additional `change_category` field (one of
+`new_symbol`, `deleted_symbol`, `signature_change`, `body_change`, `dependency_added`)
+set by the AST diff in `reindex_file`. See `docs/change-categories.md` for details.
 
 ---
 

@@ -758,22 +758,27 @@ fn format_observations(
             .as_deref()
             .map(|f| format!(" (re: `{}`)", f))
             .unwrap_or_default();
+        let cat_label = o
+            .change_category
+            .as_deref()
+            .map(|c| format!(" [{}]", c))
+            .unwrap_or_default();
 
         match detail_level {
             "L1" => {
-                // Headline only: timestamp + fqn + first 80 chars of content
+                // Headline only: timestamp + fqn + category + first 80 chars of content
                 let headline: String = o.content.chars().take(80).collect();
                 let ellipsis = if o.content.len() > 80 { "…" } else { "" };
                 out.push_str(&format!(
-                    "- [{}]{}{}: {}{}\n",
-                    ts, sym_label, stale, headline, ellipsis
+                    "- [{}]{}{}{}: {}{}\n",
+                    ts, sym_label, cat_label, stale, headline, ellipsis
                 ));
             }
             "L3" => {
                 // Full content + symbol body from graph
                 out.push_str(&format!(
-                    "- [{}]{}{}: {}\n",
-                    ts, sym_label, stale, o.content
+                    "- [{}]{}{}{}: {}\n",
+                    ts, sym_label, cat_label, stale, o.content
                 ));
                 if let Some(fqn) = &o.symbol_fqn {
                     if let Some((sig, body)) = engine.get_symbol_snippet(fqn) {
@@ -782,10 +787,10 @@ fn format_observations(
                 }
             }
             _ => {
-                // L2: current default behaviour
+                // L2: default
                 out.push_str(&format!(
-                    "- [{}]{}{}: {}\n",
-                    ts, sym_label, stale, o.content
+                    "- [{}]{}{}{}: {}\n",
+                    ts, sym_label, cat_label, stale, o.content
                 ));
             }
         }
