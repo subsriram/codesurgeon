@@ -356,9 +356,7 @@ impl Database {
 
     /// Return all (path, content_hash) pairs from the files table.
     pub fn all_file_hashes(&self) -> Result<HashMap<String, String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, content_hash FROM files")?;
+        let mut stmt = self.conn.prepare("SELECT path, content_hash FROM files")?;
         let map = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .filter_map(|r| r.ok())

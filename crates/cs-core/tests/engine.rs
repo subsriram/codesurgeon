@@ -1559,8 +1559,11 @@ fn incremental_index_skips_unchanged_files() {
     let count_before = stats_before.symbol_count;
 
     // Modify one file and re-index
-    std::fs::write(dir.path().join("other.rs"), "pub fn other() {}\npub fn new_fn() {}\n")
-        .unwrap();
+    std::fs::write(
+        dir.path().join("other.rs"),
+        "pub fn other() {}\npub fn new_fn() {}\n",
+    )
+    .unwrap();
     engine.index_workspace().expect("second index failed");
 
     let stats_after = engine.index_stats().expect("stats failed");
@@ -1573,7 +1576,10 @@ fn incremental_index_skips_unchanged_files() {
     let out = engine
         .run_pipeline("stable", Some(2000), None, None)
         .expect("run_pipeline failed");
-    assert!(out.contains("stable"), "unchanged symbol should still be indexed");
+    assert!(
+        out.contains("stable"),
+        "unchanged symbol should still be indexed"
+    );
 }
 
 /// `.codesurgeon/.gitignore` is created on `CoreEngine::new()` and excludes manifest.json
@@ -1607,7 +1613,10 @@ fn gitignore_omits_manifest_when_tracked() {
 
     let gitignore = dir.path().join(".codesurgeon").join(".gitignore");
     let contents = std::fs::read_to_string(&gitignore).unwrap();
-    assert!(contents.contains("index.db"), "should still exclude index.db");
+    assert!(
+        contents.contains("index.db"),
+        "should still exclude index.db"
+    );
     assert!(
         !contents.contains("manifest.json"),
         "manifest.json should not be excluded when track_manifest=true"
