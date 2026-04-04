@@ -460,8 +460,7 @@ impl CoreEngine {
         let manifest = Manifest {
             version: 1,
             workspace: self.config.workspace_root.to_string_lossy().to_string(),
-            updated_at: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            updated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             files: file_hashes,
         };
         let json = serde_json::to_string_pretty(&manifest)?;
@@ -527,7 +526,11 @@ impl CoreEngine {
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string();
-                if baseline_hashes.get(&rel).map(|h| h == &hash).unwrap_or(false) {
+                if baseline_hashes
+                    .get(&rel)
+                    .map(|h| h == &hash)
+                    .unwrap_or(false)
+                {
                     return None; // unchanged — skip
                 }
                 let symbols = index_file(&self.config.workspace_root, path, &content)
