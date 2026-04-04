@@ -1318,3 +1318,90 @@ fn consolidated_kind_not_in_candidates_pool() {
         "no consolidated entries expected without embedder"
     );
 }
+
+// ── get_stats tests ───────────────────────────────────────────────────────────
+
+/// `get_stats` on an empty log returns a "no calls recorded" message, not an error.
+#[test]
+fn get_stats_empty_log_returns_no_data_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(&dir);
+    let out = engine.get_stats(None).expect("get_stats failed");
+    assert!(
+        out.contains("No run_pipeline calls"),
+        "expected no-data message, got: {}",
+        out
+    );
+}
+
+/// After `run_pipeline` calls, `get_stats` must report the correct query count
+/// and include all expected sections.
+#[test]
+fn get_stats_counts_logged_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn foo() {}\npub fn bar() {}\n").unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    engine.run_pipeline("fix bug in foo", Some(500), None, None).unwrap();
+    engine.run_pipeline("add new feature bar", Some(500), None, None).unwrap();
+    engine.run_pipeline("refactor foo and bar", Some(500), None, None).unwrap();
+
+    let out = engine.get_stats(Some(30)).expect("get_stats failed");
+    assert!(out.contains("Total queries:        3"), "wrong count: {}", out);
+    assert!(out.contains("Token savings:"), "missing savings line: {}", out);
+    assert!(out.contains("Latency"), "missing latency section: {}", out);
+    assert!(out.contains("Intent breakdown"), "missing intent section: {}", out);
+    assert!(out.contains("Language distribution"), "missing lang section: {}", out);
+}
+
+/// `get_stats` with a very large `days` value must still return data logged moments ago.
+#[test]
+fn get_stats_large_days_includes_recent_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().unwrap();
+    engine.run_pipeline("fix foo", Some(500), None, None).unwrap();
+
+    let out = engine.get_stats(Some(9999)).expect("get_stats failed");
+    assert!(
+        out.contains("Total queries:        1"),
+        "expected 1 query in large window, got: {}",
+        out
+    );
+}
+
+/// Token savings percentage must be between 0% and 100%.
+#[test]
+fn get_stats_savings_pct_in_valid_range() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n",
+    )
+    .unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().unwrap();
+
+    for _ in 0..5 {
+        engine.run_pipeline("fix alpha", Some(200), None, None).unwrap();
+    }
+
+    let out = engine.get_stats(Some(30)).unwrap();
+    // Extract the savings percentage from the output line.
+    let pct_line = out
+        .lines()
+        .find(|l| l.contains("Token savings:"))
+        .expect("no savings line");
+    let pct_str = pct_line
+        .split_whitespace()
+        .find(|t| t.ends_with('%'))
+        .expect("no % token");
+    let pct: f64 = pct_str.trim_end_matches('%').parse().expect("non-numeric %");
+    assert!(
+        pct >= 0.0 && pct <= 100.0,
+        "savings % out of range: {}",
+        pct
+    );
+}

@@ -34,9 +34,11 @@ use instant_distance::{Builder as HnswBuilder, HnswMap, Search as HnswSearch};
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 #[cfg(feature = "embeddings")]
 use std::sync::OnceLock;
 
@@ -805,6 +807,7 @@ impl CoreEngine {
         language: Option<&str>,
         file_hint: Option<&str>,
     ) -> Result<String> {
+        let t0 = Instant::now();
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(task);
 
@@ -812,6 +815,7 @@ impl CoreEngine {
 
         let capsule =
             self.build_context_capsule(task, budget, &intent, language, file_hint, None, None)?;
+        let latency_ms = t0.elapsed().as_millis() as u64;
         let mut out = format_capsule(&capsule);
 
         // Append Swift enrichment hint when Swift symbols appear in results.
@@ -837,6 +841,47 @@ impl CoreEngine {
             .record_auto_observation(task, &pivot_fqns)
         {
             tracing::warn!("auto-observation failed: {}", e);
+        }
+
+        // Log query metrics.
+        let unique_files: HashSet<&str> =
+            capsule.pivots.iter().map(|p| p.file_path.as_str()).collect();
+        let candidate_file_tokens: u64 = {
+            let db = self.db.lock();
+            unique_files
+                .iter()
+                .filter_map(|fp| db.all_symbols_for_file(fp).ok())
+                .flatten()
+                .map(|s| s.token_estimate() as u64)
+                .sum()
+        };
+        let mut langs: Vec<String> = capsule
+            .pivots
+            .iter()
+            .map(|p| {
+                std::path::Path::new(&p.file_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        langs.sort();
+        let languages_hit = langs.join(",");
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = self.db.lock().log_query(
+            &timestamp,
+            task,
+            intent.as_str(),
+            capsule.stats.pivot_count,
+            capsule.stats.total_tokens,
+            candidate_file_tokens,
+            latency_ms,
+            &languages_hit,
+        ) {
+            tracing::warn!("query log failed: {}", e);
         }
 
         Ok(out)
@@ -866,6 +911,120 @@ impl CoreEngine {
         }
 
         Ok(format_capsule(&capsule))
+    }
+
+    /// Return a formatted stats report over the last `days` days of run_pipeline calls.
+    pub fn get_stats(&self, days: Option<u32>) -> Result<String> {
+        let days = days.unwrap_or(30);
+        let db = self.db.lock();
+        let rows = db.query_log_rows(days)?;
+
+        if rows.is_empty() {
+            return Ok(format!(
+                "No run_pipeline calls recorded in the last {} days.",
+                days
+            ));
+        }
+
+        let total_queries = rows.len();
+        let total_tokens: u64 = rows.iter().map(|r| r.total_tokens).sum();
+        let total_candidate: u64 = rows.iter().map(|r| r.candidate_file_tokens).sum();
+        let savings_pct = if total_candidate > 0 {
+            (total_candidate.saturating_sub(total_tokens)) as f64 / total_candidate as f64 * 100.0
+        } else {
+            0.0
+        };
+        let tokens_saved = total_candidate.saturating_sub(total_tokens);
+        // claude-sonnet-4 input pricing: $3 / 1M tokens
+        let cost_saved = tokens_saved as f64 * 3.0 / 1_000_000.0;
+
+        // Latency percentiles
+        let mut latencies: Vec<u64> = rows.iter().map(|r| r.latency_ms).collect();
+        latencies.sort_unstable();
+        let median = latencies[latencies.len() / 2];
+        let p95 = latencies[(latencies.len() * 95) / 100];
+
+        // Intent breakdown
+        let mut intent_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            *intent_counts.entry(row.intent.as_str()).or_insert(0) += 1;
+        }
+        let mut intent_vec: Vec<(&str, usize)> = intent_counts.into_iter().collect();
+        intent_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        let intent_line = intent_vec
+            .iter()
+            .map(|(k, v)| format!("{} {:.0}%", k, *v as f64 / total_queries as f64 * 100.0))
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+
+        // Language distribution
+        let mut lang_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            for lang in row.languages_hit.split(',') {
+                let lang = lang.trim();
+                if !lang.is_empty() {
+                    *lang_counts.entry(lang.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        let lang_total: usize = lang_counts.values().sum();
+        let mut lang_vec: Vec<(String, usize)> = lang_counts.into_iter().collect();
+        lang_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        let lang_line = if lang_total > 0 {
+            lang_vec
+                .iter()
+                .map(|(k, v)| format!("{} {:.0}%", k, *v as f64 / lang_total as f64 * 100.0))
+                .collect::<Vec<_>>()
+                .join("  ·  ")
+        } else {
+            String::from("—")
+        };
+
+        // Workspace savings (on-demand)
+        let workspace_tokens = db.workspace_token_estimate().unwrap_or(0);
+        let ws_avg_tokens = if total_queries > 0 {
+            total_tokens / total_queries as u64
+        } else {
+            0
+        };
+        let ws_savings_pct = if workspace_tokens > 0 {
+            (workspace_tokens.saturating_sub(ws_avg_tokens)) as f64 / workspace_tokens as f64
+                * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(format!(
+            "── Query stats (last {} days) {}\n\
+             \x20 Total queries:        {}\n\
+             \x20 Token savings:        {:.1}%  (candidate-file baseline)\n\
+             \x20 Workspace savings:    {:.1}%  (avg capsule vs full workspace)\n\
+             \x20 Estimated cost saved: ${:.2}  (@ claude-sonnet-4 pricing)\n\
+             \n\
+             ── Latency {}\n\
+             \x20 Median: {}ms    p95: {}ms\n\
+             \n\
+             ── Intent breakdown {}\n\
+             \x20 {}\n\
+             \n\
+             ── Language distribution {}\n\
+             \x20 {}\n",
+            days,
+            "─".repeat(38usize.saturating_sub(format!("last {} days", days).len())),
+            total_queries,
+            savings_pct,
+            ws_savings_pct,
+            cost_saved,
+            "─".repeat(49),
+            median,
+            p95,
+            "─".repeat(44),
+            intent_line,
+            "─".repeat(43),
+            lang_line,
+        ))
     }
 
     /// Get impact graph: what breaks if `symbol_fqn` changes?
