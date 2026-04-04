@@ -80,6 +80,7 @@ impl ObservationKind {
 /// [indexing]
 /// rust_expand_macros  = true
 /// rust_rustdoc_types  = true
+/// python_pyright      = true
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct IndexingConfig {
@@ -95,6 +96,14 @@ pub struct IndexingConfig {
     /// Re-run is gated on `Cargo.lock` content hash — skipped when unchanged.
     /// Default: false.
     pub rust_rustdoc_types: bool,
+
+    /// When true, run `pyright --outputjson` and merge resolved type
+    /// annotations into existing Python symbols.
+    /// Requires `pyright` to be installed (npm install -g pyright); skipped
+    /// gracefully if absent.
+    /// Re-run is gated on a hash of Python file stats — skipped when unchanged.
+    /// Default: false.
+    pub python_pyright: bool,
 }
 
 impl IndexingConfig {
@@ -113,6 +122,9 @@ impl IndexingConfig {
             }
             if let Some(v) = indexing.get("rust_rustdoc_types").and_then(|v| v.as_bool()) {
                 cfg.rust_rustdoc_types = v;
+            }
+            if let Some(v) = indexing.get("python_pyright").and_then(|v| v.as_bool()) {
+                cfg.python_pyright = v;
             }
         }
         cfg

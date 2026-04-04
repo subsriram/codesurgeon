@@ -20,6 +20,7 @@ use crate::ranking::{
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
+use crate::pyright_enrich::run_pyright_enrichment;
 use crate::rustdoc_enrich::run_rustdoc_enrichment;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
@@ -85,6 +86,12 @@ pub struct EngineConfig {
     /// Set via `[indexing] rust_rustdoc_types = true` in `config.toml`.
     /// Default: false.
     pub rust_rustdoc_types: bool,
+
+    /// When true, run `pyright --outputjson` and merge resolved type
+    /// annotations into existing Python symbols.
+    /// Set via `[indexing] python_pyright = true` in `config.toml`.
+    /// Default: false.
+    pub python_pyright: bool,
 }
 
 impl EngineConfig {
@@ -104,6 +111,7 @@ impl EngineConfig {
             index_stubs: true,
             rust_expand_macros: false,
             rust_rustdoc_types: false,
+            python_pyright: false,
         }
     }
 
@@ -255,6 +263,9 @@ impl CoreEngine {
         }
         if indexing_config.rust_rustdoc_types {
             config.rust_rustdoc_types = true;
+        }
+        if indexing_config.python_pyright {
+            config.python_pyright = true;
         }
 
         let memory = Arc::new(Mutex::new(
@@ -553,6 +564,30 @@ impl CoreEngine {
                 let db = self.db.lock();
                 db.begin_transaction()?;
                 for sym in all_symbols.iter().filter(|s| s.resolved_type.is_some()) {
+                    db.upsert_symbol(sym)?;
+                }
+                db.commit_transaction()?;
+            }
+        }
+
+        // ── Pyright Python type enrichment ───────────────────────────────────
+        // Merge resolved return types and inferred type annotations from
+        // `pyright --outputjson` into existing Python symbols.
+        // Gated on Python file stats hash for incremental skipping.
+        if self.config.python_pyright {
+            let enriched_count = {
+                let db = self.db.lock();
+                run_pyright_enrichment(&self.config.workspace_root, &mut all_symbols, &db)
+            };
+            if enriched_count > 0 {
+                tracing::info!(
+                    "pyright-enrich: resolved types for {} symbol(s)",
+                    enriched_count
+                );
+                // Flush updated resolved_type values back to SQLite.
+                let db = self.db.lock();
+                db.begin_transaction()?;
+                for sym in all_symbols.iter().filter(|s| s.source.as_deref() == Some("pyright")) {
                     db.upsert_symbol(sym)?;
                 }
                 db.commit_transaction()?;

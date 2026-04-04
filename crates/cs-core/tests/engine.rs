@@ -1003,6 +1003,50 @@ fn resolved_type_round_trips_through_db() {
     assert_eq!(fetched.source.as_deref(), Some("rustdoc"));
 }
 
+// ── Issue #12: pyright Python type enrichment ────────────────────────────────
+
+/// `run_pyright_enrichment` returns 0 when there are no Python symbols.
+#[test]
+fn pyright_enrichment_skipped_without_python_symbols() {
+    use cs_core::db::Database;
+    use cs_core::pyright_enrich::run_pyright_enrichment;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("index.db");
+    let db = Database::open(&db_path).expect("db open");
+    let count = run_pyright_enrichment(dir.path(), &mut [], &db);
+    assert_eq!(count, 0, "expected 0 enrichments without Python symbols");
+}
+
+/// `python_pyright = true` in config.toml is read by `IndexingConfig`.
+#[test]
+fn indexing_config_reads_python_pyright() {
+    use cs_core::memory::IndexingConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[indexing]\npython_pyright = true\n",
+    )
+    .unwrap();
+    let cfg = IndexingConfig::load_from_toml(&config_path);
+    assert!(cfg.python_pyright, "python_pyright should be true");
+}
+
+/// `extract_return_type_from_sig` handles common Python signature forms.
+#[test]
+fn pyright_return_type_extraction_variants() {
+    use cs_core::pyright_enrich::extract_return_type_from_sig;
+    assert_eq!(
+        extract_return_type_from_sig("def f() -> str:"),
+        Some("str".to_string())
+    );
+    assert_eq!(
+        extract_return_type_from_sig("async def f() -> None:"),
+        Some("None".to_string())
+    );
+    assert_eq!(extract_return_type_from_sig("def f():"), None);
+}
+
 // ── Issue #9: search_memory + detail levels ───────────────────────────────────
 
 /// `search_memory` returns observations whose content matches the query.
