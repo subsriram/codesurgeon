@@ -65,6 +65,13 @@ enum Commands {
         budget: u32,
     },
 
+    /// Show query stats: token savings, latency, intent breakdown
+    Stats {
+        /// Look-back window in days (default: 30)
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+    },
+
     /// Auto-generate per-directory CLAUDE.md summaries
     Docs {
         /// Write CLAUDE.md files to disk (default: preview only)
@@ -201,6 +208,10 @@ async fn main() -> Result<()> {
                 diff
             };
             println!("{}", engine.get_diff_capsule(&diff_text, Some(budget))?);
+        }
+
+        Commands::Stats { days } => {
+            println!("{}", engine.get_stats(Some(days))?);
         }
 
         Commands::Docs { write } => {

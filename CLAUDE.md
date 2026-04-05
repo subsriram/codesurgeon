@@ -16,6 +16,7 @@ It parses your codebase into a symbol graph, then serves token-budgeted context 
 | `index_status` | Check index health |
 | `get_session_context` | See what was learned in previous sessions |
 | `save_observation` | Save an insight so it persists across sessions |
+| `get_stats` | Token savings, latency percentiles, intent breakdown (last N days) |
 
 ## Recommended workflow
 

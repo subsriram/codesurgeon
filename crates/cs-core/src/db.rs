@@ -138,6 +138,21 @@ impl Database {
              ); \
              CREATE INDEX IF NOT EXISTS idx_lsp_edges_source ON lsp_edges(source_file);",
         );
+        // Query log — per-call metrics for run_pipeline.
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS query_log ( \
+                 id                    INTEGER PRIMARY KEY, \
+                 timestamp             TEXT NOT NULL, \
+                 task                  TEXT NOT NULL, \
+                 intent                TEXT NOT NULL, \
+                 pivot_count           INTEGER NOT NULL, \
+                 total_tokens          INTEGER NOT NULL, \
+                 candidate_file_tokens INTEGER NOT NULL, \
+                 latency_ms            INTEGER NOT NULL, \
+                 languages_hit         TEXT NOT NULL \
+             ); \
+             CREATE INDEX IF NOT EXISTS idx_qlog_ts ON query_log(timestamp);",
+        );
         Ok(())
     }
 
@@ -712,6 +727,85 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // ── Query log ─────────────────────────────────────────────────────────────
+
+    pub fn log_query(&self, entry: &QueryLogEntry) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO query_log \
+             (timestamp, task, intent, pivot_count, total_tokens, \
+              candidate_file_tokens, latency_ms, languages_hit) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                entry.timestamp,
+                entry.task,
+                entry.intent,
+                entry.pivot_count as i64,
+                entry.total_tokens as i64,
+                entry.candidate_file_tokens as i64,
+                entry.latency_ms as i64,
+                entry.languages_hit,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Aggregate stats from the query_log for the last `days` days.
+    /// Returns rows of (intent, count, total_tokens_sum, candidate_file_tokens_sum, latency_ms).
+    pub fn query_log_rows(&self, days: u32) -> Result<Vec<QueryLogRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT intent, pivot_count, total_tokens, candidate_file_tokens, latency_ms, languages_hit \
+             FROM query_log \
+             WHERE datetime(timestamp) >= datetime('now', ?1) \
+             ORDER BY timestamp ASC",
+        )?;
+        let since = format!("-{} days", days);
+        let rows = stmt
+            .query_map(params![since], |row| {
+                Ok(QueryLogRow {
+                    intent: row.get(0)?,
+                    pivot_count: row.get::<_, i64>(1)? as usize,
+                    total_tokens: row.get::<_, i64>(2)? as u64,
+                    candidate_file_tokens: row.get::<_, i64>(3)? as u64,
+                    latency_ms: row.get::<_, i64>(4)? as u64,
+                    languages_hit: row.get(5)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Total token estimate across all indexed symbols (rough workspace baseline).
+    pub fn workspace_token_estimate(&self) -> Result<u64> {
+        let bytes: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(body)), 0) FROM symbols",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((bytes as u64) / 4)
+    }
+}
+
+/// Input record for `Database::log_query`.
+pub struct QueryLogEntry<'a> {
+    pub timestamp: &'a str,
+    pub task: &'a str,
+    pub intent: &'a str,
+    pub pivot_count: usize,
+    pub total_tokens: u32,
+    pub candidate_file_tokens: u64,
+    pub latency_ms: u64,
+    pub languages_hit: &'a str,
+}
+
+pub struct QueryLogRow {
+    pub intent: String,
+    pub pivot_count: usize,
+    pub total_tokens: u64,
+    pub candidate_file_tokens: u64,
+    pub latency_ms: u64,
+    pub languages_hit: String,
 }
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
@@ -843,5 +937,90 @@ impl Language {
             "sql" => Language::Sql,
             _ => Language::JavaScript,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp_db() -> (Database, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.db")).unwrap();
+        (db, dir)
+    }
+
+    /// `log_query` must not error, and `query_log_rows` must return the inserted row.
+    #[test]
+    fn log_query_round_trip() {
+        let (db, _dir) = open_temp_db();
+        db.log_query(&QueryLogEntry {
+            timestamp: "2026-01-01T00:00:00Z",
+            task: "fix auth bug",
+            intent: "debug",
+            pivot_count: 3,
+            total_tokens: 400,
+            candidate_file_tokens: 2000,
+            latency_ms: 120,
+            languages_hit: "rs",
+        })
+        .unwrap();
+
+        let rows = db.query_log_rows(365).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].intent, "debug");
+        assert_eq!(rows[0].pivot_count, 3);
+        assert_eq!(rows[0].total_tokens, 400);
+        assert_eq!(rows[0].candidate_file_tokens, 2000);
+        assert_eq!(rows[0].latency_ms, 120);
+        assert_eq!(rows[0].languages_hit, "rs");
+    }
+
+    /// `query_log_rows(0)` must return no rows regardless of what was logged.
+    #[test]
+    fn query_log_rows_zero_days_returns_empty() {
+        let (db, _dir) = open_temp_db();
+        db.log_query(&QueryLogEntry {
+            timestamp: "2026-01-01T00:00:00Z",
+            task: "task",
+            intent: "general",
+            pivot_count: 1,
+            total_tokens: 100,
+            candidate_file_tokens: 500,
+            latency_ms: 50,
+            languages_hit: "rs",
+        })
+        .unwrap();
+        let rows = db.query_log_rows(0).unwrap();
+        assert!(rows.is_empty(), "expected no rows for 0-day window");
+    }
+
+    /// Multiple rows logged within the window must all be returned.
+    #[test]
+    fn query_log_rows_returns_all_within_window() {
+        let (db, _dir) = open_temp_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        for i in 0..5u64 {
+            db.log_query(&QueryLogEntry {
+                timestamp: &now,
+                task: "task",
+                intent: "add",
+                pivot_count: 1,
+                total_tokens: 100 + i as u32,
+                candidate_file_tokens: 500,
+                latency_ms: 50 + i,
+                languages_hit: "ts",
+            })
+            .unwrap();
+        }
+        let rows = db.query_log_rows(30).unwrap();
+        assert_eq!(rows.len(), 5);
+    }
+
+    /// `workspace_token_estimate` returns 0 when no symbols are indexed.
+    #[test]
+    fn workspace_token_estimate_empty_db_returns_zero() {
+        let (db, _dir) = open_temp_db();
+        assert_eq!(db.workspace_token_estimate().unwrap(), 0);
     }
 }

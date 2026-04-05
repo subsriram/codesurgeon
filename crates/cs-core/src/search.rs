@@ -275,6 +275,17 @@ pub enum SearchIntent {
 }
 
 impl SearchIntent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchIntent::Debug => "debug",
+            SearchIntent::Refactor => "refactor",
+            SearchIntent::Add => "add",
+            SearchIntent::Explore => "explore",
+            SearchIntent::Structural => "structural",
+            SearchIntent::General => "general",
+        }
+    }
+
     pub fn detect(task: &str) -> Self {
         let lower = task.to_lowercase();
         if contains_any(

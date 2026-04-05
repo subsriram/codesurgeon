@@ -300,6 +300,20 @@ fn tool_list() -> Value {
                 }
             },
             {
+                "name": "get_stats",
+                "description": "Return a summary of run_pipeline usage: token savings, latency percentiles, intent breakdown, and language distribution. Useful for surfacing 'you've saved ~180k tokens this week' inline.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "days": {
+                            "type": "integer",
+                            "description": "Look-back window in days (default: 30)",
+                            "default": 30
+                        }
+                    }
+                }
+            },
+            {
                 "name": "submit_lsp_edges",
                 "description": "Push LSP-resolved edges into the codesurgeon index. Call this from a VS Code extension or Claude Code hook (e.g. on file save) to enrich the graph with type-resolved cross-file edges that tree-sitter cannot see. Edges are stored persistently and loaded on next startup. They are automatically invalidated when the source file changes.",
                 "inputSchema": {
@@ -1010,6 +1024,11 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
             let edges: Vec<LspEdge> = serde_json::from_value(raw.clone())
                 .map_err(|e| anyhow::anyhow!("Invalid edges array: {}", e))?;
             engine.submit_lsp_edges(&edges)
+        }
+
+        "get_stats" => {
+            let days = args.get("days").and_then(|v| v.as_u64()).map(|v| v as u32);
+            engine.get_stats(days)
         }
 
         other => Err(anyhow::anyhow!("Unknown tool: {}", other)),
