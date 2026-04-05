@@ -22,12 +22,12 @@ use crate::ranking::{
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
 use crate::rustdoc_enrich::run_rustdoc_enrichment;
-use crate::ts_enrich::run_ts_enrichment;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
 #[cfg(feature = "embeddings")]
 use crate::symbol::SymbolKind;
 use crate::symbol::{EdgeKind, LspEdge, Symbol};
+use crate::ts_enrich::run_ts_enrichment;
 use crate::watcher::{hash_content, ChangeKind};
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -725,10 +725,7 @@ impl CoreEngine {
                 run_ts_enrichment(&self.config.workspace_root, &mut all_symbols, &db)
             };
             if enriched_count > 0 {
-                tracing::info!(
-                    "ts-enrich: resolved types for {} symbol(s)",
-                    enriched_count
-                );
+                tracing::info!("ts-enrich: resolved types for {} symbol(s)", enriched_count);
                 // Flush updated resolved_type values back to SQLite.
                 let db = self.db.lock();
                 db.begin_transaction()?;

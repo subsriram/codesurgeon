@@ -14,9 +14,9 @@ pub mod pyright_enrich;
 pub mod ranking;
 pub mod rustdoc_enrich;
 pub mod search;
-pub mod ts_enrich;
 pub mod skeletonizer;
 pub mod symbol;
+pub mod ts_enrich;
 pub mod watcher;
 
 // Re-export the main entry point

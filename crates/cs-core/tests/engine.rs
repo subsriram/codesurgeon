@@ -1355,7 +1355,10 @@ fn indexing_config_ts_types_loaded_from_toml() {
     )
     .unwrap();
     let cfg = IndexingConfig::load_from_toml(&config_dir.join("config.toml"));
-    assert!(cfg.ts_types, "ts_types should be true when set in config.toml");
+    assert!(
+        cfg.ts_types,
+        "ts_types should be true when set in config.toml"
+    );
 }
 
 /// `ts_types` must default to `false` so it is never accidentally enabled.
@@ -1389,7 +1392,10 @@ fn indexing_config_all_three_enrichment_flags() {
 fn engine_config_ts_types_defaults_to_false() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = cs_core::EngineConfig::new(dir.path());
-    assert!(!cfg.ts_types, "ts_types must default to false in EngineConfig");
+    assert!(
+        !cfg.ts_types,
+        "ts_types must default to false in EngineConfig"
+    );
 }
 
 /// `run_ts_enrichment` must return 0 gracefully when no tsconfig.json is present.
@@ -1464,7 +1470,11 @@ fn engine_applies_ts_types_config_from_toml() {
         r#"{"compilerOptions":{"strict":true},"include":["src"]}"#,
     )
     .unwrap();
-    std::fs::write(dir.path().join("hello.ts"), "export function greet(): string { return 'hi'; }\n").unwrap();
+    std::fs::write(
+        dir.path().join("hello.ts"),
+        "export function greet(): string { return 'hi'; }\n",
+    )
+    .unwrap();
 
     let config = cs_core::EngineConfig::new(dir.path()).without_embedder();
     assert!(
@@ -1542,8 +1552,8 @@ export class Greeter {
     }
 
     // Index the workspace so there are symbols to enrich.
-    let engine = CoreEngine::new(EngineConfig::new(dir.path()).without_embedder())
-        .expect("engine init");
+    let engine =
+        CoreEngine::new(EngineConfig::new(dir.path()).without_embedder()).expect("engine init");
     engine.index_workspace().expect("index_workspace");
 
     // Run enrichment directly (bypasses the ts_types config gate).

@@ -88,7 +88,10 @@ pub fn run_ts_enrichment(
 
     // Parse NDJSON output
     let resolved_map = parse_ndjson_output(&stdout_text);
-    tracing::debug!("ts-enrich: shim emitted {} type annotations", resolved_map.len());
+    tracing::debug!(
+        "ts-enrich: shim emitted {} type annotations",
+        resolved_map.len()
+    );
 
     // Merge into symbols
     let count = merge_resolved_types(all_symbols, &resolved_map);
@@ -149,11 +152,7 @@ fn run_shim(shim_path: &Path, workspace_root: &Path) -> Result<String> {
     }
 
     if !output.status.success() {
-        anyhow::bail!(
-            "ts-enricher.js exited {}: {}",
-            output.status,
-            stderr.trim()
-        );
+        anyhow::bail!("ts-enricher.js exited {}: {}", output.status, stderr.trim());
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -328,7 +327,10 @@ mod tests {
 
     #[test]
     fn fqn_ends_with_positive() {
-        assert!(fqn_ends_with("src/foo.ts::MyClass::method", "MyClass::method"));
+        assert!(fqn_ends_with(
+            "src/foo.ts::MyClass::method",
+            "MyClass::method"
+        ));
         assert!(fqn_ends_with("src/bar.ts::greet", "greet"));
         assert!(fqn_ends_with("a::b::c", "b::c"));
     }
@@ -381,7 +383,10 @@ mod tests {
 
         let count = merge_resolved_types(&mut syms, &map);
         assert_eq!(count, 1);
-        assert!(syms[0].resolved_type.is_none(), "Rust symbol must not be enriched");
+        assert!(
+            syms[0].resolved_type.is_none(),
+            "Rust symbol must not be enriched"
+        );
         assert_eq!(syms[1].resolved_type.as_deref(), Some("string"));
         assert_eq!(syms[1].source.as_deref(), Some("ts-compiler"));
     }
