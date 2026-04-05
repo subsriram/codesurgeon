@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 300,
+            "statusMessage": "Running pre-commit checks (fmt, clippy, test)...",
+            "command": "cmd=$(jq -r '.tool_input.command // \"\"'); echo \"$cmd\" | grep -q 'git commit' || exit 0; cd /Users/sriram/projects/codesurgeon && ~/.cargo/bin/cargo fmt --all && ~/.cargo/bin/cargo clippy --workspace -- -D warnings && ~/.cargo/bin/cargo test --workspace"
+          }
+        ]
+      }
+    ]
+  }
+}
