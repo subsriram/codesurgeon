@@ -22,6 +22,7 @@ use crate::ranking::{
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
 use crate::rustdoc_enrich::run_rustdoc_enrichment;
+use crate::ts_enrich::run_ts_enrichment;
 use crate::search::{SearchIndex, SearchIntent};
 use crate::skeletonizer::skeletonize;
 #[cfg(feature = "embeddings")]
@@ -95,6 +96,12 @@ pub struct EngineConfig {
     /// Default: false.
     pub python_pyright: bool,
 
+    /// When true, invoke the bundled Node.js shim to resolve TypeScript/JavaScript
+    /// symbol types via `ts.createProgram()` + `TypeChecker`.
+    /// Set via `[indexing] ts_types = true` in `config.toml`.
+    /// Default: false.
+    pub ts_types: bool,
+
     /// When true, `manifest.json` is omitted from `.codesurgeon/.gitignore`
     /// so it can be committed and shared.
     /// Set via `CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true`
@@ -120,6 +127,7 @@ impl EngineConfig {
             rust_expand_macros: false,
             rust_rustdoc_types: false,
             python_pyright: false,
+            ts_types: false,
             track_manifest: false,
         }
     }
@@ -292,6 +300,9 @@ impl CoreEngine {
         }
         if indexing_config.python_pyright {
             config.python_pyright = true;
+        }
+        if indexing_config.ts_types {
+            config.ts_types = true;
         }
         if indexing_config.track_manifest {
             config.track_manifest = true;
@@ -698,6 +709,30 @@ impl CoreEngine {
                     .iter()
                     .filter(|s| s.source.as_deref() == Some("pyright"))
                 {
+                    db.upsert_symbol(sym)?;
+                }
+                db.commit_transaction()?;
+            }
+        }
+
+        // ── TypeScript compiler resolved-type enrichment ──────────────────────
+        // Invoke the bundled Node.js shim (`ts-enricher.js`) to resolve types
+        // via `ts.createProgram()` + `TypeChecker` for TypeScript/JavaScript
+        // symbols.  Gated on tsconfig.json hash for incremental skipping.
+        if self.config.ts_types {
+            let enriched_count = {
+                let db = self.db.lock();
+                run_ts_enrichment(&self.config.workspace_root, &mut all_symbols, &db)
+            };
+            if enriched_count > 0 {
+                tracing::info!(
+                    "ts-enrich: resolved types for {} symbol(s)",
+                    enriched_count
+                );
+                // Flush updated resolved_type values back to SQLite.
+                let db = self.db.lock();
+                db.begin_transaction()?;
+                for sym in all_symbols.iter().filter(|s| s.resolved_type.is_some()) {
                     db.upsert_symbol(sym)?;
                 }
                 db.commit_transaction()?;

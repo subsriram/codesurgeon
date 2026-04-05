@@ -269,12 +269,35 @@ codesurgeon observe "insight" --symbol src/http.rs::send  # Attach to a symbol
 |----------|--------|-------|
 | Rust | tree-sitter | Full AST incl. impl/trait |
 | Python | tree-sitter | Full AST |
-| TypeScript / TSX | tree-sitter | Full AST |
-| JavaScript / JSX | tree-sitter | Full AST |
+| TypeScript / TSX | tree-sitter | Full AST; optional resolved types via TS compiler shim |
+| JavaScript / JSX | tree-sitter | Full AST; optional resolved types via TS compiler shim |
 | Swift | tree-sitter + Xcode MCP (optional) | Full AST — class/struct/enum/extension/protocol/func/method; Xcode MCP adds resolved types |
 | Shell (bash/zsh) | tree-sitter | Function extraction |
 | HTML | tree-sitter | Script/style blocks |
 | SQL | tree-sitter | CREATE TABLE/VIEW/FUNCTION/INDEX/TYPE |
+
+## TypeScript / JavaScript enrichment — compiler shim
+
+codesurgeon's tree-sitter pass gives you full TypeScript/JavaScript symbol structure. For resolved types (e.g. `Promise<User>` instead of `Promise<any>`), enable the optional compiler shim:
+
+**Requirements:** `node` on PATH, `tsconfig.json` in your workspace root, and `typescript` in `node_modules` (or globally installed).
+
+**Enable** by adding to `.codesurgeon/config.toml`:
+
+```toml
+[indexing]
+ts_types = true
+```
+
+At index time codesurgeon invokes a bundled Node.js script (`ts-enricher.js`) that runs `ts.createProgram()` + `TypeChecker` over your workspace and annotates symbols with their resolved return/property types. The results are stored in the index as `resolved_type` and surfaced in context capsules.
+
+**Incremental:** the shim only re-runs when `tsconfig.json` changes. Existing annotations are preserved across re-indexes.
+
+**Plain JS:** the shim sets `allowJs: true`, so JSDoc-annotated JavaScript files are resolved correctly too.
+
+**VS Code users:** if you have the [codesurgeon VS Code extension](https://marketplace.visualstudio.com/items?itemName=codesurgeon.codesurgeon) installed, the `submit_lsp_edges` tool pushed from the running TypeScript language server is the faster alternative — no subprocess spawning required. `ts_types` is the right choice for CI, Codex, or non-VS Code editors.
+
+---
 
 ## Swift enrichment — Xcode MCP
 
