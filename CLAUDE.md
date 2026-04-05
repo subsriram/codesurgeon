@@ -16,6 +16,10 @@ It parses your codebase into a symbol graph, then serves token-budgeted context 
 | `index_status` | Check index health |
 | `get_session_context` | See what was learned in previous sessions |
 | `save_observation` | Save an insight so it persists across sessions |
+| `search_memory` | Search saved observations by keyword |
+| `get_diff_capsule` | Context capsule scoped to a PR diff |
+| `generate_module_docs` | Auto-generate per-directory CLAUDE.md files |
+| `submit_lsp_edges` | Push LSP-resolved type edges from IDE extensions |
 | `get_stats` | Token savings, latency percentiles, intent breakdown (last N days) |
 
 ## Recommended workflow
