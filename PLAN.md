@@ -460,7 +460,7 @@ Implementation notes:
 
 ---
 
-#### 7c — Tier 2: TypeScript/JavaScript enrichment (`typescript` npm package)
+#### 7c — Tier 2: TypeScript/JavaScript enrichment (`typescript` npm package) ✅
 
 > **Note:** For VS Code users, `submit_lsp_edges` (Phase 8c) is the preferred path —
 > it uses the language server already running in the editor rather than spawning a
@@ -485,7 +485,10 @@ codesurgeon indexer
 - JSDoc types in JS files resolved correctly
 - `node_modules/@types/**/*.d.ts` resolution is automatic (TypeScript handles it)
 - Skip gracefully if `node` not available or no `tsconfig.json` found
-- Gate behind `--features ts-enrichment`
+- Enabled via `[indexing] ts_types = true` in `.codesurgeon/config.toml`
+- Incremental: gated on `tsconfig.json` content hash
+- Shim embedded at compile time in `crates/cs-core/assets/ts-enricher.js`
+- Merge pass in `crates/cs-core/src/ts_enrich.rs`
 
 ---
 
@@ -1064,10 +1067,12 @@ enrichment story is solid enough to be worth distributing.
 
 ---
 
-**#17 — 7c TypeScript compiler shim** · Med effort
-Demoted from #7 to #10 because `submit_lsp_edges` covers the same gap for VS Code TS users
-with better architecture. Remains useful as a standalone option for non-VS Code environments.
-FQN alignment between tree-sitter and the TypeScript compiler is still the main risk.
+**#17 — 7c TypeScript compiler shim** · Med effort ✅
+`ts_types = true` in `.codesurgeon/config.toml` triggers the shim at index time.
+Implemented in `crates/cs-core/src/ts_enrich.rs` + `crates/cs-core/assets/ts-enricher.js`.
+FQN alignment uses exact → suffix → name fallback matching (same pattern as rustdoc enrichment).
+Incremental gating on `tsconfig.json` hash. `submit_lsp_edges` remains the preferred path
+for VS Code users; this covers CI and non-VS Code environments.
 
 ---
 

@@ -81,6 +81,7 @@ impl ObservationKind {
 /// rust_expand_macros  = true
 /// rust_rustdoc_types  = true
 /// python_pyright      = true
+/// ts_types            = true
 ///
 /// [git]
 /// track_manifest = true
@@ -108,6 +109,19 @@ pub struct IndexingConfig {
     /// Default: false.
     pub python_pyright: bool,
 
+    /// When true, invoke the bundled Node.js shim (`ts-enricher.js`) to run
+    /// `ts.createProgram()` + `TypeChecker` over the workspace and annotate
+    /// TypeScript/JavaScript symbols with their resolved types.
+    ///
+    /// Requires `node` on PATH and a `tsconfig.json` in the workspace root.
+    /// The `typescript` package is loaded from `node_modules/typescript` first,
+    /// then falls back to any globally installed copy.  Skipped gracefully when
+    /// either prerequisite is absent.
+    ///
+    /// Re-run is gated on `tsconfig.json` content hash — skipped when unchanged.
+    /// Default: false.
+    pub ts_types: bool,
+
     /// When true, omit `manifest.json` from `.codesurgeon/.gitignore` so it
     /// can be committed and shared across clones.
     /// Set via `CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true`
@@ -134,6 +148,9 @@ impl IndexingConfig {
             }
             if let Some(v) = indexing.get("python_pyright").and_then(|v| v.as_bool()) {
                 cfg.python_pyright = v;
+            }
+            if let Some(v) = indexing.get("ts_types").and_then(|v| v.as_bool()) {
+                cfg.ts_types = v;
             }
         }
         if let Some(git) = table.get("git").and_then(|v| v.as_table()) {
