@@ -56,6 +56,24 @@ claude mcp add --scope user \
 
 Then restart Claude Code — the server indexes in the background on first start.
 
+## Pre-commit checklist
+
+Run these before every commit to match what CI checks:
+
+```bash
+# 1. Format (CI job: Rustfmt)
+cargo fmt --all
+
+# 2. Lint (CI job: Clippy) — warnings are errors in CI
+cargo clippy --workspace -- -D warnings
+
+# 3. Tests (CI job: Test)
+cargo test --workspace
+```
+
+All three must pass cleanly. `cargo fmt --all` is the most common cause of CI failures —
+run it last, after all code changes are done.
+
 ## Testing MCP over JSON-RPC
 
 Run the full protocol invariant test suite before any merge:
