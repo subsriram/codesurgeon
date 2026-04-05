@@ -128,13 +128,30 @@ The search/ranking logic is documented in `docs/ranking.md`.
 | Language | Parser | Notes |
 |----------|--------|-------|
 | Python | tree-sitter | Full AST |
-| TypeScript / TSX | tree-sitter | Full AST |
-| JavaScript / JSX | tree-sitter | Full AST |
+| TypeScript / TSX | tree-sitter | Full AST; optional resolved types via `ts_types` compiler shim |
+| JavaScript / JSX | tree-sitter | Full AST; optional resolved types via `ts_types` compiler shim |
 | Shell (bash/zsh) | tree-sitter | Function extraction |
 | HTML | tree-sitter | Script/style blocks |
 | Rust | tree-sitter | Full AST incl. impl/trait |
 | Swift | tree-sitter + Xcode MCP (optional) | Full AST — class/struct/enum/extension/protocol/func/method; Xcode MCP adds resolved types |
 | SQL | tree-sitter (tree-sitter-sequel) | CREATE TABLE/VIEW/FUNCTION/INDEX/TYPE |
+
+## TypeScript enrichment — how it works (implementation note)
+
+Enable with `[indexing] ts_types = true` in `.codesurgeon/config.toml`.
+
+At index time, `run_ts_enrichment()` in `crates/cs-core/src/ts_enrich.rs`:
+1. Gates on `tsconfig.json` presence + `node` on PATH + tsconfig hash (incremental skip)
+2. Writes the embedded shim (`crates/cs-core/assets/ts-enricher.js`) to a temp file
+3. Runs `node <shim> <workspace_root>` — the shim loads `typescript` from workspace
+   `node_modules` first, then falls back to a globally installed copy
+4. Parses NDJSON output `{ fqn, resolved_type, line }` and merges into TS/JS/TSX/JSX
+   symbols via exact FQN → suffix → name fallback matching
+5. Flushes updated `resolved_type` values back to SQLite
+
+The shim sets `allowJs: true` so JSDoc-annotated JavaScript is resolved too.
+For VS Code users, `submit_lsp_edges` (issue #10) is the preferred path — it uses
+the already-running language server without subprocess overhead.
 
 ## Swift enrichment — how it works (implementation note)
 
