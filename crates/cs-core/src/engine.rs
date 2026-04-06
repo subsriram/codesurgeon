@@ -33,6 +33,8 @@ use anyhow::Result;
 use ignore::WalkBuilder;
 #[cfg(feature = "embeddings")]
 use instant_distance::{Builder as HnswBuilder, HnswMap, Search as HnswSearch};
+#[cfg(feature = "embeddings")]
+use parking_lot::Once;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -270,6 +272,10 @@ pub struct CoreEngine {
     /// Rebuilt after every reindex pass alongside `embedding_cache`.
     #[cfg(feature = "embeddings")]
     ann_index: Arc<RwLock<Option<HnswMap<EmbeddingPoint, u64>>>>,
+    /// Guards the first-time load of `embedding_cache` from SQLite.
+    /// After the initial load, `refresh_embedding_cache` updates the cache directly.
+    #[cfg(feature = "embeddings")]
+    cache_once: Once,
 }
 
 impl CoreEngine {
@@ -391,26 +397,14 @@ impl CoreEngine {
         #[cfg(feature = "embeddings")]
         let embedder = Arc::new(OnceLock::new());
 
-        // Warm the embedding cache from previously stored embeddings, then build the
-        // HNSW index on a background thread so startup is not blocked.
-        // Queries fall back to BM25+graph until the index is ready (ann_index = None).
+        // Embedding cache and HNSW index are populated lazily on the first semantic query
+        // (see `ensure_embedding_cache`). This avoids loading ~154 MB into RAM at startup
+        // when semantic search is never used (common for small/medium codebases).
         #[cfg(feature = "embeddings")]
-        let (embedding_cache, ann_index) = {
-            let cached = db.lock().all_embeddings().unwrap_or_default();
-            let ann_index: Arc<RwLock<Option<HnswMap<EmbeddingPoint, u64>>>> =
-                Arc::new(RwLock::new(None));
-            if !cached.is_empty() {
-                let ann_index_bg = Arc::clone(&ann_index);
-                let cached_bg = cached.clone();
-                std::thread::spawn(move || {
-                    if let Some(index) = build_hnsw_index(&cached_bg) {
-                        *ann_index_bg.write() = Some(index);
-                        tracing::info!("ANN index ready ({} vectors)", cached_bg.len());
-                    }
-                });
-            }
-            (Arc::new(RwLock::new(cached)), ann_index)
-        };
+        let (embedding_cache, ann_index) = (
+            Arc::new(RwLock::new(Vec::<(u64, Vec<f32>)>::new())),
+            Arc::new(RwLock::new(None::<HnswMap<EmbeddingPoint, u64>>)),
+        );
 
         Ok(CoreEngine {
             config,
@@ -425,6 +419,8 @@ impl CoreEngine {
             embedding_cache,
             #[cfg(feature = "embeddings")]
             ann_index,
+            #[cfg(feature = "embeddings")]
+            cache_once: Once::new(),
         })
     }
 
@@ -1444,6 +1440,14 @@ impl CoreEngine {
         ))
     }
 
+    /// Number of vectors currently in the in-memory embedding cache.
+    /// Returns 0 until the first semantic query triggers lazy initialisation.
+    /// Exposed for testing; not part of the stable public API.
+    #[cfg(feature = "embeddings")]
+    pub fn embedding_cache_len(&self) -> usize {
+        self.embedding_cache.read().len()
+    }
+
     /// Index statistics and health.
     pub fn index_stats(&self) -> Result<IndexStats> {
         let db = self.db.lock();
@@ -1823,6 +1827,7 @@ impl CoreEngine {
     /// Returns `(symbol_id, cosine_similarity)` pairs, sorted descending by similarity.
     #[cfg(feature = "embeddings")]
     fn ann_candidates(&self, query: &str, k: usize) -> Vec<(u64, f32)> {
+        self.ensure_embedding_cache();
         let Some(emb) = self.embedder.get() else {
             return vec![];
         };
@@ -1846,13 +1851,43 @@ impl CoreEngine {
             .collect()
     }
 
+    /// Ensure the embedding cache has been loaded from SQLite at least once.
+    /// Uses `cache_once` so the DB load happens exactly once across all concurrent callers;
+    /// subsequent calls are a cheap atomic check. `refresh_embedding_cache` bypasses this
+    /// and writes directly — it also marks `cache_once` as done to suppress any future
+    /// redundant lazy loads.
+    #[cfg(feature = "embeddings")]
+    fn ensure_embedding_cache(&self) {
+        let db = &self.db;
+        let embedding_cache = &self.embedding_cache;
+        let ann_index = &self.ann_index;
+        self.cache_once
+            .call_once(|| match db.lock().all_embeddings() {
+                Ok(embs) => {
+                    let ann_bg = Arc::clone(ann_index);
+                    let cache_bg = embs.clone();
+                    *embedding_cache.write() = embs;
+                    std::thread::spawn(move || {
+                        if let Some(index) = build_hnsw_index(&cache_bg) {
+                            *ann_bg.write() = Some(index);
+                            tracing::info!("ANN index ready ({} vectors)", cache_bg.len());
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!("lazy embedding cache load failed: {}", e),
+            });
+    }
+
     /// Reload all embeddings from SQLite into the in-memory cache, then rebuild the ANN index.
     /// Called after every index pass so queries never need to hit the db for vectors.
+    /// Also marks `cache_once` as done so the next query skips the lazy-init path.
     #[cfg(feature = "embeddings")]
     fn refresh_embedding_cache(&self) {
         match self.db.lock().all_embeddings() {
             Ok(embs) => {
                 *self.embedding_cache.write() = embs;
+                // Mark as initialized so ensure_embedding_cache is a no-op hereafter.
+                self.cache_once.call_once(|| {});
                 let ann_index_bg = Arc::clone(&self.ann_index);
                 let cache_bg = self.embedding_cache.read().clone();
                 std::thread::spawn(move || {
@@ -2017,6 +2052,8 @@ impl CoreEngine {
         reranked: Vec<(u64, f32)>,
         query: &str,
     ) -> Vec<(u64, f32)> {
+        #[cfg(feature = "embeddings")]
+        self.ensure_embedding_cache();
         #[cfg(feature = "embeddings")]
         let semantic_scores: std::collections::HashMap<u64, f32> =
             if let Some(emb) = self.embedder.get() {

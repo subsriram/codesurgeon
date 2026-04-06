@@ -13,7 +13,7 @@ codesurgeon parses your codebase into a symbol dependency graph, then serves tok
 | Relevant pivots surfaced | all files | 8 symbols |
 | Setup | none | `cargo install` + 1 config line |
 
-> Token figures are from the leading competitor's published results. codesurgeon will report your actual per-workspace savings via `codesurgeon stats` once Phase 11 ships.
+> Token figures are from the leading competitor's published results. codesurgeon reports your actual per-workspace savings via `codesurgeon stats` (or the `get_stats` MCP tool).
 
 ### SWE-bench Verified
 
@@ -87,39 +87,29 @@ cargo build --release
 
 ### 2. Add to Claude Code
 
-Add to `~/.claude/mcp_settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "cs-myproject": {
-      "command": "/path/to/codesurgeon/target/release/codesurgeon-mcp",
-      "args": [],
-      "env": {
-        "CS_WORKSPACE": "/path/to/your/project"
-      }
-    }
-  }
-}
+```bash
+claude mcp add --scope user \
+  -e CS_WORKSPACE=/path/to/your/project \
+  cs-myproject \
+  /path/to/codesurgeon/target/release/codesurgeon-mcp
 ```
 
-Restart Claude Code — the server indexes your workspace in the background on first start.
+This writes to `~/.claude.json` (CLI v2.x). Restart Claude Code — the server indexes your workspace in the background on first start.
 
 ### Multiple projects
 
-```json
-{
-  "mcpServers": {
-    "cs-frontend": {
-      "command": "/path/to/codesurgeon-mcp",
-      "env": { "CS_WORKSPACE": "/projects/frontend" }
-    },
-    "cs-backend": {
-      "command": "/path/to/codesurgeon-mcp",
-      "env": { "CS_WORKSPACE": "/projects/backend" }
-    }
-  }
-}
+Run `claude mcp add` once per project with a unique server name:
+
+```bash
+claude mcp add --scope user \
+  -e CS_WORKSPACE=/projects/frontend \
+  cs-frontend \
+  /path/to/codesurgeon-mcp
+
+claude mcp add --scope user \
+  -e CS_WORKSPACE=/projects/backend \
+  cs-backend \
+  /path/to/codesurgeon-mcp
 ```
 
 Tools are namespaced: `cs-frontend__run_pipeline`, `cs-backend__run_pipeline`, etc.
