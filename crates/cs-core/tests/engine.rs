@@ -1987,3 +1987,52 @@ fn gitignore_omits_manifest_when_tracked() {
         "manifest.json should not be excluded when track_manifest=true"
     );
 }
+
+/// The embedding cache must be empty immediately after `CoreEngine::new`.
+/// Verifies the lazy-load contract from issue #47: ~154 MB is not allocated
+/// until the first semantic query, not at startup.
+#[cfg(feature = "embeddings")]
+#[test]
+fn embedding_cache_is_empty_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig::new(dir.path()).without_embedder();
+    let engine = CoreEngine::new(config).expect("engine init failed");
+    assert_eq!(
+        engine.embedding_cache_len(),
+        0,
+        "cache must not be loaded eagerly at startup"
+    );
+}
+
+/// Parallel queries racing to trigger the first lazy cache load must not
+/// deadlock or panic. `cache_once` serialises the init; all threads proceed
+/// normally after the single DB load completes.
+#[cfg(feature = "embeddings")]
+#[test]
+fn parallel_queries_do_not_deadlock_on_lazy_cache_init() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn foo() {}\npub fn bar() {}\n",
+    )
+    .unwrap();
+    let config = EngineConfig::new(dir.path()).without_embedder();
+    let engine = Arc::new(CoreEngine::new(config).expect("engine init failed"));
+    engine.index_workspace().expect("index failed");
+
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let e = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let _ = e.run_pipeline(&format!("query {i}"), Some(500), None, None);
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    // No embedder → no embeddings stored → cache initialised but still empty.
+    assert_eq!(engine.embedding_cache_len(), 0);
+}

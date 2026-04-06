@@ -70,8 +70,10 @@ utility function called by 200 places would flood the pool with noise).
 - Queries an in-memory HNSW index (instant-distance) built from the embedding cache
 - Returns top-25 nearest neighbors by cosine similarity
 
-The HNSW index is built from the embedding cache at startup and rebuilt after every
-reindex pass (same trigger as `refresh_embedding_cache`).
+The embedding cache and HNSW index are loaded lazily on the first semantic query
+(`cache_once` in `CoreEngine`), not at startup. This avoids allocating ~154 MB for the
+cache when semantic search is never used. After every reindex pass, `refresh_embedding_cache`
+updates the cache directly and marks the once as done so the lazy-init path is skipped.
 
 **Why ANN at retrieval time, not just re-ranking?** Previously, semantic scoring only
 re-ranked the BM25 pool (Stage 4). Symbols with high semantic similarity but low lexical
