@@ -68,12 +68,14 @@ toml = { workspace = true }
 # Build with: cargo build --features embeddings
 # Build with Accelerate BLAS on Apple Silicon: cargo build --features metal
 fastembed         = { version = "5", optional = true }
-instant-distance  = { version = "0.6.1", optional = true }
+instant-distance  = { version = "0.6.1", optional = true, features = ["with-serde"] }
+memmap2           = { version = "0.9", optional = true }
+bincode           = { version = "1", optional = true }
 tree-sitter-md-025 = "0.5.4"
 
 [features]
 default    = []
-embeddings = ["dep:fastembed", "dep:instant-distance"]
+embeddings = ["dep:fastembed", "dep:instant-distance", "dep:memmap2", "dep:bincode"]
 metal      = ["embeddings", "fastembed/accelerate"]
 
 [dev-dependencies]

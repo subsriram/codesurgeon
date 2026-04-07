@@ -2,6 +2,8 @@ use crate::capsule::{build_capsule, format_capsule, Capsule, MemoryEntry, DEFAUL
 use crate::db::Database;
 use crate::diff::parse_diff_symbols;
 #[cfg(feature = "embeddings")]
+use crate::emb_store::EmbeddingStore;
+#[cfg(feature = "embeddings")]
 use crate::embedder::{cosine_similarity, Embedder};
 use crate::graph::CodeGraph;
 use crate::indexer::{
@@ -228,6 +230,7 @@ pub struct FlowResult {
 /// Vectors are L2-normalised, so `1.0 - dot_product` gives angular distance.
 #[cfg(feature = "embeddings")]
 #[derive(Clone)]
+#[cfg_attr(feature = "embeddings", derive(serde::Serialize, serde::Deserialize))]
 struct EmbeddingPoint(Vec<f32>);
 
 #[cfg(feature = "embeddings")]
@@ -237,18 +240,68 @@ impl instant_distance::Point for EmbeddingPoint {
     }
 }
 
-/// Build an HNSW index from the embedding cache. Returns `None` when the cache is empty.
+/// Build an HNSW index from an embedding store. Returns `None` when the store is empty.
 #[cfg(feature = "embeddings")]
-fn build_hnsw_index(cache: &[(u64, Vec<f32>)]) -> Option<HnswMap<EmbeddingPoint, u64>> {
-    if cache.is_empty() {
+fn build_hnsw_index(store: &EmbeddingStore) -> Option<HnswMap<EmbeddingPoint, u64>> {
+    if store.is_empty() {
         return None;
     }
-    let points: Vec<EmbeddingPoint> = cache
-        .iter()
-        .map(|(_, v)| EmbeddingPoint(v.clone()))
-        .collect();
-    let values: Vec<u64> = cache.iter().map(|(id, _)| *id).collect();
+    let mut points = Vec::with_capacity(store.len());
+    let mut values = Vec::with_capacity(store.len());
+    for (id, vec) in store.iter() {
+        points.push(EmbeddingPoint(vec.to_vec()));
+        values.push(id);
+    }
     Some(HnswBuilder::default().build(points, values))
+}
+
+/// HNSW cache file header: magic(4) + version(4) + embedding_count(8) = 16 bytes.
+#[cfg(feature = "embeddings")]
+const HNSW_MAGIC: &[u8; 4] = b"HNSW";
+#[cfg(feature = "embeddings")]
+const HNSW_VERSION: u32 = 1;
+
+/// Try to load a persisted HNSW index from disk.
+/// Returns `None` if the file is absent, has wrong magic/version, or the
+/// stored embedding count doesn't match `expected_count`.
+#[cfg(feature = "embeddings")]
+fn load_hnsw_index(
+    path: &std::path::Path,
+    expected_count: usize,
+) -> Option<HnswMap<EmbeddingPoint, u64>> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 16 {
+        return None;
+    }
+    if &bytes[0..4] != HNSW_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    if version != HNSW_VERSION {
+        return None;
+    }
+    let stored_count = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+    if stored_count != expected_count {
+        return None;
+    }
+    bincode::deserialize::<HnswMap<EmbeddingPoint, u64>>(&bytes[16..]).ok()
+}
+
+/// Serialize an HNSW index to disk with a header recording the embedding count.
+#[cfg(feature = "embeddings")]
+fn save_hnsw_index(
+    path: &std::path::Path,
+    index: &HnswMap<EmbeddingPoint, u64>,
+    embedding_count: usize,
+) -> anyhow::Result<()> {
+    let body = bincode::serialize(index)?;
+    let mut buf = Vec::with_capacity(16 + body.len());
+    buf.extend_from_slice(HNSW_MAGIC);
+    buf.extend_from_slice(&HNSW_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(embedding_count as u64).to_le_bytes());
+    buf.extend_from_slice(&body);
+    std::fs::write(path, &buf)?;
+    Ok(())
 }
 
 // ── CoreEngine ────────────────────────────────────────────────────────────────
@@ -264,10 +317,11 @@ pub struct CoreEngine {
     indexing: Arc<AtomicBool>,
     #[cfg(feature = "embeddings")]
     embedder: Arc<OnceLock<Embedder>>,
-    /// In-memory cache of all symbol embeddings — loaded after each index pass so
-    /// run_pipeline never needs to hit SQLite for embedding lookups.
+    /// Flat embedding store (mmap'd file when available, heap otherwise) — loaded after
+    /// each index pass so run_pipeline never needs to hit SQLite for embedding lookups.
+    /// OS-managed paging means pages that aren't accessed don't consume RSS.
     #[cfg(feature = "embeddings")]
-    embedding_cache: Arc<RwLock<Vec<(u64, Vec<f32>)>>>,
+    embedding_cache: Arc<RwLock<EmbeddingStore>>,
     /// HNSW index built from the embedding cache for Stage 1.5 ANN retrieval.
     /// Rebuilt after every reindex pass alongside `embedding_cache`.
     #[cfg(feature = "embeddings")]
@@ -321,7 +375,7 @@ impl CoreEngine {
             .join(".codesurgeon")
             .join(".gitignore");
         if !gitignore_path.exists() {
-            let mut contents = "index.db\n".to_string();
+            let mut contents = "index.db\nembeddings.bin\nhnsw.bin\n".to_string();
             if !config.track_manifest {
                 contents.push_str("manifest.json\n");
             }
@@ -400,9 +454,11 @@ impl CoreEngine {
         // Embedding cache and HNSW index are populated lazily on the first semantic query
         // (see `ensure_embedding_cache`). This avoids loading ~154 MB into RAM at startup
         // when semantic search is never used (common for small/medium codebases).
+        // On subsequent calls, `ensure_embedding_cache` tries the mmap'd embeddings.bin
+        // and hnsw.bin before falling back to SQLite and a full rebuild.
         #[cfg(feature = "embeddings")]
         let (embedding_cache, ann_index) = (
-            Arc::new(RwLock::new(Vec::<(u64, Vec<f32>)>::new())),
+            Arc::new(RwLock::new(EmbeddingStore::from_heap(vec![]))),
             Arc::new(RwLock::new(None::<HnswMap<EmbeddingPoint, u64>>)),
         );
 
@@ -1851,49 +1907,107 @@ impl CoreEngine {
             .collect()
     }
 
-    /// Ensure the embedding cache has been loaded from SQLite at least once.
-    /// Uses `cache_once` so the DB load happens exactly once across all concurrent callers;
-    /// subsequent calls are a cheap atomic check. `refresh_embedding_cache` bypasses this
-    /// and writes directly — it also marks `cache_once` as done to suppress any future
-    /// redundant lazy loads.
+    /// Ensure the embedding cache has been loaded at least once.
+    /// Uses `cache_once` so the load happens exactly once across all concurrent callers;
+    /// subsequent calls are a cheap atomic check. Tries the mmap'd embeddings.bin and
+    /// hnsw.bin before falling back to SQLite + a full rebuild.
+    /// `refresh_embedding_cache` bypasses this and writes directly — it also marks
+    /// `cache_once` as done to suppress any future redundant lazy loads.
     #[cfg(feature = "embeddings")]
     fn ensure_embedding_cache(&self) {
         let db = &self.db;
         let embedding_cache = &self.embedding_cache;
         let ann_index = &self.ann_index;
-        self.cache_once
-            .call_once(|| match db.lock().all_embeddings() {
-                Ok(embs) => {
-                    let ann_bg = Arc::clone(ann_index);
-                    let cache_bg = embs.clone();
-                    *embedding_cache.write() = embs;
-                    std::thread::spawn(move || {
-                        if let Some(index) = build_hnsw_index(&cache_bg) {
-                            *ann_bg.write() = Some(index);
-                            tracing::info!("ANN index ready ({} vectors)", cache_bg.len());
-                        }
-                    });
+        let emb_path = self
+            .config
+            .workspace_root
+            .join(".codesurgeon")
+            .join("embeddings.bin");
+        let hnsw_path = self
+            .config
+            .workspace_root
+            .join(".codesurgeon")
+            .join("hnsw.bin");
+        self.cache_once.call_once(|| {
+            // Try mmap'd file first (O(1), OS-managed paging); fall back to SQLite.
+            let store = if let Some(s) = EmbeddingStore::open(&emb_path) {
+                tracing::info!("Lazy-loaded {} embeddings from mmap file", s.len());
+                s
+            } else {
+                match db.lock().all_embeddings() {
+                    Ok(embs) => EmbeddingStore::from_heap(embs),
+                    Err(e) => {
+                        tracing::warn!("lazy embedding cache load failed: {}", e);
+                        return;
+                    }
                 }
-                Err(e) => tracing::warn!("lazy embedding cache load failed: {}", e),
-            });
+            };
+            if store.is_empty() {
+                return;
+            }
+            let store_count = store.len();
+            let ann_bg = Arc::clone(ann_index);
+            if let Some(loaded) = load_hnsw_index(&hnsw_path, store_count) {
+                *ann_index.write() = Some(loaded);
+                tracing::info!("ANN index loaded from disk ({} vectors)", store_count);
+            } else {
+                let data: Vec<(u64, Vec<f32>)> =
+                    store.iter().map(|(id, v)| (id, v.to_vec())).collect();
+                std::thread::spawn(move || {
+                    let heap_store = EmbeddingStore::from_heap(data);
+                    if let Some(index) = build_hnsw_index(&heap_store) {
+                        let _ = save_hnsw_index(&hnsw_path, &index, store_count);
+                        *ann_bg.write() = Some(index);
+                        tracing::info!("ANN index ready ({} vectors)", store_count);
+                    }
+                });
+            }
+            *embedding_cache.write() = store;
+        });
     }
 
-    /// Reload all embeddings from SQLite into the in-memory cache, then rebuild the ANN index.
-    /// Called after every index pass so queries never need to hit the db for vectors.
-    /// Also marks `cache_once` as done so the next query skips the lazy-init path.
+    /// Reload all embeddings from SQLite, write to embeddings.bin (mmap), then rebuild
+    /// the HNSW index on a background thread and persist it to hnsw.bin.
+    /// Called after every index pass. Also marks `cache_once` as done so the next query
+    /// skips the lazy-init path.
     #[cfg(feature = "embeddings")]
     fn refresh_embedding_cache(&self) {
+        let emb_path = self
+            .config
+            .workspace_root
+            .join(".codesurgeon")
+            .join("embeddings.bin");
+        let hnsw_path = self
+            .config
+            .workspace_root
+            .join(".codesurgeon")
+            .join("hnsw.bin");
+
         match self.db.lock().all_embeddings() {
             Ok(embs) => {
-                *self.embedding_cache.write() = embs;
+                let store_count = embs.len();
+                if store_count == 0 {
+                    return;
+                }
+
+                // Write the flat binary file and swap in the mmap store.
+                let new_store = match EmbeddingStore::write_and_open(&emb_path, &embs) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("Failed to write embeddings.bin: {}", e);
+                        EmbeddingStore::from_heap(embs.clone())
+                    }
+                };
+                *self.embedding_cache.write() = new_store;
                 // Mark as initialized so ensure_embedding_cache is a no-op hereafter.
                 self.cache_once.call_once(|| {});
                 let ann_index_bg = Arc::clone(&self.ann_index);
-                let cache_bg = self.embedding_cache.read().clone();
                 std::thread::spawn(move || {
-                    if let Some(index) = build_hnsw_index(&cache_bg) {
+                    let heap_store = EmbeddingStore::from_heap(embs);
+                    if let Some(index) = build_hnsw_index(&heap_store) {
+                        let _ = save_hnsw_index(&hnsw_path, &index, store_count);
                         *ann_index_bg.write() = Some(index);
-                        tracing::info!("ANN index rebuilt ({} vectors)", cache_bg.len());
+                        tracing::info!("ANN index rebuilt ({} vectors)", store_count);
                     }
                 });
             }
@@ -2065,7 +2179,7 @@ impl CoreEngine {
                         cache
                             .iter()
                             .filter(|(id, _)| candidate_ids.contains(id))
-                            .map(|(id, vec)| (*id, cosine_similarity(&query_vec, vec)))
+                            .map(|(id, vec)| (id, cosine_similarity(&query_vec, vec)))
                             .collect()
                     }
                     Err(e) => {
@@ -2591,5 +2705,73 @@ mod consolidation_tests {
             merged.starts_with("[consolidated from 1 observation"),
             "unexpected prefix: {merged}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+mod hnsw_persistence_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Build a minimal HNSW index from synthetic embeddings and verify that
+    /// `save_hnsw_index` + `load_hnsw_index` round-trips the data correctly.
+    #[test]
+    fn save_load_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("hnsw.bin");
+
+        let entries: Vec<(u64, Vec<f32>)> = (0..20u64)
+            .map(|i| {
+                let mut v = vec![0.0f32; 8];
+                v[i as usize % 8] = 1.0;
+                (i, v)
+            })
+            .collect();
+        let store = crate::emb_store::EmbeddingStore::from_heap(entries);
+        let index = build_hnsw_index(&store).expect("index should build");
+
+        save_hnsw_index(&path, &index, store.len()).unwrap();
+
+        let loaded = load_hnsw_index(&path, store.len()).expect("should load");
+        // Verify ANN search on the loaded index returns a result.
+        let query = EmbeddingPoint(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let mut search = HnswSearch::default();
+        let results: Vec<_> = loaded.search(&query, &mut search).take(3).collect();
+        assert!(
+            !results.is_empty(),
+            "loaded index should return ANN results"
+        );
+    }
+
+    #[test]
+    fn load_missing_file_returns_none() {
+        let dir = TempDir::new().unwrap();
+        assert!(load_hnsw_index(&dir.path().join("absent.bin"), 10).is_none());
+    }
+
+    #[test]
+    fn load_wrong_count_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("hnsw.bin");
+
+        let entries: Vec<(u64, Vec<f32>)> = (0..10u64).map(|i| (i, vec![i as f32; 4])).collect();
+        let store = crate::emb_store::EmbeddingStore::from_heap(entries);
+        let index = build_hnsw_index(&store).unwrap();
+        save_hnsw_index(&path, &index, store.len()).unwrap();
+
+        // Asking for a different count should reject the cached file.
+        assert!(load_hnsw_index(&path, store.len() + 1).is_none());
+    }
+
+    #[test]
+    fn load_wrong_magic_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.bin");
+        std::fs::write(
+            &path,
+            b"XXXX\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
+        assert!(load_hnsw_index(&path, 5).is_none());
     }
 }
