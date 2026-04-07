@@ -485,6 +485,32 @@ mod tests {
     }
 
     #[test]
+    fn merge_skips_already_enriched_symbol() {
+        use crate::symbol::Symbol;
+        // A symbol that already has resolved_type set (e.g. from a previous run restored
+        // from the DB) must not be mutated again — source must also be left intact.
+        let mut sym = Symbol::new(
+            "src/app.py",
+            "compute",
+            SymbolKind::Function,
+            1,
+            3,
+            "def compute(x: int) -> bool:".to_string(),
+            None,
+            "def compute(x: int) -> bool:\n    return x > 0".to_string(),
+            Language::Python,
+        );
+        sym.resolved_type = Some("bool".to_string());
+        sym.source = Some("pyright".to_string());
+
+        let diag_map = HashMap::new();
+        let count = merge_pyright_types(std::slice::from_mut(&mut sym), &diag_map);
+        assert_eq!(count, 0, "already-enriched symbol must not be re-enriched");
+        assert_eq!(sym.resolved_type.as_deref(), Some("bool"));
+        assert_eq!(sym.source.as_deref(), Some("pyright"));
+    }
+
+    #[test]
     fn merge_uses_diag_for_inferred_type() {
         use crate::symbol::Symbol;
         let mut sym = Symbol::new(
