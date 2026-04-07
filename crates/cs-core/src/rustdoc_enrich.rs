@@ -470,4 +470,168 @@ mod tests {
         let count = run_rustdoc_enrichment(dir.path(), &mut [], &db);
         assert_eq!(count, 0);
     }
+
+    #[test]
+    fn rustdoc_incremental_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = crate::db::Database::open(&db_path).expect("db");
+
+        // Gate 1: Cargo.toml present.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+
+        // Prime the DB with the current Cargo.lock hash.
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            b"# This file is automatically @generated",
+        )
+        .unwrap();
+        let lock_hash = cargo_lock_hash(dir.path());
+        db.set_macro_expand_hash("__rustdoc__", &lock_hash).unwrap();
+
+        // Gate 3 fires: must return 0 without running cargo doc.
+        let count = run_rustdoc_enrichment(dir.path(), &mut [], &db);
+        assert_eq!(count, 0, "cache hit must short-circuit to 0");
+    }
+
+    fn make_rust_sym(name: &str) -> crate::symbol::Symbol {
+        use crate::language::Language;
+        use crate::symbol::{Symbol, SymbolKind};
+        let mut sym = Symbol::new(
+            "src/lib.rs",
+            name,
+            SymbolKind::Function,
+            1,
+            5,
+            format!("fn {}() -> String", name),
+            None,
+            format!("fn {}() -> String {{ String::new() }}", name),
+            Language::Rust,
+        );
+        sym.fqn = format!("src/lib.rs::{}", name);
+        sym
+    }
+
+    #[test]
+    fn merge_enriches_rust_symbol_by_name() {
+        let mut map = HashMap::new();
+        map.insert(
+            "my_fn".to_string(),
+            ResolvedInfo {
+                resolved_type: "String".to_string(),
+            },
+        );
+        let mut sym = make_rust_sym("my_fn");
+        let count = merge_resolved_types(std::slice::from_mut(&mut sym), &map);
+        assert_eq!(count, 1);
+        assert_eq!(sym.resolved_type.as_deref(), Some("String"));
+        assert_eq!(sym.source.as_deref(), Some("rustdoc"));
+    }
+
+    #[test]
+    fn merge_enriches_rust_symbol_by_fqn_suffix() {
+        let mut map = HashMap::new();
+        map.insert(
+            "CoreEngine::new".to_string(),
+            ResolvedInfo {
+                resolved_type: "Self".to_string(),
+            },
+        );
+        let mut sym = make_rust_sym("new");
+        sym.fqn = "src/engine.rs::CoreEngine::new".to_string();
+        let count = merge_resolved_types(std::slice::from_mut(&mut sym), &map);
+        assert_eq!(count, 1);
+        assert_eq!(sym.resolved_type.as_deref(), Some("Self"));
+    }
+
+    #[test]
+    fn merge_skips_non_rust_symbol() {
+        use crate::language::Language;
+        use crate::symbol::{Symbol, SymbolKind};
+        let mut map = HashMap::new();
+        map.insert(
+            "compute".to_string(),
+            ResolvedInfo {
+                resolved_type: "String".to_string(),
+            },
+        );
+        let mut sym = Symbol::new(
+            "src/app.py",
+            "compute",
+            SymbolKind::Function,
+            1,
+            3,
+            "def compute():".to_string(),
+            None,
+            "def compute(): pass".to_string(),
+            Language::Python,
+        );
+        let count = merge_resolved_types(std::slice::from_mut(&mut sym), &map);
+        assert_eq!(count, 0, "Python symbols must not be enriched by rustdoc");
+        assert!(sym.resolved_type.is_none());
+    }
+
+    #[test]
+    fn merge_preserves_existing_source() {
+        let mut map = HashMap::new();
+        map.insert(
+            "my_fn".to_string(),
+            ResolvedInfo {
+                resolved_type: "u32".to_string(),
+            },
+        );
+        let mut sym = make_rust_sym("my_fn");
+        sym.source = Some("proc-macro".to_string());
+
+        let count = merge_resolved_types(std::slice::from_mut(&mut sym), &map);
+        assert_eq!(count, 1);
+        assert_eq!(
+            sym.source.as_deref(),
+            Some("proc-macro"),
+            "pre-existing source must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn merge_empty_map_returns_zero() {
+        let map: HashMap<String, ResolvedInfo> = HashMap::new();
+        let mut sym = make_rust_sym("my_fn");
+        let count = merge_resolved_types(std::slice::from_mut(&mut sym), &map);
+        assert_eq!(count, 0);
+        assert!(sym.resolved_type.is_none());
+    }
+
+    #[test]
+    fn parse_rustdoc_json_malformed_returns_empty() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("crate.json");
+        let mut f = std::fs::File::create(&json_path).unwrap();
+        f.write_all(b"not valid json at all").unwrap();
+        let result = parse_rustdoc_json(&json_path);
+        // Must not panic; an Err is acceptable, empty map is also fine.
+        match result {
+            Ok(map) => assert!(map.is_empty(), "malformed JSON should yield empty map"),
+            Err(_) => {} // parse error is acceptable
+        }
+    }
+
+    #[test]
+    fn parse_rustdoc_json_missing_index_returns_err() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("crate.json");
+        let mut f = std::fs::File::create(&json_path).unwrap();
+        f.write_all(br#"{"version": 1}"#).unwrap(); // valid JSON but no "index" key
+        let result = parse_rustdoc_json(&json_path);
+        assert!(result.is_err(), "missing `index` key must return an error");
+    }
+
+    #[test]
+    fn fqn_ends_with_partial_name_no_match() {
+        // "fn" is a suffix of "my_fn" but not at a :: boundary — must not match.
+        assert!(!fqn_ends_with("src/lib.rs::my_fn", "fn"));
+        // Empty suffix edge case.
+        assert!(fqn_ends_with("a::b", "a::b"));
+    }
 }

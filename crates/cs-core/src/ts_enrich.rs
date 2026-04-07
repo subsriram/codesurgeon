@@ -365,6 +365,82 @@ mod tests {
     }
 
     #[test]
+    fn ts_incremental_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = crate::db::Database::open(&db_path).expect("db open");
+
+        // Gate 1: tsconfig.json must exist for gate 1 to pass.
+        let tsconfig = dir.path().join("tsconfig.json");
+        std::fs::write(&tsconfig, r#"{"compilerOptions":{}}"#).unwrap();
+
+        // Prime the DB with the hash of tsconfig.json, exactly as run_ts_enrichment does.
+        let hash = file_hash(&tsconfig);
+        db.set_macro_expand_hash("__ts_enrich__", &hash).unwrap();
+
+        // Gate 3 fires: must return 0 without invoking node, regardless of node availability.
+        let mut syms = vec![make_sym("src/a.ts::fn1", "fn1", Language::TypeScript)];
+        let count = run_ts_enrichment(dir.path(), &mut syms, &db);
+        assert_eq!(count, 0, "cache hit must short-circuit to 0");
+        assert!(
+            syms[0].resolved_type.is_none(),
+            "symbol must not be mutated on cache hit"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_existing_source() {
+        // When a symbol already has source set, the merge pass must not overwrite it.
+        let mut map = HashMap::new();
+        map.insert(
+            "src/foo.ts::fn1".to_string(),
+            TsResolvedInfo {
+                resolved_type: "string".to_string(),
+            },
+        );
+        let mut sym = make_sym("src/foo.ts::fn1", "fn1", Language::TypeScript);
+        sym.fqn = "src/foo.ts::fn1".to_string();
+        sym.source = Some("lsp".to_string());
+
+        let count = merge_resolved_types(std::slice::from_mut(&mut sym), &map);
+        assert_eq!(count, 1, "symbol must still be counted as enriched");
+        assert_eq!(
+            sym.source.as_deref(),
+            Some("lsp"),
+            "pre-existing source must not be overwritten"
+        );
+        assert_eq!(sym.resolved_type.as_deref(), Some("string"));
+    }
+
+    #[test]
+    fn merge_empty_map_returns_zero() {
+        let map: HashMap<String, TsResolvedInfo> = HashMap::new();
+        let mut sym = make_sym("src/foo.ts::fn1", "fn1", Language::TypeScript);
+        sym.fqn = "src/foo.ts::fn1".to_string();
+        let count = merge_resolved_types(std::slice::from_mut(&mut sym), &map);
+        assert_eq!(count, 0);
+        assert!(sym.resolved_type.is_none());
+    }
+
+    #[test]
+    fn merge_name_only_fallback() {
+        // Map key is the bare symbol name; FQN is path-qualified.
+        // find_match resolves this via suffix matching (step 2).
+        let mut map = HashMap::new();
+        map.insert(
+            "greet".to_string(),
+            TsResolvedInfo {
+                resolved_type: "void".to_string(),
+            },
+        );
+        let mut sym = make_sym("src/utils.ts::greet", "greet", Language::TypeScript);
+        sym.fqn = "src/utils.ts::greet".to_string();
+        let count = merge_resolved_types(std::slice::from_mut(&mut sym), &map);
+        assert_eq!(count, 1, "name-only fallback must enrich the symbol");
+        assert_eq!(sym.resolved_type.as_deref(), Some("void"));
+    }
+
+    #[test]
     fn merge_only_ts_js_symbols() {
         let mut map = HashMap::new();
         map.insert(
