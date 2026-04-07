@@ -2,6 +2,8 @@ pub mod capsule;
 pub mod db;
 pub mod diff;
 pub mod edges;
+#[cfg(feature = "embeddings")]
+pub mod emb_store;
 pub mod embedder;
 pub mod engine;
 pub mod graph;

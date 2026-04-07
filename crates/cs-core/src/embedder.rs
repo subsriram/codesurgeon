@@ -56,7 +56,7 @@ mod inner {
         pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.model
                 .lock()
-                .embed(texts.to_vec(), None)
+                .embed(texts, None)
                 .map_err(|e| anyhow::anyhow!("embed failed: {e}"))
         }
 
