@@ -489,6 +489,45 @@ impl CoreEngine {
             }
         };
 
+        // ── Prune stale files ─────────────────────────────────────────────────
+        // Remove symbols whose file no longer exists on disk (e.g. deleted
+        // worktrees, git branch switches, manual deletions).
+        {
+            let on_disk: std::collections::HashSet<String> = files
+                .iter()
+                .chain(stub_files.iter())
+                .filter_map(|p| {
+                    p.strip_prefix(&self.config.workspace_root)
+                        .ok()
+                        .map(|r| r.to_string_lossy().to_string())
+                })
+                .collect();
+
+            let db = self.db.lock();
+            let tracked = db.all_file_paths().unwrap_or_default();
+            let stale: Vec<&String> = tracked
+                .iter()
+                .filter(|p| !on_disk.contains(p.as_str()))
+                .collect();
+            if !stale.is_empty() {
+                tracing::info!("Pruning {} stale file(s) from index", stale.len());
+                let mut search = self.search.lock();
+                let mut graph = self.graph.write();
+                for rel in &stale {
+                    let old_ids = db.symbol_ids_for_file(rel).unwrap_or_default();
+                    let _ = db.delete_edges_for_symbols(&old_ids);
+                    let _ = db.delete_embeddings_for_symbols(&old_ids);
+                    let _ = db.delete_file_symbols(rel);
+                    let _ = db.delete_lsp_edges_for_file(rel);
+                    let _ = db.delete_file(rel);
+                    search.delete_symbols(&old_ids);
+                    graph.remove_file(rel);
+                }
+                let _ = search.commit();
+                graph.warm_caches();
+            }
+        }
+
         // Parse files in parallel with rayon, skipping files whose hash matches baseline.
         let results: Vec<(PathBuf, String, Vec<Symbol>)> = files
             .par_iter()
@@ -842,7 +881,11 @@ impl CoreEngine {
         // Phase 1: Snapshot old symbols + remove stale db rows (same db lock).
         let old_symbols = {
             let db = self.db.lock();
+            let old_ids = db.symbol_ids_for_file(&rel)?;
             let snap = db.all_symbols_for_file(&rel)?;
+            // Clean up edges and embeddings referencing these symbols.
+            db.delete_edges_for_symbols(&old_ids)?;
+            db.delete_embeddings_for_symbols(&old_ids)?;
             db.delete_file_symbols(&rel)?;
             // LSP edges from this file are now stale; the IDE hook will re-submit after save.
             db.delete_lsp_edges_for_file(&rel)?;
@@ -854,6 +897,21 @@ impl CoreEngine {
         }
 
         if kind == ChangeKind::Removed {
+            // Phase 2b: Also purge from Tantivy and the files table.
+            let old_ids: Vec<u64> = old_symbols.iter().map(|s| s.id).collect();
+            {
+                let mut search = self.search.lock();
+                search.delete_symbols(&old_ids);
+                search.commit()?;
+            }
+            {
+                let db = self.db.lock();
+                db.delete_file(&rel)?;
+            }
+            #[cfg(feature = "embeddings")]
+            {
+                self.refresh_embedding_cache();
+            }
             return Ok(());
         }
 
@@ -1573,8 +1631,6 @@ impl CoreEngine {
     /// Observations below the minimum similarity threshold are excluded.
     #[cfg(feature = "embeddings")]
     fn ranked_observations(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
-        const MIN_SIMILARITY: f32 = 0.3;
-
         // Fetch a larger pool so we can select the most relevant subset.
         let pool_size = (limit * 3).max(30);
         let raw = self.memory.lock().get_recent_observations(pool_size)?;
@@ -1582,18 +1638,11 @@ impl CoreEngine {
             return Ok(Vec::new());
         }
 
-        let scored = if let Some(emb) = self.embedder.get() {
+        let ranked_indices = if let Some(emb) = self.embedder.get() {
             if let Ok(query_vec) = emb.embed_one(query) {
                 let texts: Vec<&str> = raw.iter().map(|o| o.content.as_str()).collect();
                 if let Ok(obs_vecs) = emb.embed_batch(&texts) {
-                    let mut pairs: Vec<(usize, f32)> = obs_vecs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, v)| (i, cosine_similarity(&query_vec, v)))
-                        .collect();
-                    pairs
-                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    Some(pairs)
+                    Some(rank_by_similarity(&query_vec, &obs_vecs, limit))
                 } else {
                     None
                 }
@@ -1604,12 +1653,10 @@ impl CoreEngine {
             None
         };
 
-        let entries: Vec<MemoryEntry> = if let Some(pairs) = scored {
-            pairs
+        let entries: Vec<MemoryEntry> = if let Some(indices) = ranked_indices {
+            indices
                 .into_iter()
-                .filter(|(_, score)| *score >= MIN_SIMILARITY)
-                .take(limit)
-                .map(|(i, _)| &raw[i])
+                .map(|i| &raw[i])
                 .map(|obs| MemoryEntry {
                     content: obs.content.clone(),
                     symbol_fqn: obs.symbol_fqn.clone(),
@@ -2471,6 +2518,28 @@ fn merge_cluster_content(obs: &[&crate::memory::Observation]) -> String {
     }
 }
 
+/// Minimum cosine similarity for an observation to be included in a capsule.
+#[cfg(feature = "embeddings")]
+const OBSERVATION_MIN_SIMILARITY: f32 = 0.3;
+
+/// Score observation vectors against a query vector, filter by minimum similarity,
+/// sort descending, and return the indices of the top `limit` observations.
+#[cfg(feature = "embeddings")]
+fn rank_by_similarity(query_vec: &[f32], obs_vecs: &[Vec<f32>], limit: usize) -> Vec<usize> {
+    let mut pairs: Vec<(usize, f32)> = obs_vecs
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, cosine_similarity(query_vec, v)))
+        .collect();
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    pairs
+        .into_iter()
+        .filter(|(_, score)| *score >= OBSERVATION_MIN_SIMILARITY)
+        .take(limit)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 #[cfg(test)]
 mod secrets_tests {
     use super::*;
@@ -2651,5 +2720,76 @@ mod consolidation_tests {
             merged.starts_with("[consolidated from 1 observation"),
             "unexpected prefix: {merged}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+mod rank_by_similarity_tests {
+    use super::*;
+
+    /// Helper: build a simple unit vector with a 1.0 at position `idx` (rest zero).
+    fn unit_vec(dim: usize, idx: usize) -> Vec<f32> {
+        let mut v = vec![0.0; dim];
+        v[idx] = 1.0;
+        v
+    }
+
+    #[test]
+    fn returns_indices_sorted_by_descending_similarity() {
+        let query = unit_vec(4, 0); // [1, 0, 0, 0]
+        let obs = vec![
+            unit_vec(4, 2),           // idx 0: orthogonal → sim 0.0
+            unit_vec(4, 0),           // idx 1: identical → sim 1.0
+            vec![0.5, 0.5, 0.5, 0.5], // idx 2: partial → sim 0.5
+        ];
+        let result = rank_by_similarity(&query, &obs, 10);
+        assert_eq!(
+            result,
+            vec![1, 2],
+            "should return idx 1 (best) then idx 2, skip idx 0 (below threshold)"
+        );
+    }
+
+    #[test]
+    fn filters_below_min_similarity() {
+        let query = unit_vec(4, 0);
+        // All observations are orthogonal to query → cosine sim = 0.0
+        let obs = vec![unit_vec(4, 1), unit_vec(4, 2), unit_vec(4, 3)];
+        let result = rank_by_similarity(&query, &obs, 10);
+        assert!(result.is_empty(), "all observations should be filtered out");
+    }
+
+    #[test]
+    fn respects_limit() {
+        let query = unit_vec(4, 0);
+        let obs = vec![
+            vec![0.9, 0.1, 0.0, 0.0], // high sim
+            vec![0.8, 0.2, 0.0, 0.0], // high sim
+            vec![0.7, 0.3, 0.0, 0.0], // high sim
+        ];
+        let result = rank_by_similarity(&query, &obs, 2);
+        assert_eq!(result.len(), 2, "should only return 2 results");
+    }
+
+    #[test]
+    fn empty_observations_returns_empty() {
+        let query = unit_vec(4, 0);
+        let result = rank_by_similarity(&query, &[], 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn borderline_similarity_included() {
+        // cosine_similarity([1,0,0,0], [0.35, 0.9367, 0, 0]) ≈ 0.35 (above 0.3 threshold)
+        let query = unit_vec(4, 0);
+        let s = (0.35f32 * 0.35 + 0.9367f32 * 0.9367).sqrt();
+        let obs = vec![vec![0.35 / s, 0.9367 / s, 0.0, 0.0]];
+        let sim = cosine_similarity(&query, &obs[0]);
+        assert!(
+            sim >= OBSERVATION_MIN_SIMILARITY,
+            "sim {sim} should be >= 0.3"
+        );
+        let result = rank_by_similarity(&query, &obs, 10);
+        assert_eq!(result.len(), 1, "borderline similarity should be included");
     }
 }

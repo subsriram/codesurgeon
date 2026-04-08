@@ -100,6 +100,14 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Remove symbols by ID from the Tantivy index.
+    pub fn delete_symbols(&mut self, ids: &[u64]) {
+        for id in ids {
+            let id_term = tantivy::Term::from_field_u64(self.schema.f_id, *id);
+            self.writer.delete_term(id_term);
+        }
+    }
+
     /// Commit all pending writes.
     pub fn commit(&mut self) -> Result<()> {
         self.writer.commit()?;

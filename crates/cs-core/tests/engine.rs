@@ -2036,3 +2036,83 @@ fn parallel_queries_do_not_deadlock_on_lazy_cache_init() {
     // No embedder → no embeddings stored → cache initialised but still empty.
     assert_eq!(engine.embedding_cache_len(), 0);
 }
+
+/// When a file is deleted, `reindex_file(Removed)` must purge its symbols from
+/// search results so they don't appear as ghost entries.
+#[test]
+fn reindex_file_removed_purges_from_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("lib.py");
+    std::fs::write(&file, "def my_unique_target_fn(): pass\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    // Symbol should be findable before deletion.
+    let before = engine
+        .get_context_capsule("my_unique_target_fn", None, None, None)
+        .unwrap();
+    assert!(
+        before.contains("my_unique_target_fn"),
+        "symbol should appear before deletion"
+    );
+
+    // Delete the file and notify the engine.
+    std::fs::remove_file(&file).unwrap();
+    engine
+        .reindex_file(&file, ChangeKind::Removed)
+        .expect("reindex_file Removed failed");
+
+    // Symbol must no longer appear in search results (0 pivots).
+    let after = engine
+        .get_context_capsule("my_unique_target_fn", None, None, None)
+        .unwrap();
+    assert!(
+        after.contains("0 pivots"),
+        "symbol should be purged after file removal, got: {}",
+        after
+    );
+}
+
+/// `index_workspace` must prune symbols from files that no longer exist on disk
+/// (e.g. deleted worktrees, branch switches).
+#[test]
+fn index_workspace_prunes_stale_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_a = dir.path().join("kept.py");
+    let file_b = dir.path().join("stale.py");
+    std::fs::write(&file_a, "def kept_fn(): pass\n").unwrap();
+    std::fs::write(&file_b, "def stale_unique_fn(): pass\n").unwrap();
+
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("first index failed");
+
+    // Both symbols present.
+    let capsule = engine
+        .get_context_capsule("stale_unique_fn", None, None, None)
+        .unwrap();
+    assert!(
+        capsule.contains("stale_unique_fn"),
+        "should exist before prune"
+    );
+
+    // Delete one file, then re-index the workspace.
+    std::fs::remove_file(&file_b).unwrap();
+    engine.index_workspace().expect("second index failed");
+
+    // Stale symbol must be gone from pivots.
+    let after = engine
+        .get_context_capsule("stale_unique_fn", None, None, None)
+        .unwrap();
+    assert!(
+        after.contains("0 pivots"),
+        "stale symbol should be pruned after re-index, got: {}",
+        after
+    );
+
+    // Kept symbol must still be present.
+    let kept = engine
+        .get_context_capsule("kept_fn", None, None, None)
+        .unwrap();
+    assert!(kept.contains("kept_fn"), "kept symbol should survive prune");
+}

@@ -233,6 +233,59 @@ impl Database {
         Ok(())
     }
 
+    /// Return all symbol IDs belonging to a file (for cleanup in Tantivy/embeddings).
+    pub fn symbol_ids_for_file(&self, file_path: &str) -> Result<Vec<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM symbols WHERE file_path = ?1")?;
+        let ids = stmt
+            .query_map(params![file_path], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .map(|id| id as u64)
+            .collect();
+        Ok(ids)
+    }
+
+    /// Delete all edges referencing any of the given symbol IDs.
+    pub fn delete_edges_for_symbols(&self, symbol_ids: &[u64]) -> Result<()> {
+        for id in symbol_ids {
+            let id = *id as i64;
+            self.conn.execute(
+                "DELETE FROM edges WHERE from_id = ?1 OR to_id = ?1",
+                params![id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Delete embeddings for the given symbol IDs.
+    pub fn delete_embeddings_for_symbols(&self, symbol_ids: &[u64]) -> Result<()> {
+        for id in symbol_ids {
+            self.conn.execute(
+                "DELETE FROM symbol_embeddings WHERE symbol_id = ?1",
+                params![*id as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove a file entry from the files table.
+    pub fn delete_file(&self, file_path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM files WHERE path = ?1", params![file_path])?;
+        Ok(())
+    }
+
+    /// Return all file paths tracked in the files table.
+    pub fn all_file_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let paths = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(paths)
+    }
+
     pub fn get_symbol(&self, id: u64) -> Result<Option<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,fqn,name,kind,file_path,start_line,end_line,\
