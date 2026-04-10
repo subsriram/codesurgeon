@@ -251,6 +251,8 @@ codesurgeon memory                         # List saved observations (shows IDs)
 codesurgeon memory --delete <id>           # Delete an observation by ID
 codesurgeon observe "insight text"         # Save a manual observation
 codesurgeon observe "insight" --symbol src/http.rs::send  # Attach to a symbol
+codesurgeon submit-lsp-edges edges.json    # Push LSP-resolved type edges from a file
+cat edges.json | codesurgeon submit-lsp-edges  # …or from stdin
 ```
 
 ## Language support
