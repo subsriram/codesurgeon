@@ -1626,9 +1626,15 @@ impl CoreEngine {
         Ok(0)
     }
 
-    /// Fetch recent observations and rank them by semantic relevance to the query.
-    /// Falls back to recency order when embeddings are unavailable.
-    /// Observations below the minimum similarity threshold are excluded.
+    /// Fetch observations ranked by semantic relevance to `query`.
+    ///
+    /// Pulls a pool of `limit * 3` recent observations from the memory store, embeds them
+    /// alongside the query, and returns up to `limit` entries sorted by descending cosine
+    /// similarity. Entries scoring below [`OBSERVATION_MIN_SIMILARITY`] are excluded entirely
+    /// so irrelevant observations never consume capsule budget.
+    ///
+    /// Falls back to plain recency order when the embedder is unavailable (e.g. the process
+    /// was started without the `embeddings` feature, or the model hasn't been loaded yet).
     #[cfg(feature = "embeddings")]
     fn ranked_observations(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         // Fetch a larger pool so we can select the most relevant subset.
@@ -2518,12 +2524,19 @@ fn merge_cluster_content(obs: &[&crate::memory::Observation]) -> String {
     }
 }
 
-/// Minimum cosine similarity for an observation to be included in a capsule.
+/// Minimum cosine similarity an observation must have to appear in a context capsule.
+/// Observations below this threshold are considered topically unrelated to the query
+/// and are excluded before the budget pass, so they can't crowd out relevant content.
 #[cfg(feature = "embeddings")]
 const OBSERVATION_MIN_SIMILARITY: f32 = 0.3;
 
-/// Score observation vectors against a query vector, filter by minimum similarity,
-/// sort descending, and return the indices of the top `limit` observations.
+/// Score `obs_vecs` against `query_vec` by cosine similarity, drop entries below
+/// [`OBSERVATION_MIN_SIMILARITY`], sort descending, and return the indices of the
+/// top `limit` survivors.
+///
+/// Returns indices into the original `obs_vecs` slice so the caller can look up the
+/// corresponding [`Observation`] without copying. The returned vec may be shorter than
+/// `limit` when fewer than `limit` observations pass the similarity threshold.
 #[cfg(feature = "embeddings")]
 fn rank_by_similarity(query_vec: &[f32], obs_vecs: &[Vec<f32>], limit: usize) -> Vec<usize> {
     let mut pairs: Vec<(usize, f32)> = obs_vecs
