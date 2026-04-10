@@ -141,7 +141,12 @@ impl SearchIndex {
                 // Fall back to a fuzzy name search
                 query_parser
                     .parse_query(&escape_for_tantivy(query))
-                    .unwrap_or_else(|_| query_parser.parse_query("*").unwrap())
+                    .unwrap_or_else(|_| {
+                        // "*" is a valid Tantivy query — this expect cannot fail.
+                        query_parser
+                            .parse_query("*")
+                            .expect("parsing literal '*' query should never fail")
+                    })
             }
         };
 

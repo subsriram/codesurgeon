@@ -200,11 +200,24 @@ impl MemoryConfig {
     /// If the file is missing or the `[memory]` section is absent, returns defaults.
     pub fn load_from_toml(path: &std::path::Path) -> Self {
         let mut cfg = MemoryConfig::default();
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return cfg;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return cfg,
+            Err(e) => {
+                tracing::warn!("Failed to read {}: {}", path.display(), e);
+                return cfg;
+            }
         };
-        let Ok(table) = text.parse::<toml::Table>() else {
-            return cfg;
+        let table = match text.parse::<toml::Table>() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "Malformed TOML in {}: {} — using default memory config",
+                    path.display(),
+                    e
+                );
+                return cfg;
+            }
         };
         if let Some(memory) = table.get("memory").and_then(|v| v.as_table()) {
             if let Some(v) = memory.get("auto_ttl_days").and_then(|v| v.as_integer()) {

@@ -835,6 +835,8 @@ impl CoreEngine {
             {
                 let db = self.db.lock();
                 db.begin_transaction()?;
+                let mut failed_chunks = 0u32;
+                let total_chunks = (all_symbols.len() + 63) / 64;
                 for chunk_syms in all_symbols.chunks(64) {
                     let chunk_texts: Vec<String> =
                         chunk_syms.iter().map(|s| skeleton_text(s)).collect();
@@ -847,8 +849,18 @@ impl CoreEngine {
                                 }
                             }
                         }
-                        Err(e) => tracing::warn!("embed_batch error: {}", e),
+                        Err(e) => {
+                            failed_chunks += 1;
+                            tracing::warn!("embed_batch error: {}", e);
+                        }
                     }
+                }
+                if failed_chunks > 0 {
+                    tracing::error!(
+                        "Embedding degraded: {}/{} chunks failed — semantic search may return incomplete results",
+                        failed_chunks,
+                        total_chunks
+                    );
                 }
                 db.commit_transaction()?;
             }

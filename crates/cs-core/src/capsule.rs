@@ -293,11 +293,10 @@ pub fn chunk_for_query(body: &str, query: &str, max_tokens: u32) -> String {
         result_lines.push(lines[0]); // always include signature
         result_lines.push("  // ... (lines omitted) ...");
     }
-    let (_, best_end) = windows
-        .iter()
-        .find(|(s, _)| *s == best_start)
-        .copied()
-        .unwrap();
+    let (_, best_end) = match windows.iter().find(|(s, _)| *s == best_start).copied() {
+        Some(pair) => pair,
+        None => return body.to_string(), // should never happen — best_start came from windows
+    };
     result_lines.extend_from_slice(&lines[best_start..best_end]);
     if best_end < lines.len() {
         result_lines.push("  // ... (lines omitted) ...");

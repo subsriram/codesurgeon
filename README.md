@@ -401,6 +401,54 @@ Or add the release directory to your PATH, or symlink:
 ln -s /path/to/codesurgeon/target/release/codesurgeon /usr/local/bin/codesurgeon
 ```
 
+---
+
+### Enabling debug logging
+
+Set `RUST_LOG` to see detailed output from the MCP server or CLI:
+
+```bash
+# Info-level (recommended for troubleshooting)
+RUST_LOG=info CS_WORKSPACE=/path/to/project codesurgeon query "my search"
+
+# Debug-level (verbose — shows every file indexed, every query scored)
+RUST_LOG=debug CS_WORKSPACE=/path/to/project ./target/release/codesurgeon-mcp
+
+# Trace a specific module
+RUST_LOG=cs_core::engine=debug codesurgeon query "my search"
+```
+
+## Configuration
+
+codesurgeon is configured via `.codesurgeon/config.toml` in your project root.
+All settings are optional — sensible defaults apply when the file is missing.
+
+```toml
+[indexing]
+# Enable TypeScript compiler enrichment (requires node + typescript in node_modules)
+ts_types = false
+
+# Enable Pyright type enrichment (requires pyright on PATH)
+python_pyright = false
+
+# Enable cargo-expand macro enrichment (requires cargo-expand)
+rust_expand_macros = false
+
+# Enable rustdoc JSON type enrichment (requires nightly Rust)
+rust_rustdoc_types = false
+
+[memory]
+# Auto-observations expire after this many days (default: 7)
+auto_ttl_days = 7
+
+# Manual observations never expire by default; set to override
+# manual_ttl_days = 90
+
+[git]
+# Write manifest.json for git-tracked index metadata
+track_manifest = false
+```
+
 ## License
 
 MIT
