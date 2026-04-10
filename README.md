@@ -72,7 +72,7 @@ Query: "fix the retry logic in the HTTP client"
 ### 1. Build
 
 ```bash
-git clone https://github.com/sriramk/codesurgeon
+git clone https://github.com/subsriram/codesurgeon
 cd codesurgeon
 
 # Apple Silicon (Metal embeddings, recommended)

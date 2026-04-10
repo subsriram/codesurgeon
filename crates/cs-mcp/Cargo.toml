@@ -2,6 +2,12 @@
 name = "cs-mcp"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server for codesurgeon — local-first codebase context engine for AI coding agents"
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "codesurgeon-mcp"
