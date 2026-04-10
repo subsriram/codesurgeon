@@ -128,6 +128,43 @@ fn index_empty_workspace_exits_zero() {
     assert!(out.status.success(), "index failed: {}", stderr(&out));
 }
 
+/// `index --force` must succeed and re-parse all files.
+#[test]
+fn index_force_reparses_all_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.py"), "def hello():\n    return 1\n").unwrap();
+
+    // First index.
+    let idx1 = run(&dir, &["index"]);
+    assert!(
+        idx1.status.success(),
+        "first index failed: {}",
+        stderr(&idx1)
+    );
+
+    // Second index without --force should skip unchanged files.
+    let idx2 = run(&dir, &["index"]);
+    assert!(idx2.status.success());
+    let err2 = stderr(&idx2);
+    assert!(
+        err2.contains("skipped") || err2.contains("unchanged"),
+        "expected incremental skip message: {err2}"
+    );
+
+    // Third index with --force should re-parse everything.
+    let idx3 = run(&dir, &["index", "--force"]);
+    assert!(
+        idx3.status.success(),
+        "force index failed: {}",
+        stderr(&idx3)
+    );
+    let out3 = stdout(&idx3);
+    assert!(
+        out3.contains("(force)"),
+        "expected '(force)' in output: {out3}"
+    );
+}
+
 // ── search ────────────────────────────────────────────────────────────────────
 
 /// `search` on an empty workspace must exit zero (no results is not an error).
@@ -347,5 +384,139 @@ fn submit_lsp_edges_missing_file_exits_nonzero() {
     assert!(
         !out.status.success(),
         "expected non-zero exit for missing file"
+    );
+}
+
+// ── context ──────────────────────────────────────────────────────────────────
+
+/// `context` on an empty workspace must exit zero (no results is not an error).
+#[test]
+fn context_on_empty_workspace_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&dir, &["context", "find authentication logic"]);
+    assert!(
+        out.status.success(),
+        "context failed on empty workspace: {}",
+        stderr(&out)
+    );
+}
+
+/// `context` with --budget flag must be accepted by clap.
+#[test]
+fn context_accepts_budget_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&dir, &["context", "test query", "--budget", "2000"]);
+    assert!(
+        out.status.success(),
+        "context with --budget failed: {}",
+        stderr(&out)
+    );
+}
+
+/// `context` with --language and --file-hint flags must be accepted.
+#[test]
+fn context_accepts_language_and_file_hint_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(
+        &dir,
+        &[
+            "context",
+            "test query",
+            "--language",
+            "rust",
+            "--file-hint",
+            "src/lib",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "context with flags failed: {}",
+        stderr(&out)
+    );
+}
+
+/// `context` without a task argument must exit non-zero.
+#[test]
+fn context_without_task_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&dir, &["context"]);
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit when task is missing"
+    );
+}
+
+// ── config ───────────────────────────────────────────────────────────────────
+
+/// `config` on workspace without config file must exit zero and show defaults message.
+#[test]
+fn config_shows_defaults_when_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&dir, &["config"]);
+    assert!(out.status.success(), "config failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("defaults"),
+        "expected 'defaults' message in config output: {text}"
+    );
+}
+
+/// `config` with a config file present must display its contents.
+#[test]
+fn config_displays_config_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let cs_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&cs_dir).unwrap();
+    std::fs::write(cs_dir.join("config.toml"), "[indexing]\nts_types = true\n").unwrap();
+
+    let out = run(&dir, &["config"]);
+    assert!(out.status.success(), "config failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("ts_types = true"),
+        "expected config file contents in output: {text}"
+    );
+}
+
+/// `config` shows effective skeleton_detail and token_budget from [context] section.
+#[test]
+fn config_shows_context_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let cs_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&cs_dir).unwrap();
+    std::fs::write(
+        cs_dir.join("config.toml"),
+        "[context]\nmax_tokens = 8000\nskeleton_detail = \"detailed\"\n",
+    )
+    .unwrap();
+
+    let out = run(&dir, &["config"]);
+    assert!(out.status.success(), "config failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Detailed"),
+        "expected 'Detailed' skeleton_detail: {text}"
+    );
+    assert!(text.contains("8000"), "expected token_budget 8000: {text}");
+}
+
+// ── indexing progress ────────────────────────────────────────────────────────
+
+/// `index` must produce progress output on stderr with [codesurgeon] prefix.
+#[test]
+fn index_progress_output_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "def greet():\n    return 'hi'\n").unwrap();
+
+    let out = run(&dir, &["index"]);
+    assert!(out.status.success(), "index failed: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("[codesurgeon]"),
+        "expected [codesurgeon] progress prefix in stderr: {err}"
+    );
+    assert!(
+        err.contains("done"),
+        "expected 'done' progress line in stderr: {err}"
     );
 }

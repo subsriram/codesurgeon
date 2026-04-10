@@ -127,6 +127,18 @@ pub struct IndexingConfig {
     /// Set via `CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true`
     /// in `config.toml`. Default: false (manifest.json is gitignored).
     pub track_manifest: bool,
+
+    /// Token budget per context capsule.
+    /// Set via `[context] max_tokens = 8000` in `config.toml`. Default: None (use engine default).
+    pub max_tokens: Option<u32>,
+
+    /// Skeleton detail level: "minimal", "standard", or "detailed".
+    /// Set via `[context] skeleton_detail = "standard"` in `config.toml`. Default: None.
+    pub skeleton_detail: Option<String>,
+
+    /// USD cost per token for savings display in `get_stats`.
+    /// Set via `[observability] token_rate_usd = 0.000003` in `config.toml`. Default: None.
+    pub token_rate_usd: Option<f64>,
 }
 
 impl IndexingConfig {
@@ -158,12 +170,98 @@ impl IndexingConfig {
                 cfg.track_manifest = v;
             }
         }
+        if let Some(context) = table.get("context").and_then(|v| v.as_table()) {
+            if let Some(v) = context.get("max_tokens").and_then(|v| v.as_integer()) {
+                cfg.max_tokens = Some(v.max(100) as u32);
+            }
+            if let Some(v) = context.get("skeleton_detail").and_then(|v| v.as_str()) {
+                cfg.skeleton_detail = Some(v.to_string());
+            }
+        }
+        if let Some(obs) = table.get("observability").and_then(|v| v.as_table()) {
+            if let Some(v) = obs.get("token_rate_usd").and_then(|v| v.as_float()) {
+                cfg.token_rate_usd = Some(v);
+            }
+        }
         // CS_TRACK_MANIFEST env var overrides config.toml
         if std::env::var("CS_TRACK_MANIFEST").as_deref() == Ok("1") {
             cfg.track_manifest = true;
         }
         cfg
     }
+
+    /// Load user-level config from `~/.config/codesurgeon/config.toml`, then
+    /// overlay workspace-level config on top. Workspace settings take precedence.
+    pub fn load_with_user_fallback(workspace_config: &std::path::Path) -> Self {
+        // Start with user-level config as base (lower precedence).
+        let user_config = dirs_or_home().join("config.toml");
+        let mut cfg = if user_config.exists() {
+            Self::load_from_toml(&user_config)
+        } else {
+            Self::default()
+        };
+
+        // Overlay workspace config (higher precedence).
+        if workspace_config.exists() {
+            let ws = Self::load_from_toml(workspace_config);
+            if ws.rust_expand_macros {
+                cfg.rust_expand_macros = true;
+            }
+            if ws.rust_rustdoc_types {
+                cfg.rust_rustdoc_types = true;
+            }
+            if ws.python_pyright {
+                cfg.python_pyright = true;
+            }
+            if ws.ts_types {
+                cfg.ts_types = true;
+            }
+            if ws.track_manifest {
+                cfg.track_manifest = true;
+            }
+            if ws.max_tokens.is_some() {
+                cfg.max_tokens = ws.max_tokens;
+            }
+            if ws.skeleton_detail.is_some() {
+                cfg.skeleton_detail = ws.skeleton_detail;
+            }
+            if ws.token_rate_usd.is_some() {
+                cfg.token_rate_usd = ws.token_rate_usd;
+            }
+        }
+
+        // CS_TRACK_MANIFEST env var overrides everything
+        if std::env::var("CS_TRACK_MANIFEST").as_deref() == Ok("1") {
+            cfg.track_manifest = true;
+        }
+        cfg
+    }
+}
+
+/// Return `~/.config/codesurgeon/` (or a fallback).
+fn dirs_or_home() -> std::path::PathBuf {
+    if let Some(config_dir) = dirs_path() {
+        config_dir.join("codesurgeon")
+    } else {
+        std::path::PathBuf::from(".config/codesurgeon")
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dirs_path() -> Option<std::path::PathBuf> {
+    std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn dirs_path() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA").ok().map(std::path::PathBuf::from)
 }
 
 // ── MemoryConfig ───────────────────────────────────────────────────────────────
@@ -200,11 +298,24 @@ impl MemoryConfig {
     /// If the file is missing or the `[memory]` section is absent, returns defaults.
     pub fn load_from_toml(path: &std::path::Path) -> Self {
         let mut cfg = MemoryConfig::default();
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return cfg;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return cfg,
+            Err(e) => {
+                tracing::warn!("Failed to read {}: {}", path.display(), e);
+                return cfg;
+            }
         };
-        let Ok(table) = text.parse::<toml::Table>() else {
-            return cfg;
+        let table = match text.parse::<toml::Table>() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "Malformed TOML in {}: {} — using default memory config",
+                    path.display(),
+                    e
+                );
+                return cfg;
+            }
         };
         if let Some(memory) = table.get("memory").and_then(|v| v.as_table()) {
             if let Some(v) = memory.get("auto_ttl_days").and_then(|v| v.as_integer()) {
@@ -725,6 +836,107 @@ mod obs_kind_tests {
             cfg.expires_at(&ObservationKind::Consolidated).is_some(),
             "MemoryConfig::expires_at must return Some for Consolidated"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_load_tests {
+    use super::*;
+
+    #[test]
+    fn load_from_toml_missing_file_returns_defaults() {
+        let cfg = MemoryConfig::load_from_toml(std::path::Path::new("/nonexistent/config.toml"));
+        assert_eq!(cfg.auto_ttl_days, 7);
+        assert!(cfg.manual_ttl_days.is_none());
+    }
+
+    #[test]
+    fn load_from_toml_valid_config_applies_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[memory]\nauto_ttl_days = 14\nmanual_ttl_days = 30\n",
+        )
+        .unwrap();
+        let cfg = MemoryConfig::load_from_toml(&path);
+        assert_eq!(cfg.auto_ttl_days, 14);
+        assert_eq!(cfg.manual_ttl_days, Some(30));
+    }
+
+    #[test]
+    fn load_from_toml_malformed_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[memory\n  this is not valid toml").unwrap();
+        let cfg = MemoryConfig::load_from_toml(&path);
+        // Should return defaults, not panic.
+        assert_eq!(cfg.auto_ttl_days, 7);
+    }
+
+    #[test]
+    fn load_from_toml_missing_memory_section_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[indexing]\nts_types = true\n").unwrap();
+        let cfg = MemoryConfig::load_from_toml(&path);
+        assert_eq!(cfg.auto_ttl_days, 7);
+        assert!(cfg.manual_ttl_days.is_none());
+    }
+}
+
+#[cfg(test)]
+mod indexing_config_tests {
+    use super::*;
+
+    #[test]
+    fn context_section_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[context]\nmax_tokens = 8000\nskeleton_detail = \"detailed\"\n",
+        )
+        .unwrap();
+        let cfg = IndexingConfig::load_from_toml(&path);
+        assert_eq!(cfg.max_tokens, Some(8000));
+        assert_eq!(cfg.skeleton_detail.as_deref(), Some("detailed"));
+    }
+
+    #[test]
+    fn observability_section_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[observability]\ntoken_rate_usd = 0.00001\n").unwrap();
+        let cfg = IndexingConfig::load_from_toml(&path);
+        assert!((cfg.token_rate_usd.unwrap() - 0.00001).abs() < 1e-10);
+    }
+
+    #[test]
+    fn missing_context_section_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[indexing]\nts_types = true\n").unwrap();
+        let cfg = IndexingConfig::load_from_toml(&path);
+        assert!(cfg.max_tokens.is_none());
+        assert!(cfg.skeleton_detail.is_none());
+        assert!(cfg.token_rate_usd.is_none());
+    }
+
+    #[test]
+    fn user_fallback_workspace_takes_precedence() {
+        // This test only verifies the merge logic — actual user config path
+        // is not written to avoid polluting the real home directory.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[context]\nmax_tokens = 6000\nskeleton_detail = \"minimal\"\n",
+        )
+        .unwrap();
+        let cfg = IndexingConfig::load_with_user_fallback(&path);
+        assert_eq!(cfg.max_tokens, Some(6000));
+        assert_eq!(cfg.skeleton_detail.as_deref(), Some("minimal"));
     }
 }
 

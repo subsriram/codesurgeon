@@ -247,24 +247,52 @@ impl Database {
     }
 
     /// Delete all edges referencing any of the given symbol IDs.
+    ///
+    /// Uses a single batched DELETE with `IN (...)` instead of one statement per
+    /// ID — on a file with 200 symbols this is ~200x fewer round-trips.
     pub fn delete_edges_for_symbols(&self, symbol_ids: &[u64]) -> Result<()> {
-        for id in symbol_ids {
-            let id = *id as i64;
-            self.conn.execute(
-                "DELETE FROM edges WHERE from_id = ?1 OR to_id = ?1",
-                params![id],
-            )?;
+        if symbol_ids.is_empty() {
+            return Ok(());
+        }
+        // SQLite allows up to 999 host parameters by default; chunk to stay safe.
+        for chunk in symbol_ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "DELETE FROM edges WHERE from_id IN ({p}) OR to_id IN ({p})",
+                p = placeholders
+            );
+            let params: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|id| rusqlite::types::Value::Integer(*id as i64))
+                .collect();
+            // Duplicate params for both IN clauses.
+            let mut all_params: Vec<rusqlite::types::Value> = params.clone();
+            all_params.extend(params);
+            self.conn
+                .execute(&sql, rusqlite::params_from_iter(all_params))?;
         }
         Ok(())
     }
 
     /// Delete embeddings for the given symbol IDs.
+    ///
+    /// Batched into a single `DELETE ... WHERE symbol_id IN (...)` per chunk.
     pub fn delete_embeddings_for_symbols(&self, symbol_ids: &[u64]) -> Result<()> {
-        for id in symbol_ids {
-            self.conn.execute(
-                "DELETE FROM symbol_embeddings WHERE symbol_id = ?1",
-                params![*id as i64],
-            )?;
+        if symbol_ids.is_empty() {
+            return Ok(());
+        }
+        for chunk in symbol_ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "DELETE FROM symbol_embeddings WHERE symbol_id IN ({})",
+                placeholders
+            );
+            let params: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|id| rusqlite::types::Value::Integer(*id as i64))
+                .collect();
+            self.conn
+                .execute(&sql, rusqlite::params_from_iter(params))?;
         }
         Ok(())
     }
@@ -1075,5 +1103,29 @@ mod tests {
     fn workspace_token_estimate_empty_db_returns_zero() {
         let (db, _dir) = open_temp_db();
         assert_eq!(db.workspace_token_estimate().unwrap(), 0);
+    }
+
+    /// Deleting edges for an empty list must be a no-op (not an error).
+    #[test]
+    fn delete_edges_for_symbols_empty_list_noop() {
+        let (db, _dir) = open_temp_db();
+        assert!(db.delete_edges_for_symbols(&[]).is_ok());
+    }
+
+    /// Deleting embeddings for an empty list must be a no-op (not an error).
+    #[test]
+    fn delete_embeddings_for_symbols_empty_list_noop() {
+        let (db, _dir) = open_temp_db();
+        assert!(db.delete_embeddings_for_symbols(&[]).is_ok());
+    }
+
+    /// Batched delete with > 500 IDs must chunk correctly without SQL errors.
+    #[test]
+    fn delete_edges_for_symbols_batches_over_500() {
+        let (db, _dir) = open_temp_db();
+        // Build a list of 600 fake IDs (most won't match any rows, but the SQL must not error).
+        let ids: Vec<u64> = (1..=600).collect();
+        assert!(db.delete_edges_for_symbols(&ids).is_ok());
+        assert!(db.delete_embeddings_for_symbols(&ids).is_ok());
     }
 }

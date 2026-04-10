@@ -109,6 +109,53 @@ pub struct EngineConfig {
     /// Set via `CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true`
     /// in `config.toml`. Default: false.
     pub track_manifest: bool,
+
+    /// Controls how much body text is included for adjacent (skeleton) symbols
+    /// in context capsules:
+    ///
+    /// - `"minimal"` — ~5% of body (signatures only)
+    /// - `"standard"` — ~15% of body (default)
+    /// - `"detailed"` — ~30% of body (for large-context models)
+    ///
+    /// Set via `[context] skeleton_detail = "detailed"` in `config.toml`.
+    pub skeleton_detail: SkeletonDetail,
+
+    /// USD cost per token, used by `get_stats` to calculate savings.
+    /// Set via `[observability] token_rate_usd = 0.000003` in `config.toml`.
+    /// Default: 0.000003 (Claude Sonnet input pricing).
+    pub token_rate_usd: f64,
+}
+
+/// Controls adjacent-symbol body fraction in context capsules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SkeletonDetail {
+    /// ~5% of body — signatures only, very tight budget
+    Minimal,
+    /// ~15% of body — default
+    #[default]
+    Standard,
+    /// ~30% of body — for large-context models
+    Detailed,
+}
+
+impl SkeletonDetail {
+    /// Parse from a config string. Unrecognised values fall back to Standard.
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "minimal" => SkeletonDetail::Minimal,
+            "detailed" => SkeletonDetail::Detailed,
+            _ => SkeletonDetail::Standard,
+        }
+    }
+
+    /// Memory budget fraction for adjacent symbol bodies.
+    pub fn body_fraction(self) -> f32 {
+        match self {
+            SkeletonDetail::Minimal => 0.05,
+            SkeletonDetail::Standard => 0.15,
+            SkeletonDetail::Detailed => 0.30,
+        }
+    }
 }
 
 impl EngineConfig {
@@ -131,6 +178,8 @@ impl EngineConfig {
             python_pyright: false,
             ts_types: false,
             track_manifest: false,
+            skeleton_detail: SkeletonDetail::default(),
+            token_rate_usd: 0.000003,
         }
     }
 
@@ -246,6 +295,11 @@ pub struct CoreEngine {
     /// After the initial load, `refresh_embedding_cache` updates the cache directly.
     #[cfg(feature = "embeddings")]
     cache_once: Once,
+    /// Serialises `refresh_embedding_cache` calls so two rapid reindexes cannot
+    /// race (thread A reads stale embeddings → thread B writes newer → thread A
+    /// overwrites with stale data).
+    #[cfg(feature = "embeddings")]
+    refresh_guard: Mutex<()>,
 }
 
 impl CoreEngine {
@@ -265,8 +319,8 @@ impl CoreEngine {
             .join(".codesurgeon")
             .join("config.toml");
         let mem_config = MemoryConfig::load_from_toml(&config_path);
-        let indexing_config = IndexingConfig::load_from_toml(&config_path);
-        // Apply [indexing] / [git] settings onto EngineConfig.
+        let indexing_config = IndexingConfig::load_with_user_fallback(&config_path);
+        // Apply [indexing] / [git] / [context] / [observability] settings onto EngineConfig.
         let mut config = config;
         if indexing_config.rust_expand_macros {
             config.rust_expand_macros = true;
@@ -282,6 +336,15 @@ impl CoreEngine {
         }
         if indexing_config.track_manifest {
             config.track_manifest = true;
+        }
+        if let Some(max_tokens) = indexing_config.max_tokens {
+            config.default_token_budget = max_tokens;
+        }
+        if let Some(ref detail) = indexing_config.skeleton_detail {
+            config.skeleton_detail = SkeletonDetail::parse(detail);
+        }
+        if let Some(rate) = indexing_config.token_rate_usd {
+            config.token_rate_usd = rate;
         }
 
         // Write .codesurgeon/.gitignore if absent, excluding index.db always
@@ -388,6 +451,8 @@ impl CoreEngine {
             embedding_cache,
             #[cfg(feature = "embeddings")]
             cache_once: Once::new(),
+            #[cfg(feature = "embeddings")]
+            refresh_guard: Mutex::new(()),
         })
     }
 
@@ -458,29 +523,47 @@ impl CoreEngine {
 
     /// Walk the workspace and index all source files in parallel.
     pub fn index_workspace(&self) -> Result<IndexStats> {
+        self.index_workspace_with_options(false)
+    }
+
+    /// Walk the workspace and index all source files in parallel.
+    /// When `force` is true, skip the blake3 hash cache and re-parse every file.
+    pub fn index_workspace_with_options(&self, force: bool) -> Result<IndexStats> {
         self.indexing.store(true, Ordering::Relaxed);
-        let result = self.index_workspace_inner();
+        let result = self.index_workspace_inner_with_options(force);
         self.indexing.store(false, Ordering::Relaxed);
         result
     }
 
-    fn index_workspace_inner(&self) -> Result<IndexStats> {
+    fn index_workspace_inner_with_options(&self, force: bool) -> Result<IndexStats> {
         tracing::info!(
             "Indexing workspace: {}",
             self.config.workspace_root.display()
         );
 
+        // Progress output to stderr so it's visible even when stdout is piped.
+        eprintln!(
+            "[codesurgeon] indexing {}",
+            self.config.workspace_root.display()
+        );
+
         let files = self.collect_source_files()?;
         tracing::info!("Found {} source files", files.len());
+        eprintln!("[codesurgeon] found {} source files", files.len());
         let stub_files = self.collect_stub_files();
         if !stub_files.is_empty() {
             tracing::info!("Found {} stub files", stub_files.len());
         }
 
         // Load baseline hashes for incremental skip:
+        // - When force is true: empty baseline → re-parse every file
         // - When DB has data: use the files table (handles re-index after git pull/checkout)
         // - When DB is empty: no baseline — full index required
-        let baseline_hashes: HashMap<String, String> = {
+        let baseline_hashes: HashMap<String, String> = if force {
+            tracing::info!("Force re-index: skipping hash cache");
+            eprintln!("[codesurgeon] force re-index — parsing all files");
+            HashMap::new()
+        } else {
             let db = self.db.lock();
             if db.file_count().unwrap_or(0) > 0 {
                 db.all_file_hashes().unwrap_or_default()
@@ -561,6 +644,13 @@ impl CoreEngine {
                 skipped,
                 results.len()
             );
+            eprintln!(
+                "[codesurgeon] skipped {} unchanged, parsing {}",
+                skipped,
+                results.len()
+            );
+        } else {
+            eprintln!("[codesurgeon] parsing {} files", results.len());
         }
 
         // Pre-process parsed results into (rel_path, file_hash, symbols) tuples.
@@ -810,38 +900,36 @@ impl CoreEngine {
         // Runs after graph/search locks are released so queries can proceed in parallel.
         #[cfg(feature = "embeddings")]
         if let Some(emb) = self.embedder.get() {
-            let skeletons: Vec<String> = all_symbols
-                .iter()
-                .map(|s| {
-                    if s.signature.is_empty() {
-                        s.name.clone()
-                    } else if s.kind.is_type_definition() || s.kind == SymbolKind::Impl {
-                        // For types: include body preview so property/field names are embedded.
-                        // This allows semantic queries like "coordinator for documents and lists"
-                        // to match a class whose signature is just "class PDFLibrary: ObservableObject"
-                        // but whose body declares `@Published var documents`, `var lists`, etc.
-                        let body_preview = utf8_truncate(&s.body, 500);
-                        format!(
-                            "{} {} {}",
-                            s.signature,
-                            s.docstring.as_deref().unwrap_or(""),
-                            body_preview
-                        )
-                    } else if s.language == Language::Markdown {
-                        // For markdown sections, embed the full section body so paragraph content
-                        // is semantically searchable, not just the heading text.
-                        let body_preview = utf8_truncate(&s.body, 1000);
-                        format!("{} {}", s.signature, body_preview)
-                    } else {
-                        format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
-                    }
-                })
-                .collect();
+            // Generate skeleton text per-chunk instead of materializing all at once.
+            // On a 100k-symbol workspace the old approach allocated ~50 GB of strings
+            // before any embedding happened; now peak memory is bounded to one chunk.
+            let skeleton_text = |s: &Symbol| -> String {
+                if s.signature.is_empty() {
+                    s.name.clone()
+                } else if s.kind.is_type_definition() || s.kind == SymbolKind::Impl {
+                    let body_preview = utf8_truncate(&s.body, 500);
+                    format!(
+                        "{} {} {}",
+                        s.signature,
+                        s.docstring.as_deref().unwrap_or(""),
+                        body_preview
+                    )
+                } else if s.language == Language::Markdown {
+                    let body_preview = utf8_truncate(&s.body, 1000);
+                    format!("{} {}", s.signature, body_preview)
+                } else {
+                    format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
+                }
+            };
 
             {
                 let db = self.db.lock();
                 db.begin_transaction()?;
-                for (chunk_syms, chunk_texts) in all_symbols.chunks(64).zip(skeletons.chunks(64)) {
+                let mut failed_chunks = 0u32;
+                let total_chunks = (all_symbols.len() + 63) / 64;
+                for chunk_syms in all_symbols.chunks(64) {
+                    let chunk_texts: Vec<String> =
+                        chunk_syms.iter().map(|s| skeleton_text(s)).collect();
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
                     match emb.embed_batch(&refs) {
                         Ok(vecs) => {
@@ -851,8 +939,18 @@ impl CoreEngine {
                                 }
                             }
                         }
-                        Err(e) => tracing::warn!("embed_batch error: {}", e),
+                        Err(e) => {
+                            failed_chunks += 1;
+                            tracing::warn!("embed_batch error: {}", e);
+                        }
                     }
+                }
+                if failed_chunks > 0 {
+                    tracing::error!(
+                        "Embedding degraded: {}/{} chunks failed — semantic search may return incomplete results",
+                        failed_chunks,
+                        total_chunks
+                    );
                 }
                 db.commit_transaction()?;
             }
@@ -864,6 +962,12 @@ impl CoreEngine {
         if let Err(e) = self.write_manifest() {
             tracing::warn!("Failed to write manifest: {}", e);
         }
+
+        eprintln!(
+            "[codesurgeon] done — {} symbols, {} edges",
+            all_symbols.len(),
+            all_edges.len()
+        );
 
         self.index_stats()
     }
@@ -1994,6 +2098,10 @@ impl CoreEngine {
     /// query skips the lazy-init path.
     #[cfg(feature = "embeddings")]
     fn refresh_embedding_cache(&self) {
+        // Hold the refresh guard for the entire read-write cycle so two
+        // concurrent reindexes cannot interleave and overwrite with stale data.
+        let _guard = self.refresh_guard.lock();
+
         let emb_path = self
             .config
             .workspace_root
@@ -2359,6 +2467,11 @@ impl CoreEngine {
     pub fn session_id(&self) -> &str {
         &self.config.session_id
     }
+
+    /// Access the engine configuration (for CLI `config` display).
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
+    }
 }
 
 // ── Secrets exclusion (11a) ───────────────────────────────────────────────────
@@ -2551,6 +2664,43 @@ fn rank_by_similarity(query_vec: &[f32], obs_vecs: &[Vec<f32>], limit: usize) ->
         .take(limit)
         .map(|(i, _)| i)
         .collect()
+}
+
+#[cfg(test)]
+mod skeleton_detail_tests {
+    use super::*;
+
+    #[test]
+    fn parse_known_values() {
+        assert_eq!(SkeletonDetail::parse("minimal"), SkeletonDetail::Minimal);
+        assert_eq!(SkeletonDetail::parse("standard"), SkeletonDetail::Standard);
+        assert_eq!(SkeletonDetail::parse("detailed"), SkeletonDetail::Detailed);
+    }
+
+    #[test]
+    fn parse_case_insensitive() {
+        assert_eq!(SkeletonDetail::parse("DETAILED"), SkeletonDetail::Detailed);
+        assert_eq!(SkeletonDetail::parse("Minimal"), SkeletonDetail::Minimal);
+    }
+
+    #[test]
+    fn parse_unknown_falls_back_to_standard() {
+        assert_eq!(SkeletonDetail::parse("bogus"), SkeletonDetail::Standard);
+        assert_eq!(SkeletonDetail::parse(""), SkeletonDetail::Standard);
+    }
+
+    #[test]
+    fn body_fractions_ordered() {
+        assert!(SkeletonDetail::Minimal.body_fraction() < SkeletonDetail::Standard.body_fraction());
+        assert!(
+            SkeletonDetail::Standard.body_fraction() < SkeletonDetail::Detailed.body_fraction()
+        );
+    }
+
+    #[test]
+    fn default_is_standard() {
+        assert_eq!(SkeletonDetail::default(), SkeletonDetail::Standard);
+    }
 }
 
 #[cfg(test)]

@@ -67,12 +67,18 @@ Query: "fix the retry logic in the HTTP client"
            └─ Adjacents (20): signatures only (70–90% smaller)
 ```
 
-## Quick start
+## Installation
 
-### 1. Build
+### Requirements
+
+- **Rust 1.75+** (install via [rustup](https://rustup.rs))
+- **macOS or Linux** (Windows is untested)
+- **Optional:** Node.js (for TypeScript enrichment), pyright (for Python enrichment)
+
+### Build from source
 
 ```bash
-git clone https://github.com/sriramk/codesurgeon
+git clone https://github.com/subsriram/codesurgeon
 cd codesurgeon
 
 # Apple Silicon (Metal embeddings, recommended)
@@ -84,6 +90,10 @@ cargo build --release --features embeddings
 # No embeddings (BM25 + graph only)
 cargo build --release
 ```
+
+This produces two binaries in `target/release/`:
+- `codesurgeon` — the CLI
+- `codesurgeon-mcp` — the MCP server (add to Claude Code / Codex)
 
 ### 2. Add to Claude Code
 
@@ -245,7 +255,11 @@ codesurgeon search "retry logic"           # BM25 search
 codesurgeon skeleton src/http.rs           # File skeleton
 codesurgeon impact src/http.rs::send       # Blast radius
 codesurgeon flow src/http.rs::send src/retry.rs::with_retry  # Logic flow
-codesurgeon diff < my.patch               # Diff-aware capsule
+codesurgeon diff - < my.patch             # Diff-aware capsule (stdin)
+git diff | codesurgeon diff -             # Pipe from git diff
+codesurgeon diff "$(git diff)"           # Inline diff text
+codesurgeon context "fix auth bug"       # Full run_pipeline from CLI
+codesurgeon config                       # Show current configuration
 codesurgeon docs                           # Generate per-module CLAUDE.md files
 codesurgeon memory                         # List saved observations (shows IDs)
 codesurgeon memory --delete <id>           # Delete an observation by ID
@@ -401,6 +415,84 @@ Or add the release directory to your PATH, or symlink:
 ln -s /path/to/codesurgeon/target/release/codesurgeon /usr/local/bin/codesurgeon
 ```
 
+---
+
+### Enabling debug logging
+
+Set `RUST_LOG` to see detailed output from the MCP server or CLI:
+
+```bash
+# Info-level (recommended for troubleshooting)
+RUST_LOG=info CS_WORKSPACE=/path/to/project codesurgeon query "my search"
+
+# Debug-level (verbose — shows every file indexed, every query scored)
+RUST_LOG=debug CS_WORKSPACE=/path/to/project ./target/release/codesurgeon-mcp
+
+# Trace a specific module
+RUST_LOG=cs_core::engine=debug codesurgeon query "my search"
+```
+
+## Configuration
+
+codesurgeon is configured via `.codesurgeon/config.toml` in your project root.
+A user-level fallback at `~/.config/codesurgeon/config.toml` is also loaded
+(workspace settings take precedence). All settings are optional — sensible
+defaults apply when files are missing.
+
+```toml
+[context]
+# Token budget per context capsule (default: 4000)
+max_tokens = 4000
+
+# How much body text to include for adjacent (skeleton) symbols:
+#   "minimal"  — ~5% of body (signatures only, very tight)
+#   "standard" — ~15% of body (default)
+#   "detailed" — ~30% of body (for large-context models like claude-opus)
+skeleton_detail = "standard"
+
+[indexing]
+# Enable TypeScript compiler enrichment (requires node + typescript in node_modules)
+ts_types = false
+
+# Enable Pyright type enrichment (requires pyright on PATH)
+python_pyright = false
+
+# Enable cargo-expand macro enrichment (requires cargo-expand)
+rust_expand_macros = false
+
+# Enable rustdoc JSON type enrichment (requires nightly Rust)
+rust_rustdoc_types = false
+
+[memory]
+# Auto-observations expire after this many days (default: 7)
+auto_ttl_days = 7
+
+# Manual observations never expire by default; set to override
+# manual_ttl_days = 90
+
+[git]
+# Write manifest.json for git-tracked index metadata
+track_manifest = false
+
+[observability]
+# USD cost per token for savings display in `codesurgeon stats` (default: 0.000003)
+token_rate_usd = 0.000003
+```
+
+Run `codesurgeon config` to see the effective merged settings and their sources.
+
+## Contributing
+
+Contributions are welcome! Before submitting a PR, run the pre-commit checklist:
+
+```bash
+cargo fmt --all          # Format
+cargo clippy --workspace -- -D warnings  # Lint (warnings are errors in CI)
+cargo test --workspace   # Tests
+```
+
+All three must pass. See `.github/workflows/ci.yml` for the exact CI checks.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE) for details.

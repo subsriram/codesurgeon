@@ -57,6 +57,11 @@ impl EmbeddingStore {
         let count = u64::from_le_bytes(mmap[8..16].try_into().ok()?) as usize;
         let dim = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
 
+        // Guard against corrupt dim/count that would overflow the size arithmetic.
+        if dim == 0 || dim > 16384 || count > usize::MAX / (8 + dim * 4) {
+            return None;
+        }
+
         let expected = HEADER_SIZE + count * (8 + dim * 4);
         if mmap.len() != expected {
             return None;
@@ -165,7 +170,12 @@ impl<'a> Iterator for EmbeddingIter<'a> {
             StoreInner::Mmap(mmap) => {
                 let entry_size = 8 + self.store.dim * 4;
                 let off = HEADER_SIZE + self.pos * entry_size;
-                let id = u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap());
+                // Safety: open() validated mmap length == HEADER_SIZE + count * entry_size,
+                // and pos < count is checked above, so this slice is always 8 bytes.
+                let id = u64::from_le_bytes(match mmap[off..off + 8].try_into() {
+                    Ok(b) => b,
+                    Err(_) => return None,
+                });
                 let floats_bytes = &mmap[off + 8..off + entry_size];
                 // Safety: the file layout guarantees 4-byte alignment for the
                 // float region (HEADER_SIZE=20 + entry_size multiples of 4) and
@@ -281,5 +291,41 @@ mod tests {
     fn write_errors_on_empty_input() {
         let dir = TempDir::new().unwrap();
         assert!(EmbeddingStore::write_and_open(&dir.path().join("empty.bin"), &[]).is_err());
+    }
+
+    #[test]
+    fn open_dim_zero_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dim0.bin");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CSEMB001");
+        buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&0u32.to_le_bytes()); // dim = 0 (invalid)
+        std::fs::write(&path, &buf).unwrap();
+        assert!(EmbeddingStore::open(&path).is_none());
+    }
+
+    #[test]
+    fn open_dim_overflow_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dim_huge.bin");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CSEMB001");
+        buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&20000u32.to_le_bytes()); // dim > 16384 limit
+        std::fs::write(&path, &buf).unwrap();
+        assert!(EmbeddingStore::open(&path).is_none());
+    }
+
+    #[test]
+    fn open_count_overflow_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("count_huge.bin");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CSEMB001");
+        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // count = MAX (overflow)
+        buf.extend_from_slice(&4u32.to_le_bytes()); // dim = 4
+        std::fs::write(&path, &buf).unwrap();
+        assert!(EmbeddingStore::open(&path).is_none());
     }
 }

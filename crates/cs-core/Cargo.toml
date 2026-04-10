@@ -2,6 +2,12 @@
 name = "cs-core"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core library for codesurgeon — local-first codebase context engine for AI coding agents"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # Async
