@@ -35,6 +35,23 @@ enum Commands {
         budget: u32,
     },
 
+    /// Run the full context pipeline (same as MCP run_pipeline)
+    Context {
+        /// Task description, e.g. "fix the retry logic in the HTTP client"
+        task: String,
+        #[arg(short, long, default_value = "4000")]
+        budget: u32,
+        /// Restrict results to a single language (e.g. rust, python, typescript)
+        #[arg(short, long)]
+        language: Option<String>,
+        /// Seed the search with a file path substring (e.g. src/auth)
+        #[arg(short, long)]
+        file_hint: Option<String>,
+    },
+
+    /// Show current configuration
+    Config,
+
     /// Show skeleton (signatures only) for a file
     Skeleton { file_path: String },
 
@@ -122,6 +139,48 @@ async fn main() -> Result<()> {
         Commands::Search { query, budget } => {
             let capsule = engine.get_context_capsule(&query, Some(budget), None, None)?;
             println!("{}", capsule);
+        }
+
+        Commands::Context {
+            task,
+            budget,
+            language,
+            file_hint,
+        } => {
+            let result = engine.run_pipeline(
+                &task,
+                Some(budget),
+                language.as_deref(),
+                file_hint.as_deref(),
+            )?;
+            println!("{}", result);
+        }
+
+        Commands::Config => {
+            let config_path = workspace.join(".codesurgeon").join("config.toml");
+            println!("Workspace : {}", workspace.display());
+            println!(
+                "DB path   : {}",
+                workspace.join(".codesurgeon").join("index.db").display()
+            );
+            println!(
+                "Config    : {}",
+                if config_path.exists() {
+                    config_path.display().to_string()
+                } else {
+                    "(not found — using defaults)".to_string()
+                }
+            );
+            println!();
+            if config_path.exists() {
+                match std::fs::read_to_string(&config_path) {
+                    Ok(contents) => println!("{}", contents),
+                    Err(e) => eprintln!("Error reading config: {}", e),
+                }
+            } else {
+                println!("No .codesurgeon/config.toml found. All settings use defaults.");
+                println!("See: https://github.com/subsriram/codesurgeon#configuration");
+            }
         }
 
         Commands::Skeleton { file_path } => {

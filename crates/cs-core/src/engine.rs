@@ -470,8 +470,15 @@ impl CoreEngine {
             self.config.workspace_root.display()
         );
 
+        // Progress output to stderr so it's visible even when stdout is piped.
+        eprintln!(
+            "[codesurgeon] indexing {}",
+            self.config.workspace_root.display()
+        );
+
         let files = self.collect_source_files()?;
         tracing::info!("Found {} source files", files.len());
+        eprintln!("[codesurgeon] found {} source files", files.len());
         let stub_files = self.collect_stub_files();
         if !stub_files.is_empty() {
             tracing::info!("Found {} stub files", stub_files.len());
@@ -561,6 +568,13 @@ impl CoreEngine {
                 skipped,
                 results.len()
             );
+            eprintln!(
+                "[codesurgeon] skipped {} unchanged, parsing {}",
+                skipped,
+                results.len()
+            );
+        } else {
+            eprintln!("[codesurgeon] parsing {} files", results.len());
         }
 
         // Pre-process parsed results into (rel_path, file_hash, symbols) tuples.
@@ -872,6 +886,12 @@ impl CoreEngine {
         if let Err(e) = self.write_manifest() {
             tracing::warn!("Failed to write manifest: {}", e);
         }
+
+        eprintln!(
+            "[codesurgeon] done — {} symbols, {} edges",
+            all_symbols.len(),
+            all_edges.len()
+        );
 
         self.index_stats()
     }
