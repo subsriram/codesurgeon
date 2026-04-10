@@ -14,7 +14,7 @@ Ranking runs in five stages every time `run_pipeline` or `get_context_capsule` i
 Stage 1: Candidate Retrieval
   ├── BM25 (Tantivy)          top-50 lexical matches
   ├── Graph neighbor expansion top-25 1-hop neighbors of BM25 seeds, by centrality
-  └── ANN (HNSW)              top-25 semantic nearest neighbors  [embeddings build only]
+  └── Semantic (flat scan)    top-25 semantic nearest neighbors  [embeddings build only]
        └── RRF merge ──────── fused candidate pool
 
 Stage 2: Structural injection   high-centrality hub types  [Structural intent only]
@@ -64,27 +64,27 @@ own name. These candidates would otherwise only surface as adjacents, never as p
 **Why 1 hop?** 2-hop expansion explodes combinatorially on dense call graphs (a single
 utility function called by 200 places would flood the pool with noise).
 
-### 1c. ANN semantic retrieval (`engine.rs:ann_candidates`) — embeddings build only
+### 1c. Semantic retrieval (`engine.rs:ann_candidates`) — embeddings build only
 
 - Embeds the query using NomicEmbedTextV15Q (768-dim, L2-normalised)
-- Queries an in-memory HNSW index (instant-distance) built from the embedding cache
+- Runs a parallel flat cosine scan over the in-memory embedding cache (rayon)
 - Returns top-25 nearest neighbors by cosine similarity
 
-The embedding cache and HNSW index are loaded lazily on the first semantic query
-(`cache_once` in `CoreEngine`), not at startup. This avoids allocating ~154 MB for the
-cache when semantic search is never used. After every reindex pass, `refresh_embedding_cache`
+The embedding cache is loaded lazily on the first semantic query (`cache_once` in
+`CoreEngine`), not at startup. After every reindex pass, `refresh_embedding_cache`
 updates the cache directly and marks the once as done so the lazy-init path is skipped.
 
-**Why ANN at retrieval time, not just re-ranking?** Previously, semantic scoring only
-re-ranked the BM25 pool (Stage 4). Symbols with high semantic similarity but low lexical
-overlap with the query — the hardest cases — never made it into the pool. ANN retrieval
-surfaces these symbols before any reranking occurs.
+**Why a flat scan instead of HNSW?** The previous implementation used an HNSW index
+(`instant-distance`) persisted to `hnsw.bin`. The index was exact-enough for practical
+use but added complexity: background rebuild threads, a binary persistence format, a
+stale-count invalidation check, and two extra dependencies (`instant-distance`, `bincode`).
+A rayon parallel scan over the mmap'd embedding cache is exact (100% recall), handles
+~1M vectors in <100 ms, and has zero warm-up cost — sufficient for any local codebase.
 
-**Why not score all embeddings at query time?** A full linear scan over N vectors per query
-(the original approach) costs O(N) dot products. With a 10K-symbol workspace that's 10K
-dot products for every search, ~30 MB of float data touched per query. ANN gives
-sub-linear lookup; BM25 pre-filtering (now in Stage 4) handles the remaining re-scoring
-of the ~100-candidate pool.
+**Why semantic retrieval at Stage 1, not just re-ranking?** Previously, semantic scoring
+only re-ranked the BM25 pool (Stage 4). Symbols with high semantic similarity but low
+lexical overlap with the query — the hardest cases — never made it into the pool.
+Semantic retrieval surfaces these symbols before any reranking occurs.
 
 ### 1d. RRF merge (`engine.rs:rrf_merge`)
 
@@ -292,7 +292,7 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 |-----------|-------|----------|
 | BM25 pool size | 50 | `engine.rs:BM25_POOL_SIZE` |
 | Graph neighbor candidates | 25 | `engine.rs:GRAPH_CANDIDATES` |
-| ANN candidates | 25 | `engine.rs:ANN_CANDIDATES` |
+| Semantic retrieval candidates | 25 | `engine.rs:ANN_CANDIDATES` |
 | RRF k constant | 60 | `engine.rs:RRF_K` |
 | Structural injection cap | `max_pivots * 2` = 16 | `engine.rs:inject_structural_candidates` |
 | Injected candidate score | `family_in_degree * 5.0` | `engine.rs:inject_structural_candidates` |

@@ -136,6 +136,31 @@ set by the AST diff in `reindex_file`. See `docs/change-categories.md` for detai
 
 ---
 
+## Capsule memory injection
+
+When a context capsule is assembled (`run_pipeline`, `get_context_capsule`,
+`get_diff_capsule`), observations are injected into the capsule's memory section.
+The selection uses semantic relevance rather than plain recency:
+
+**`engine.rs::ranked_observations`:**
+
+1. Fetch a pool of `limit * 3` (min 30) recent non-expired observations.
+2. Embed all observation contents in one batch alongside the query (embeddings build only).
+3. Score each observation by cosine similarity to the query vector.
+4. Drop any observation below `OBSERVATION_MIN_SIMILARITY` (0.3) — these are considered
+   topically unrelated and must not consume capsule budget.
+5. Return the top `limit` survivors sorted by descending similarity.
+
+Falls back to plain recency order when the embedder is unavailable.
+
+For `get_diff_capsule`, which has no single query string, a synthetic query is constructed
+from the names of the changed symbols and used for ranking.
+
+Memory entries are then passed to `build_capsule`, which fits them into a 15% token budget
+reserve in order, stopping when that sub-budget is exhausted.
+
+---
+
 ## Parameters
 
 | Parameter | Value | Location |
@@ -143,6 +168,11 @@ set by the AST diff in `reindex_file`. See `docs/change-categories.md` for detai
 | Compression threshold | 3 observations per FQN | `memory.rs::compress_observations` |
 | Consolidation similarity threshold | 0.92 cosine | `engine.rs::consolidate_observations` |
 | Minimum cluster size | 2 | `engine.rs::consolidate_observations` |
+| Capsule memory pool size | `limit * 3` (min 30) | `engine.rs::ranked_observations` |
+| Capsule memory limit (`get_context_capsule` / `run_pipeline`) | 20 | `engine.rs::build_context_capsule` |
+| Capsule memory limit (`get_diff_capsule`) | 10 | `engine.rs::get_diff_capsule` |
+| Capsule memory min similarity | 0.3 cosine | `engine.rs::OBSERVATION_MIN_SIMILARITY` |
+| Capsule memory budget | 15% of total token budget | `capsule.rs::build_capsule` |
 | Auto/passive/thrash/dead-end TTL | 7 days | `memory.rs::ObservationKind::default_ttl_days` |
 | Summary/consolidated TTL | 90 days | `memory.rs::ObservationKind::default_ttl_days` |
 | Embedding model | NomicEmbedTextV15Q (768-dim) | `embedder.rs::Embedder::new` |
