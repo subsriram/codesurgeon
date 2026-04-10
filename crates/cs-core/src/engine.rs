@@ -810,38 +810,34 @@ impl CoreEngine {
         // Runs after graph/search locks are released so queries can proceed in parallel.
         #[cfg(feature = "embeddings")]
         if let Some(emb) = self.embedder.get() {
-            let skeletons: Vec<String> = all_symbols
-                .iter()
-                .map(|s| {
-                    if s.signature.is_empty() {
-                        s.name.clone()
-                    } else if s.kind.is_type_definition() || s.kind == SymbolKind::Impl {
-                        // For types: include body preview so property/field names are embedded.
-                        // This allows semantic queries like "coordinator for documents and lists"
-                        // to match a class whose signature is just "class PDFLibrary: ObservableObject"
-                        // but whose body declares `@Published var documents`, `var lists`, etc.
-                        let body_preview = utf8_truncate(&s.body, 500);
-                        format!(
-                            "{} {} {}",
-                            s.signature,
-                            s.docstring.as_deref().unwrap_or(""),
-                            body_preview
-                        )
-                    } else if s.language == Language::Markdown {
-                        // For markdown sections, embed the full section body so paragraph content
-                        // is semantically searchable, not just the heading text.
-                        let body_preview = utf8_truncate(&s.body, 1000);
-                        format!("{} {}", s.signature, body_preview)
-                    } else {
-                        format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
-                    }
-                })
-                .collect();
+            // Generate skeleton text per-chunk instead of materializing all at once.
+            // On a 100k-symbol workspace the old approach allocated ~50 GB of strings
+            // before any embedding happened; now peak memory is bounded to one chunk.
+            let skeleton_text = |s: &Symbol| -> String {
+                if s.signature.is_empty() {
+                    s.name.clone()
+                } else if s.kind.is_type_definition() || s.kind == SymbolKind::Impl {
+                    let body_preview = utf8_truncate(&s.body, 500);
+                    format!(
+                        "{} {} {}",
+                        s.signature,
+                        s.docstring.as_deref().unwrap_or(""),
+                        body_preview
+                    )
+                } else if s.language == Language::Markdown {
+                    let body_preview = utf8_truncate(&s.body, 1000);
+                    format!("{} {}", s.signature, body_preview)
+                } else {
+                    format!("{} {}", s.signature, s.docstring.as_deref().unwrap_or(""))
+                }
+            };
 
             {
                 let db = self.db.lock();
                 db.begin_transaction()?;
-                for (chunk_syms, chunk_texts) in all_symbols.chunks(64).zip(skeletons.chunks(64)) {
+                for chunk_syms in all_symbols.chunks(64) {
+                    let chunk_texts: Vec<String> =
+                        chunk_syms.iter().map(|s| skeleton_text(s)).collect();
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
                     match emb.embed_batch(&refs) {
                         Ok(vecs) => {
