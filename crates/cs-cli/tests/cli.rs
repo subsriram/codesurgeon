@@ -128,6 +128,43 @@ fn index_empty_workspace_exits_zero() {
     assert!(out.status.success(), "index failed: {}", stderr(&out));
 }
 
+/// `index --force` must succeed and re-parse all files.
+#[test]
+fn index_force_reparses_all_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.py"), "def hello():\n    return 1\n").unwrap();
+
+    // First index.
+    let idx1 = run(&dir, &["index"]);
+    assert!(
+        idx1.status.success(),
+        "first index failed: {}",
+        stderr(&idx1)
+    );
+
+    // Second index without --force should skip unchanged files.
+    let idx2 = run(&dir, &["index"]);
+    assert!(idx2.status.success());
+    let err2 = stderr(&idx2);
+    assert!(
+        err2.contains("skipped") || err2.contains("unchanged"),
+        "expected incremental skip message: {err2}"
+    );
+
+    // Third index with --force should re-parse everything.
+    let idx3 = run(&dir, &["index", "--force"]);
+    assert!(
+        idx3.status.success(),
+        "force index failed: {}",
+        stderr(&idx3)
+    );
+    let out3 = stdout(&idx3);
+    assert!(
+        out3.contains("(force)"),
+        "expected '(force)' in output: {out3}"
+    );
+}
+
 // ── search ────────────────────────────────────────────────────────────────────
 
 /// `search` on an empty workspace must exit zero (no results is not an error).
@@ -439,6 +476,28 @@ fn config_displays_config_contents() {
         text.contains("ts_types = true"),
         "expected config file contents in output: {text}"
     );
+}
+
+/// `config` shows effective skeleton_detail and token_budget from [context] section.
+#[test]
+fn config_shows_context_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let cs_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&cs_dir).unwrap();
+    std::fs::write(
+        cs_dir.join("config.toml"),
+        "[context]\nmax_tokens = 8000\nskeleton_detail = \"detailed\"\n",
+    )
+    .unwrap();
+
+    let out = run(&dir, &["config"]);
+    assert!(out.status.success(), "config failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Detailed"),
+        "expected 'Detailed' skeleton_detail: {text}"
+    );
+    assert!(text.contains("8000"), "expected token_budget 8000: {text}");
 }
 
 // ── indexing progress ────────────────────────────────────────────────────────

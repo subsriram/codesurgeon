@@ -70,9 +70,9 @@
 
 | # | Title | Status |
 |---|-------|--------|
-| 25 | CLI parity (context/config show/index --force) | Partially done; `context` command is highest-value gap. |
-| 24 | config.toml schema + skeleton_detail | Partially done; config loading exists but schema incomplete. |
-| 23 | First-run UX (progress, .cursor/.windsurf rules) | .gitignore done; progress + IDE rules missing. |
+| 25 | CLI parity (context/config show/index --force) | ✅ Complete — context, config, index --force all implemented. |
+| 24 | config.toml schema + skeleton_detail | ✅ Complete — skeleton_detail, [context], [observability], user-level config. |
+| 23 | First-run UX (progress, .cursor/.windsurf rules) | Mostly done; progress output done, .cursor/.windsurf rules deferred to post-1.0. |
 | 16 | Binary distribution (cargo install, Homebrew) | Not started; blocked by fastembed/ort native deps. |
 
 ### P2 — nice to have

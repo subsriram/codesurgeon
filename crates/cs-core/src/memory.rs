@@ -885,6 +885,61 @@ mod config_load_tests {
     }
 }
 
+#[cfg(test)]
+mod indexing_config_tests {
+    use super::*;
+
+    #[test]
+    fn context_section_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[context]\nmax_tokens = 8000\nskeleton_detail = \"detailed\"\n",
+        )
+        .unwrap();
+        let cfg = IndexingConfig::load_from_toml(&path);
+        assert_eq!(cfg.max_tokens, Some(8000));
+        assert_eq!(cfg.skeleton_detail.as_deref(), Some("detailed"));
+    }
+
+    #[test]
+    fn observability_section_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[observability]\ntoken_rate_usd = 0.00001\n").unwrap();
+        let cfg = IndexingConfig::load_from_toml(&path);
+        assert!((cfg.token_rate_usd.unwrap() - 0.00001).abs() < 1e-10);
+    }
+
+    #[test]
+    fn missing_context_section_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[indexing]\nts_types = true\n").unwrap();
+        let cfg = IndexingConfig::load_from_toml(&path);
+        assert!(cfg.max_tokens.is_none());
+        assert!(cfg.skeleton_detail.is_none());
+        assert!(cfg.token_rate_usd.is_none());
+    }
+
+    #[test]
+    fn user_fallback_workspace_takes_precedence() {
+        // This test only verifies the merge logic — actual user config path
+        // is not written to avoid polluting the real home directory.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[context]\nmax_tokens = 6000\nskeleton_detail = \"minimal\"\n",
+        )
+        .unwrap();
+        let cfg = IndexingConfig::load_with_user_fallback(&path);
+        assert_eq!(cfg.max_tokens, Some(6000));
+        assert_eq!(cfg.skeleton_detail.as_deref(), Some("minimal"));
+    }
+}
+
 /// Generate a new session ID.
 pub fn new_session_id() -> String {
     format!(

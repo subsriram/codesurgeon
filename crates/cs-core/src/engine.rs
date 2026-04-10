@@ -2667,6 +2667,43 @@ fn rank_by_similarity(query_vec: &[f32], obs_vecs: &[Vec<f32>], limit: usize) ->
 }
 
 #[cfg(test)]
+mod skeleton_detail_tests {
+    use super::*;
+
+    #[test]
+    fn parse_known_values() {
+        assert_eq!(SkeletonDetail::parse("minimal"), SkeletonDetail::Minimal);
+        assert_eq!(SkeletonDetail::parse("standard"), SkeletonDetail::Standard);
+        assert_eq!(SkeletonDetail::parse("detailed"), SkeletonDetail::Detailed);
+    }
+
+    #[test]
+    fn parse_case_insensitive() {
+        assert_eq!(SkeletonDetail::parse("DETAILED"), SkeletonDetail::Detailed);
+        assert_eq!(SkeletonDetail::parse("Minimal"), SkeletonDetail::Minimal);
+    }
+
+    #[test]
+    fn parse_unknown_falls_back_to_standard() {
+        assert_eq!(SkeletonDetail::parse("bogus"), SkeletonDetail::Standard);
+        assert_eq!(SkeletonDetail::parse(""), SkeletonDetail::Standard);
+    }
+
+    #[test]
+    fn body_fractions_ordered() {
+        assert!(SkeletonDetail::Minimal.body_fraction() < SkeletonDetail::Standard.body_fraction());
+        assert!(
+            SkeletonDetail::Standard.body_fraction() < SkeletonDetail::Detailed.body_fraction()
+        );
+    }
+
+    #[test]
+    fn default_is_standard() {
+        assert_eq!(SkeletonDetail::default(), SkeletonDetail::Standard);
+    }
+}
+
+#[cfg(test)]
 mod secrets_tests {
     use super::*;
     use std::io::Write;
