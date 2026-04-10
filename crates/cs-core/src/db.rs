@@ -1104,4 +1104,28 @@ mod tests {
         let (db, _dir) = open_temp_db();
         assert_eq!(db.workspace_token_estimate().unwrap(), 0);
     }
+
+    /// Deleting edges for an empty list must be a no-op (not an error).
+    #[test]
+    fn delete_edges_for_symbols_empty_list_noop() {
+        let (db, _dir) = open_temp_db();
+        assert!(db.delete_edges_for_symbols(&[]).is_ok());
+    }
+
+    /// Deleting embeddings for an empty list must be a no-op (not an error).
+    #[test]
+    fn delete_embeddings_for_symbols_empty_list_noop() {
+        let (db, _dir) = open_temp_db();
+        assert!(db.delete_embeddings_for_symbols(&[]).is_ok());
+    }
+
+    /// Batched delete with > 500 IDs must chunk correctly without SQL errors.
+    #[test]
+    fn delete_edges_for_symbols_batches_over_500() {
+        let (db, _dir) = open_temp_db();
+        // Build a list of 600 fake IDs (most won't match any rows, but the SQL must not error).
+        let ids: Vec<u64> = (1..=600).collect();
+        assert!(db.delete_edges_for_symbols(&ids).is_ok());
+        assert!(db.delete_embeddings_for_symbols(&ids).is_ok());
+    }
 }

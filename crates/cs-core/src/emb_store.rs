@@ -292,4 +292,40 @@ mod tests {
         let dir = TempDir::new().unwrap();
         assert!(EmbeddingStore::write_and_open(&dir.path().join("empty.bin"), &[]).is_err());
     }
+
+    #[test]
+    fn open_dim_zero_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dim0.bin");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CSEMB001");
+        buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&0u32.to_le_bytes()); // dim = 0 (invalid)
+        std::fs::write(&path, &buf).unwrap();
+        assert!(EmbeddingStore::open(&path).is_none());
+    }
+
+    #[test]
+    fn open_dim_overflow_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dim_huge.bin");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CSEMB001");
+        buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&20000u32.to_le_bytes()); // dim > 16384 limit
+        std::fs::write(&path, &buf).unwrap();
+        assert!(EmbeddingStore::open(&path).is_none());
+    }
+
+    #[test]
+    fn open_count_overflow_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("count_huge.bin");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CSEMB001");
+        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // count = MAX (overflow)
+        buf.extend_from_slice(&4u32.to_le_bytes()); // dim = 4
+        std::fs::write(&path, &buf).unwrap();
+        assert!(EmbeddingStore::open(&path).is_none());
+    }
 }

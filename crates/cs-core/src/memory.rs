@@ -741,6 +741,52 @@ mod obs_kind_tests {
     }
 }
 
+#[cfg(test)]
+mod config_load_tests {
+    use super::*;
+
+    #[test]
+    fn load_from_toml_missing_file_returns_defaults() {
+        let cfg = MemoryConfig::load_from_toml(std::path::Path::new("/nonexistent/config.toml"));
+        assert_eq!(cfg.auto_ttl_days, 7);
+        assert!(cfg.manual_ttl_days.is_none());
+    }
+
+    #[test]
+    fn load_from_toml_valid_config_applies_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[memory]\nauto_ttl_days = 14\nmanual_ttl_days = 30\n",
+        )
+        .unwrap();
+        let cfg = MemoryConfig::load_from_toml(&path);
+        assert_eq!(cfg.auto_ttl_days, 14);
+        assert_eq!(cfg.manual_ttl_days, Some(30));
+    }
+
+    #[test]
+    fn load_from_toml_malformed_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[memory\n  this is not valid toml").unwrap();
+        let cfg = MemoryConfig::load_from_toml(&path);
+        // Should return defaults, not panic.
+        assert_eq!(cfg.auto_ttl_days, 7);
+    }
+
+    #[test]
+    fn load_from_toml_missing_memory_section_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[indexing]\nts_types = true\n").unwrap();
+        let cfg = MemoryConfig::load_from_toml(&path);
+        assert_eq!(cfg.auto_ttl_days, 7);
+        assert!(cfg.manual_ttl_days.is_none());
+    }
+}
+
 /// Generate a new session ID.
 pub fn new_session_id() -> String {
     format!(
