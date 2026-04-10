@@ -67,9 +67,15 @@ Query: "fix the retry logic in the HTTP client"
            └─ Adjacents (20): signatures only (70–90% smaller)
 ```
 
-## Quick start
+## Installation
 
-### 1. Build
+### Requirements
+
+- **Rust 1.75+** (install via [rustup](https://rustup.rs))
+- **macOS or Linux** (Windows is untested)
+- **Optional:** Node.js (for TypeScript enrichment), pyright (for Python enrichment)
+
+### Build from source
 
 ```bash
 git clone https://github.com/subsriram/codesurgeon
@@ -84,6 +90,10 @@ cargo build --release --features embeddings
 # No embeddings (BM25 + graph only)
 cargo build --release
 ```
+
+This produces two binaries in `target/release/`:
+- `codesurgeon` — the CLI
+- `codesurgeon-mcp` — the MCP server (add to Claude Code / Codex)
 
 ### 2. Add to Claude Code
 
@@ -245,7 +255,11 @@ codesurgeon search "retry logic"           # BM25 search
 codesurgeon skeleton src/http.rs           # File skeleton
 codesurgeon impact src/http.rs::send       # Blast radius
 codesurgeon flow src/http.rs::send src/retry.rs::with_retry  # Logic flow
-codesurgeon diff < my.patch               # Diff-aware capsule
+codesurgeon diff - < my.patch             # Diff-aware capsule (stdin)
+git diff | codesurgeon diff -             # Pipe from git diff
+codesurgeon diff "$(git diff)"           # Inline diff text
+codesurgeon context "fix auth bug"       # Full run_pipeline from CLI
+codesurgeon config                       # Show current configuration
 codesurgeon docs                           # Generate per-module CLAUDE.md files
 codesurgeon memory                         # List saved observations (shows IDs)
 codesurgeon memory --delete <id>           # Delete an observation by ID
@@ -449,6 +463,18 @@ auto_ttl_days = 7
 track_manifest = false
 ```
 
+## Contributing
+
+Contributions are welcome! Before submitting a PR, run the pre-commit checklist:
+
+```bash
+cargo fmt --all          # Format
+cargo clippy --workspace -- -D warnings  # Lint (warnings are errors in CI)
+cargo test --workspace   # Tests
+```
+
+All three must pass. See `.github/workflows/ci.yml` for the exact CI checks.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE) for details.

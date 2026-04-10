@@ -246,6 +246,11 @@ pub struct CoreEngine {
     /// After the initial load, `refresh_embedding_cache` updates the cache directly.
     #[cfg(feature = "embeddings")]
     cache_once: Once,
+    /// Serialises `refresh_embedding_cache` calls so two rapid reindexes cannot
+    /// race (thread A reads stale embeddings → thread B writes newer → thread A
+    /// overwrites with stale data).
+    #[cfg(feature = "embeddings")]
+    refresh_guard: Mutex<()>,
 }
 
 impl CoreEngine {
@@ -388,6 +393,8 @@ impl CoreEngine {
             embedding_cache,
             #[cfg(feature = "embeddings")]
             cache_once: Once::new(),
+            #[cfg(feature = "embeddings")]
+            refresh_guard: Mutex::new(()),
         })
     }
 
@@ -2022,6 +2029,10 @@ impl CoreEngine {
     /// query skips the lazy-init path.
     #[cfg(feature = "embeddings")]
     fn refresh_embedding_cache(&self) {
+        // Hold the refresh guard for the entire read-write cycle so two
+        // concurrent reindexes cannot interleave and overwrite with stale data.
+        let _guard = self.refresh_guard.lock();
+
         let emb_path = self
             .config
             .workspace_root
