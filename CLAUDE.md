@@ -50,6 +50,15 @@ Binaries produced:
 - `target/release/codesurgeon-mcp` — the MCP server (add to Claude Code config)
 - `target/release/codesurgeon` — the CLI
 
+Key CLI commands (run with `CS_WORKSPACE=/path/to/project`):
+- `codesurgeon context "fix auth bug"` — full run_pipeline from the command line
+- `codesurgeon config` — show workspace path and current config.toml
+- `codesurgeon index` — index or re-index the workspace
+- `codesurgeon search "query"` — search for symbols
+- `codesurgeon skeleton src/file.rs` — file API surface
+- `codesurgeon impact src/file.rs::symbol` — blast radius
+- `codesurgeon diff - < diff.patch` — diff-aware context capsule
+
 ## Adding to Claude Code
 
 Use `claude mcp add` (CLI v2.x stores servers in `~/.claude.json`, not `mcp_settings.json`):

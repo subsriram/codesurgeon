@@ -49,7 +49,7 @@ then serves token-budgeted context capsules via MCP.
 #### MCP server (`codesurgeon-mcp`)
 - Full MCP protocol support (JSON-RPC 2.0)
 - Dual wire format: Content-Length (Codex) and NDJSON (Claude Code CLI)
-- 14 MCP tools: `run_pipeline`, `get_context_capsule`, `get_impact_graph`,
+- 13 MCP tools: `run_pipeline`, `get_context_capsule`, `get_impact_graph`,
   `get_skeleton`, `search_logic_flow`, `get_diff_capsule`, `get_stats`,
   `index_status`, `get_session_context`, `save_observation`, `search_memory`,
   `submit_lsp_edges`, `generate_module_docs`

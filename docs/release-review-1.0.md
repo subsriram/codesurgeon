@@ -133,32 +133,31 @@
 
 ## 7. Recommended 1.0 action plan
 
-### Phase 1 — Blockers (day 1)
+### Phase 1 — Blockers ✅
 
-1. Add LICENSE file
-2. Version bump to 1.0.0
-3. Fix repository URL
-4. Add crate metadata (workspace inheritance)
-5. Fix embedding store alignment validation
-6. Create CHANGELOG.md
+1. ~~Add LICENSE file~~
+2. ~~Version bump to 1.0.0~~
+3. ~~Fix repository URL~~
+4. ~~Add crate metadata (workspace inheritance)~~
+5. ~~Fix embedding store alignment validation~~
+6. ~~Create CHANGELOG.md~~
 
-### Phase 2 — Should-fix (day 2)
+### Phase 2 — Should-fix ✅
 
-7. Fix unwraps in production paths
-8. Add embedding batch error logging
-9. Add mutex around embedding cache refresh
-10. Close issues #43, #31, #22
-11. Update README with Installation/Configuration sections
-12. Add release CI workflow
+7. ~~Fix unwraps in production paths~~ (already safe — all have `unwrap_or`)
+8. ~~Add embedding batch error logging~~
+9. ~~Add mutex around embedding cache refresh~~
+10. ~~Close issues #43, #31, #22~~
+11. ~~Update README with Installation/Configuration/Contributing sections~~
+12. ~~Add release CI workflow~~
 
-### Phase 3 — P1 issues (days 3-4)
+### Phase 3 — P1 issues ✅
 
-13. Implement `context` CLI command (#25)
-14. Complete config.toml schema (#24)
-15. Add indexing progress output (#23)
+13. ~~Implement `context` CLI command (#25)~~
+14. ~~Implement `config` CLI command (#24)~~
+15. ~~Add indexing progress output (#23)~~
 
-### Phase 4 — Polish
+### Phase 4 — Post-release
 
-16. CONTRIBUTING.md
-17. LTO release profile
-18. Binary distribution strategy (#16)
+16. LTO release profile
+17. Binary distribution strategy (#16)
