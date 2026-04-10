@@ -435,9 +435,21 @@ RUST_LOG=cs_core::engine=debug codesurgeon query "my search"
 ## Configuration
 
 codesurgeon is configured via `.codesurgeon/config.toml` in your project root.
-All settings are optional — sensible defaults apply when the file is missing.
+A user-level fallback at `~/.config/codesurgeon/config.toml` is also loaded
+(workspace settings take precedence). All settings are optional — sensible
+defaults apply when files are missing.
 
 ```toml
+[context]
+# Token budget per context capsule (default: 4000)
+max_tokens = 4000
+
+# How much body text to include for adjacent (skeleton) symbols:
+#   "minimal"  — ~5% of body (signatures only, very tight)
+#   "standard" — ~15% of body (default)
+#   "detailed" — ~30% of body (for large-context models like claude-opus)
+skeleton_detail = "standard"
+
 [indexing]
 # Enable TypeScript compiler enrichment (requires node + typescript in node_modules)
 ts_types = false
@@ -461,7 +473,13 @@ auto_ttl_days = 7
 [git]
 # Write manifest.json for git-tracked index metadata
 track_manifest = false
+
+[observability]
+# USD cost per token for savings display in `codesurgeon stats` (default: 0.000003)
+token_rate_usd = 0.000003
 ```
+
+Run `codesurgeon config` to see the effective merged settings and their sources.
 
 ## Contributing
 

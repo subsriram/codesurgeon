@@ -23,7 +23,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Index the workspace (or re-index if already done)
-    Index,
+    Index {
+        /// Force full re-index, ignoring file hash cache
+        #[arg(short, long)]
+        force: bool,
+    },
 
     /// Show index statistics
     Status,
@@ -119,9 +123,13 @@ async fn main() -> Result<()> {
     let engine = CoreEngine::new(config)?;
 
     match cli.command {
-        Commands::Index => {
-            println!("Indexing {}...", workspace.display());
-            let stats = engine.index_workspace()?;
+        Commands::Index { force } => {
+            println!(
+                "Indexing {}{}...",
+                workspace.display(),
+                if force { " (force)" } else { "" }
+            );
+            let stats = engine.index_workspace_with_options(force)?;
             println!(
                 "Done: {} symbols | {} edges | {} files | session: {}",
                 stats.symbol_count, stats.edge_count, stats.file_count, stats.session_id
@@ -158,27 +166,56 @@ async fn main() -> Result<()> {
 
         Commands::Config => {
             let config_path = workspace.join(".codesurgeon").join("config.toml");
-            println!("Workspace : {}", workspace.display());
+            let user_config = {
+                let home = std::env::var("HOME").unwrap_or_default();
+                PathBuf::from(home).join(".config/codesurgeon/config.toml")
+            };
+            println!("Workspace    : {}", workspace.display());
             println!(
-                "DB path   : {}",
+                "DB path      : {}",
                 workspace.join(".codesurgeon").join("index.db").display()
             );
             println!(
-                "Config    : {}",
+                "Config (ws)  : {}",
                 if config_path.exists() {
                     config_path.display().to_string()
                 } else {
-                    "(not found — using defaults)".to_string()
+                    "(not found)".to_string()
+                }
+            );
+            println!(
+                "Config (user): {}",
+                if user_config.exists() {
+                    user_config.display().to_string()
+                } else {
+                    "(not found)".to_string()
                 }
             );
             println!();
+            println!("Effective settings:");
+            println!("  skeleton_detail  = {:?}", engine.config().skeleton_detail);
+            println!(
+                "  token_budget     = {}",
+                engine.config().default_token_budget
+            );
+            println!("  token_rate_usd   = {}", engine.config().token_rate_usd);
+            println!();
             if config_path.exists() {
+                println!("--- {} ---", config_path.display());
                 match std::fs::read_to_string(&config_path) {
                     Ok(contents) => println!("{}", contents),
                     Err(e) => eprintln!("Error reading config: {}", e),
                 }
-            } else {
-                println!("No .codesurgeon/config.toml found. All settings use defaults.");
+            }
+            if user_config.exists() {
+                println!("--- {} ---", user_config.display());
+                match std::fs::read_to_string(&user_config) {
+                    Ok(contents) => println!("{}", contents),
+                    Err(e) => eprintln!("Error reading config: {}", e),
+                }
+            }
+            if !config_path.exists() && !user_config.exists() {
+                println!("No config files found. All settings use defaults.");
                 println!("See: https://github.com/subsriram/codesurgeon#configuration");
             }
         }

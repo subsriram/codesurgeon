@@ -127,6 +127,18 @@ pub struct IndexingConfig {
     /// Set via `CS_TRACK_MANIFEST=1` env var or `[git] track_manifest = true`
     /// in `config.toml`. Default: false (manifest.json is gitignored).
     pub track_manifest: bool,
+
+    /// Token budget per context capsule.
+    /// Set via `[context] max_tokens = 8000` in `config.toml`. Default: None (use engine default).
+    pub max_tokens: Option<u32>,
+
+    /// Skeleton detail level: "minimal", "standard", or "detailed".
+    /// Set via `[context] skeleton_detail = "standard"` in `config.toml`. Default: None.
+    pub skeleton_detail: Option<String>,
+
+    /// USD cost per token for savings display in `get_stats`.
+    /// Set via `[observability] token_rate_usd = 0.000003` in `config.toml`. Default: None.
+    pub token_rate_usd: Option<f64>,
 }
 
 impl IndexingConfig {
@@ -158,12 +170,98 @@ impl IndexingConfig {
                 cfg.track_manifest = v;
             }
         }
+        if let Some(context) = table.get("context").and_then(|v| v.as_table()) {
+            if let Some(v) = context.get("max_tokens").and_then(|v| v.as_integer()) {
+                cfg.max_tokens = Some(v.max(100) as u32);
+            }
+            if let Some(v) = context.get("skeleton_detail").and_then(|v| v.as_str()) {
+                cfg.skeleton_detail = Some(v.to_string());
+            }
+        }
+        if let Some(obs) = table.get("observability").and_then(|v| v.as_table()) {
+            if let Some(v) = obs.get("token_rate_usd").and_then(|v| v.as_float()) {
+                cfg.token_rate_usd = Some(v);
+            }
+        }
         // CS_TRACK_MANIFEST env var overrides config.toml
         if std::env::var("CS_TRACK_MANIFEST").as_deref() == Ok("1") {
             cfg.track_manifest = true;
         }
         cfg
     }
+
+    /// Load user-level config from `~/.config/codesurgeon/config.toml`, then
+    /// overlay workspace-level config on top. Workspace settings take precedence.
+    pub fn load_with_user_fallback(workspace_config: &std::path::Path) -> Self {
+        // Start with user-level config as base (lower precedence).
+        let user_config = dirs_or_home().join("config.toml");
+        let mut cfg = if user_config.exists() {
+            Self::load_from_toml(&user_config)
+        } else {
+            Self::default()
+        };
+
+        // Overlay workspace config (higher precedence).
+        if workspace_config.exists() {
+            let ws = Self::load_from_toml(workspace_config);
+            if ws.rust_expand_macros {
+                cfg.rust_expand_macros = true;
+            }
+            if ws.rust_rustdoc_types {
+                cfg.rust_rustdoc_types = true;
+            }
+            if ws.python_pyright {
+                cfg.python_pyright = true;
+            }
+            if ws.ts_types {
+                cfg.ts_types = true;
+            }
+            if ws.track_manifest {
+                cfg.track_manifest = true;
+            }
+            if ws.max_tokens.is_some() {
+                cfg.max_tokens = ws.max_tokens;
+            }
+            if ws.skeleton_detail.is_some() {
+                cfg.skeleton_detail = ws.skeleton_detail;
+            }
+            if ws.token_rate_usd.is_some() {
+                cfg.token_rate_usd = ws.token_rate_usd;
+            }
+        }
+
+        // CS_TRACK_MANIFEST env var overrides everything
+        if std::env::var("CS_TRACK_MANIFEST").as_deref() == Ok("1") {
+            cfg.track_manifest = true;
+        }
+        cfg
+    }
+}
+
+/// Return `~/.config/codesurgeon/` (or a fallback).
+fn dirs_or_home() -> std::path::PathBuf {
+    if let Some(config_dir) = dirs_path() {
+        config_dir.join("codesurgeon")
+    } else {
+        std::path::PathBuf::from(".config/codesurgeon")
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dirs_path() -> Option<std::path::PathBuf> {
+    std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn dirs_path() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA").ok().map(std::path::PathBuf::from)
 }
 
 // ── MemoryConfig ───────────────────────────────────────────────────────────────
