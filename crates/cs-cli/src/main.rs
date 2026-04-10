@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cs_core::engine::EngineConfig;
+use cs_core::symbol::LspEdge;
 use cs_core::CoreEngine;
 use std::path::PathBuf;
 
@@ -77,6 +78,12 @@ enum Commands {
         /// Write CLAUDE.md files to disk (default: preview only)
         #[arg(short, long)]
         write: bool,
+    },
+
+    /// Submit LSP-resolved type edges from stdin or a file
+    SubmitLspEdges {
+        /// Path to a JSON file containing an array of LSP edges (omit to read from stdin)
+        file: Option<PathBuf>,
     },
 
     /// Start the MCP server (same as codesurgeon-mcp binary)
@@ -220,6 +227,21 @@ async fn main() -> Result<()> {
             if write {
                 println!("CLAUDE.md files written to each module directory.");
             }
+        }
+
+        Commands::SubmitLspEdges { file } => {
+            let json = match file {
+                Some(path) => std::fs::read_to_string(&path)?,
+                None => {
+                    use std::io::Read;
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    s
+                }
+            };
+            let edges: Vec<LspEdge> = serde_json::from_str(&json)?;
+            let summary = engine.submit_lsp_edges(&edges)?;
+            println!("{}", summary);
         }
 
         Commands::Mcp => {

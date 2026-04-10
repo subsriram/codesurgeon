@@ -259,3 +259,93 @@ fn memory_delete_nonexistent_exits_nonzero() {
         "expected non-zero exit for unknown id"
     );
 }
+
+// ── submit-lsp-edges ──────────────────────────────────────────────────────────
+
+/// Valid JSON LSP edges piped via stdin must exit zero and report accepted/skipped counts.
+#[test]
+fn submit_lsp_edges_stdin_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let edges = r#"[{"from_fqn":"src/lib.rs::foo","to_fqn":"src/lib.rs::bar","kind":"calls","resolved_type":null}]"#;
+
+    let out = Command::new(BIN)
+        .env("CS_WORKSPACE", dir.path())
+        .env("CS_LOG", "error")
+        .args(["submit-lsp-edges"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(edges.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("failed to spawn codesurgeon");
+
+    assert!(
+        out.status.success(),
+        "submit-lsp-edges failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    // Unknown symbols are skipped, but the command itself must succeed.
+    assert!(
+        text.contains("accepted") && text.contains("skipped"),
+        "unexpected output: {text}"
+    );
+}
+
+/// `submit-lsp-edges` with a valid JSON file must exit zero.
+#[test]
+fn submit_lsp_edges_file_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let edges_path = dir.path().join("edges.json");
+    std::fs::write(
+        &edges_path,
+        r#"[{"from_fqn":"a::b","to_fqn":"c::d","kind":"imports","resolved_type":null}]"#,
+    )
+    .unwrap();
+
+    let out = run(&dir, &["submit-lsp-edges", edges_path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "submit-lsp-edges failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("accepted") && text.contains("skipped"),
+        "unexpected output: {text}"
+    );
+}
+
+/// `submit-lsp-edges` with malformed JSON must exit non-zero.
+#[test]
+fn submit_lsp_edges_bad_json_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let edges_path = dir.path().join("bad.json");
+    std::fs::write(&edges_path, "this is not json").unwrap();
+
+    let out = run(&dir, &["submit-lsp-edges", edges_path.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit for malformed JSON"
+    );
+}
+
+/// `submit-lsp-edges` with a nonexistent file must exit non-zero.
+#[test]
+fn submit_lsp_edges_missing_file_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&dir, &["submit-lsp-edges", "/tmp/does-not-exist-xyz.json"]);
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit for missing file"
+    );
+}
