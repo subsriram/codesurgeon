@@ -24,8 +24,11 @@ It parses your codebase into a symbol graph, then serves token-budgeted context 
 
 ## Recommended workflow
 
-> **MANDATORY**: Always call `mcp__cs-codesurgeon__run_pipeline` before editing any file in
-> this repo. Do not skip this step — it is the entire point of this project.
+> **Recommended**: If the codesurgeon MCP server is registered in your client, call its
+> `run_pipeline` tool before editing any file in this repo. The exact tool name depends on
+> the name you used when registering the server (e.g. `mcp__codesurgeon__run_pipeline`).
+> Dogfooding the tool is the entire point of this project — but if you haven't installed it
+> yet, fall back to reading files directly.
 
 1. Before editing any file: `run_pipeline(task="<what you're about to do>")`
 2. Before refactoring a function: `get_impact_graph(symbol_fqn="...")`

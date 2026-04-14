@@ -41,3 +41,8 @@ uuid = { version = "1", features = ["v4"] }
 
 # Internal crates
 cs-core = { path = "crates/cs-core" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

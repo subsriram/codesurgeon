@@ -71,11 +71,29 @@ Query: "fix the retry logic in the HTTP client"
 
 ### Requirements
 
-- **Rust 1.75+** (install via [rustup](https://rustup.rs))
 - **macOS or Linux** (Windows is untested)
+- **Rust 1.75+** — only required if building from source ([rustup](https://rustup.rs))
 - **Optional:** Node.js (for TypeScript enrichment), pyright (for Python enrichment)
 
-### Build from source
+### 1a. Download a pre-built binary (recommended)
+
+Grab the latest release for your platform from the [Releases page](https://github.com/subsriram/codesurgeon/releases/latest):
+
+```bash
+# Apple Silicon
+curl -L https://github.com/subsriram/codesurgeon/releases/latest/download/codesurgeon-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv codesurgeon codesurgeon-mcp /usr/local/bin/
+
+# Intel Mac
+curl -L https://github.com/subsriram/codesurgeon/releases/latest/download/codesurgeon-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv codesurgeon codesurgeon-mcp /usr/local/bin/
+
+# Linux x86_64
+curl -L https://github.com/subsriram/codesurgeon/releases/latest/download/codesurgeon-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv codesurgeon codesurgeon-mcp /usr/local/bin/
+```
+
+### 1b. Build from source
 
 ```bash
 git clone https://github.com/subsriram/codesurgeon
@@ -94,6 +112,13 @@ cargo build --release
 This produces two binaries in `target/release/`:
 - `codesurgeon` — the CLI
 - `codesurgeon-mcp` — the MCP server (add to Claude Code / Codex)
+
+To use the `codesurgeon` CLI from anywhere, either symlink them onto your PATH or add `target/release` to your shell's PATH:
+
+```bash
+sudo ln -sf "$(pwd)/target/release/codesurgeon" /usr/local/bin/codesurgeon
+sudo ln -sf "$(pwd)/target/release/codesurgeon-mcp" /usr/local/bin/codesurgeon-mcp
+```
 
 ### 2. Add to Claude Code
 
