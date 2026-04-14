@@ -127,7 +127,7 @@
 |-------|------|--------|
 | Graph FQN lookup is O(n) | `graph.rs` | Linear search over all symbols. Add HashMap index for large workspaces. |
 | Tantivy search index not persisted | `engine.rs:259` | Rebuilt in-RAM on every startup. Persisting to disk saves 2-5s cold start on 100k symbol workspaces. |
-| Embedding cache refresh race | `engine.rs:1036` | Two concurrent reindexes can miss recent embeddings. |
+| ~~Embedding cache refresh race~~ | ~~`engine.rs:1036`~~ | Fixed: `refresh_guard` mutex at `engine.rs:2103` serialises concurrent reindexes. |
 
 ---
 
@@ -157,7 +157,13 @@
 14. ~~Implement `config` CLI command (#24)~~
 15. ~~Add indexing progress output (#23)~~
 
-### Phase 4 — Post-release
+### Phase 4 — Post-release ✅
 
-16. LTO release profile
-17. Binary distribution strategy (#16)
+16. ~~LTO release profile~~ — landed in root `Cargo.toml` (`lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`). Measured: `codesurgeon` 47MB→36MB, `codesurgeon-mcp` 50MB→38MB (−24%).
+17. ~~Binary distribution strategy (#16)~~ — decision: ship pre-built binaries via `release.yml` for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`. README documents `curl | tar` install. `cargo install` / Homebrew formula deferred to 1.1 (still blocked by fastembed/ort native deps).
+
+---
+
+## 1.0.0 released
+
+Tagged `v1.0.0` on 2026-04-14. Release workflow publishes three binary tarballs to the GitHub Releases page.
