@@ -98,13 +98,31 @@ def pass_rate(arm_results: list[dict]) -> float | None:
     return sum(1 for r in with_eval if r["passed"]) / len(with_eval)
 
 
+def _real_input(r: dict) -> int | None:
+    """Total input tokens billed to the model = new + cache_creation + cache_read.
+
+    `input_tokens` in Claude's usage payload is ONLY the new non-cached tokens
+    (often 5–20 per turn). The real input bulk is in cache_creation_input_tokens
+    and cache_read_input_tokens. Summing all three gives the true input token
+    count that the model actually processed and that costs + latency scale with.
+    """
+    parts = [
+        r.get("input_tokens"),
+        r.get("cache_creation_tokens"),
+        r.get("cache_read_tokens"),
+    ]
+    if all(p is None for p in parts):
+        return None
+    return sum(p or 0 for p in parts)
+
+
 def arm_summary(arm_results: list[dict]) -> dict:
-    in_tok = [r.get("input_tokens") for r in arm_results]
+    in_tok = [_real_input(r) for r in arm_results]
     out_tok = [r.get("output_tokens") for r in arm_results]
     total_tok = [
-        (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0)
+        (_real_input(r) or 0) + (r.get("output_tokens") or 0)
         for r in arm_results
-        if r.get("input_tokens") is not None or r.get("output_tokens") is not None
+        if _real_input(r) is not None or r.get("output_tokens") is not None
     ]
     cost = [r.get("total_cost_usd") for r in arm_results]
     walltime = [r.get("walltime_s") for r in arm_results]

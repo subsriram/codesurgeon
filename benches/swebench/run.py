@@ -380,6 +380,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", type=int, default=None, help="run only first N tasks")
     parser.add_argument(
+        "--instance-ids",
+        default=None,
+        help="comma-separated instance_ids to run (overrides --tasks ordering, preserves list order)",
+    )
+    parser.add_argument(
         "--arms",
         default="with,without",
         help="comma-separated arms to run (default: with,without)",
@@ -427,7 +432,15 @@ def main() -> int:
     parent_workspace = REPO_ROOT  # codesurgeon indexes itself as the workspace
 
     tasks = load_tasks(TASKS_PATH)
-    if args.tasks is not None:
+    if args.instance_ids:
+        wanted = [s.strip() for s in args.instance_ids.split(",") if s.strip()]
+        by_id = {t["instance_id"]: t for t in tasks}
+        missing = [i for i in wanted if i not in by_id]
+        if missing:
+            print(f"unknown instance_ids: {missing}", file=sys.stderr)
+            return 2
+        tasks = [by_id[i] for i in wanted]
+    elif args.tasks is not None:
         tasks = tasks[: args.tasks]
 
     print(
