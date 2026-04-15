@@ -53,6 +53,7 @@ RESULTS_DIR = REPO_ROOT / "target" / "swebench"
 RESULTS_PATH = RESULTS_DIR / "results.jsonl"
 
 DEFAULT_MCP_BIN = REPO_ROOT / "target" / "release" / "codesurgeon-mcp"
+DEFAULT_CS_BIN = REPO_ROOT / "target" / "release" / "codesurgeon"
 DEFAULT_CLAUDE_BIN = "claude"
 
 # Hard safety caps. #29a is wiring-only; #29b raises these for the pilot run.
@@ -67,6 +68,15 @@ statement carefully, inspect the code, and make the minimal change needed to
 fix the bug. Do not add new tests. Do not reformat unrelated code. When you
 are confident the fix is complete, stop — your changes will be captured as a
 git diff and evaluated automatically.
+
+Before you start reading files, call `mcp__cs-codesurgeon__run_pipeline`
+with a short description of the task (e.g. `task="fix VLA diff bug in
+io.fits.FITSDiff"`). It returns a budgeted capsule of the most relevant
+symbols, files, and call-graph edges for the problem — use this to find
+the right file to edit instead of doing Grep + Read exploration. The
+capsule typically returns in under 200ms and replaces 5–10 exploratory
+tool calls. Only after you have the capsule should you start opening
+files with Read.
 
 Problem statement:
 """
@@ -206,8 +216,19 @@ def extract_token_stats(claude_json: dict) -> dict[str, int | float | None]:
 
 
 def capture_diff(workdir: Path) -> str:
-    """Return the uncommitted changes as a unified diff."""
-    # ``git add -N`` ensures untracked-but-new files show in ``git diff``.
+    """Return the uncommitted changes as a unified diff.
+
+    Excludes ``.codesurgeon/`` because the pre-index step writes the
+    symbol index there inside the task workdir, and we don't want that
+    noise in the patch sent to the swebench harness. The harness's
+    ``git apply`` chokes on binary blobs (index.db-shm, index.db-wal)
+    and even if it didn't, a stray cache dir in the patched repo is
+    poison for test stability.
+
+    The ``git add -N .`` makes untracked files visible to ``git diff``
+    so new source files the agent creates show up; the pathspec
+    exclusion keeps ``.codesurgeon/`` out regardless.
+    """
     subprocess.run(
         ["git", "add", "-N", "."],
         cwd=workdir,
@@ -215,7 +236,7 @@ def capture_diff(workdir: Path) -> str:
         capture_output=True,
     )
     result = subprocess.run(
-        ["git", "diff", "--no-color"],
+        ["git", "diff", "--no-color", "--", ".", ":(exclude).codesurgeon"],
         cwd=workdir,
         check=False,
         capture_output=True,
@@ -229,7 +250,7 @@ def run_one(
     arm: str,
     claude_bin: str,
     mcp_bin: Path,
-    parent_workspace: Path,
+    cs_bin: Path,
     max_budget_usd: float,
     timeout_s: int,
     model: str | None,
@@ -243,10 +264,13 @@ def run_one(
         tmp = Path(tmp_s)
         workdir = tmp / "repo"
 
-        # 1. Materialize MCP config for this arm.
-        if arm == "with":
-            mcp_config = materialize_mcp_with(mcp_bin, parent_workspace, tmp)
-        else:
+        # 1. Materialize MCP config for this arm. For the treatment arm we
+        # point CS_WORKSPACE at the per-task workdir (set below, after clone),
+        # not at the codesurgeon repo — pointing it at REPO_ROOT would make
+        # run_pipeline return capsules from codesurgeon's own source code,
+        # which is what #29b's first pilot was silently doing.
+        mcp_config: Path | None = None
+        if arm == "without":
             mcp_config = MCP_WITHOUT_PATH
 
         # 2. Clone the task repo (skipped in dry-run).
@@ -281,6 +305,45 @@ def run_one(
                     claude_json_path=None,
                     error=f"clone failed: {e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr}",
                 )
+
+        # 2a. Treatment arm — pre-index the task repo and render the MCP
+        # config to point CS_WORKSPACE at the workdir. Pre-indexing is
+        # synchronous and fast (sub-second for repos up to ~2000 files);
+        # without it the first run_pipeline call blocks on cold indexing
+        # and hits the task timeout.
+        if arm == "with" and not dry_run:
+            t_idx = time.monotonic()
+            idx_proc = subprocess.run(
+                [str(cs_bin), "index", "--workspace", str(workdir)],
+                env={**os.environ, "CS_WORKSPACE": str(workdir)},
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            idx_wall = time.monotonic() - t_idx
+            if idx_proc.returncode != 0:
+                print(f"  INDEX-FAIL wall={idx_wall:.1f}s", file=sys.stderr)
+                return RunResult(
+                    instance_id=task["instance_id"],
+                    repo=task["repo"],
+                    arm=arm,
+                    exit_code=-3,
+                    walltime_s=idx_wall,
+                    input_tokens=None,
+                    output_tokens=None,
+                    cache_creation_tokens=None,
+                    cache_read_tokens=None,
+                    total_cost_usd=None,
+                    diff_bytes=0,
+                    diff_path=None,
+                    claude_json_path=None,
+                    error=f"index failed: {idx_proc.stderr[-500:]}",
+                )
+            mcp_config = materialize_mcp_with(mcp_bin, workdir, tmp)
+        elif arm == "with" and dry_run:
+            mcp_config = materialize_mcp_with(mcp_bin, workdir, tmp)
+
+        assert mcp_config is not None
 
         # 3. Build prompt and spawn claude.
         prompt = PROMPT_PREFIX + task["problem_statement"]
@@ -429,7 +492,11 @@ def main() -> int:
         print("  build it: cargo build --release --features metal", file=sys.stderr)
         return 2
 
-    parent_workspace = REPO_ROOT  # codesurgeon indexes itself as the workspace
+    cs_bin = Path(os.environ.get("CODESURGEON_BIN", str(DEFAULT_CS_BIN)))
+    if "with" in arms and not args.dry_run and not cs_bin.exists():
+        print(f"codesurgeon CLI binary not found: {cs_bin}", file=sys.stderr)
+        print("  build it: cargo build --release --features metal", file=sys.stderr)
+        return 2
 
     tasks = load_tasks(TASKS_PATH)
     if args.instance_ids:
@@ -460,7 +527,7 @@ def main() -> int:
                 arm=arm,
                 claude_bin=claude_bin,
                 mcp_bin=mcp_bin,
-                parent_workspace=parent_workspace,
+                cs_bin=cs_bin,
                 max_budget_usd=args.max_budget_usd,
                 timeout_s=args.timeout,
                 model=args.model,
