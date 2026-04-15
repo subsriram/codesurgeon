@@ -610,9 +610,8 @@ mod tests {
         f.write_all(b"not valid json at all").unwrap();
         let result = parse_rustdoc_json(&json_path);
         // Must not panic; an Err is acceptable, empty map is also fine.
-        match result {
-            Ok(map) => assert!(map.is_empty(), "malformed JSON should yield empty map"),
-            Err(_) => {} // parse error is acceptable
+        if let Ok(map) = result {
+            assert!(map.is_empty(), "malformed JSON should yield empty map");
         }
     }
 

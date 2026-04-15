@@ -218,7 +218,7 @@ fn get_skeleton_max_depth_filters_nested_symbols() {
         "max_depth=1 should have fewer symbols than unrestricted"
     );
     for sym in &shallow.symbols {
-        let after_file = sym.fqn.splitn(2, "::").nth(1).unwrap_or("");
+        let after_file = sym.fqn.split_once("::").map(|x| x.1).unwrap_or("");
         assert!(
             !after_file.contains("::"),
             "depth-1 symbol has nested FQN: {}",
@@ -1477,11 +1477,9 @@ fn engine_applies_ts_types_config_from_toml() {
     .unwrap();
 
     let config = cs_core::EngineConfig::new(dir.path()).without_embedder();
-    assert!(
-        config.ts_types || true, // config is overridden from toml during CoreEngine::new
-        "ts_types starts false in EngineConfig before toml is applied"
-    );
+    // config.ts_types starts false in EngineConfig before toml is applied;
     // CoreEngine::new reads config.toml and applies ts_types.
+    let _ = config.ts_types;
     let engine = cs_core::CoreEngine::new(config).expect("engine init failed");
     // index_workspace must complete without panic even when node or typescript is absent.
     engine.index_workspace().expect("index_workspace failed");
@@ -1727,7 +1725,7 @@ fn get_stats_savings_pct_in_valid_range() {
         .parse()
         .expect("non-numeric %");
     assert!(
-        pct >= 0.0 && pct <= 100.0,
+        (0.0..=100.0).contains(&pct),
         "savings % out of range: {}",
         pct
     );
