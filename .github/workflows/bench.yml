@@ -1,0 +1,80 @@
+name: Bench
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/cs-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+      - "scripts/bench_summary.py"
+      - "benches/baseline.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  indexing:
+    name: Indexing bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bench-
+
+      - name: Run indexing bench (30 samples, advisory)
+        run: |
+          cargo bench -p cs-core --bench indexing -- \
+            --sample-size 30 \
+            --warm-up-time 2 \
+            --measurement-time 10 \
+            --noplot
+
+      - name: Render summary
+        id: summary
+        run: |
+          python3 scripts/bench_summary.py > bench-summary.md
+          cat bench-summary.md
+          {
+            echo 'body<<BENCHEOF'
+            cat bench-summary.md
+            echo 'BENCHEOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          SUMMARY_BODY: ${{ steps.summary.outputs.body }}
+        with:
+          script: |
+            const body = process.env.SUMMARY_BODY;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const marker = '<!-- bench-summary -->';
+            const comments = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.data.find(c => c.body && c.body.includes(marker));
+            const fullBody = `${marker}\n${body}`;
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: fullBody });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: fullBody });
+            }
