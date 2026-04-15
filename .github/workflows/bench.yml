@@ -10,6 +10,7 @@ on:
       - ".github/workflows/bench.yml"
       - "scripts/bench_summary.py"
       - "benches/baseline.json"
+      - "benches/token_baseline.json"
   workflow_dispatch:
 
 permissions:
@@ -47,6 +48,9 @@ jobs:
             --warm-up-time 2 \
             --measurement-time 10 \
             --noplot
+
+      - name: Run token savings example (20 queries, advisory)
+        run: cargo run --release --example token_savings -p cs-core
 
       - name: Render summary
         id: summary
