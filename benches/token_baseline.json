@@ -1,0 +1,28 @@
+{
+  "workspace_tokens": 110116,
+  "query_count": 20,
+  "avg_capsule_tokens": 3257.3,
+  "savings_pct": 97.04,
+  "per_query": {
+    "fix the retry logic": 3736,
+    "add a new language parser": 1855,
+    "token budget assembly": 2841,
+    "how does BM25 search work": 2783,
+    "session memory observations": 2939,
+    "embedding cache refresh": 2668,
+    "tree-sitter rust parsing": 2594,
+    "sqlite schema migration": 3000,
+    "graph centrality calculation": 2133,
+    "rerank search results": 3715,
+    "generate module documentation": 3210,
+    "impact graph blast radius": 3390,
+    "skeleton file API surface": 3469,
+    "workspace incremental index": 3805,
+    "observation staleness score": 3256,
+    "stub file indexing": 3982,
+    "swift enrichment xcode": 3787,
+    "diff capsule for PRs": 4410,
+    "search logic flow path": 3364,
+    "intent detection routing": 4209
+  }
+}
