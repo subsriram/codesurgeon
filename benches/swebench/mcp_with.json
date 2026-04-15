@@ -1,0 +1,12 @@
+{
+  "_comment": "Template. benches/swebench/run.py substitutes @CODESURGEON_MCP_BIN@ and @CS_WORKSPACE@ per task and writes a materialized config to a tempfile.",
+  "mcpServers": {
+    "cs-codesurgeon": {
+      "command": "@CODESURGEON_MCP_BIN@",
+      "args": [],
+      "env": {
+        "CS_WORKSPACE": "@CS_WORKSPACE@"
+      }
+    }
+  }
+}
