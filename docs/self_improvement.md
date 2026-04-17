@@ -15,6 +15,7 @@ codesurgeon over time. Two loops, one shared substrate.
   - [4.5 Preference / RLHF-style](#45-preference--rlhf-style)
   - [4.6 Off-policy evaluation — the bridge to offline](#46-off-policy-evaluation--the-bridge-to-offline)
   - [4.7 Recommendation](#47-recommendation)
+  - [4.8 Capsule shape as a learnable action — the v1.5 case](#48-capsule-shape-as-a-learnable-action--the-v15-case)
 - [5. Offline loop](#5-offline-loop)
 - [6. Guard rails](#6-guard-rails)
 - [7. Configuration surface](#7-configuration-surface)
@@ -165,11 +166,18 @@ A stock set lives in `crates/cs-core/src/policy.rs`; the user can add more via
 ```rust
 struct PolicyArm {
     name: String,
+
+    // Ranker knobs — how candidates are scored and fused.
     centrality_weight: f32,
     reranker_temp: f32,
     bm25_embed_mix: f32,        // 0 = pure BM25, 1 = pure embeddings
     graph_hop_budget: u32,
     recency_halflife_days: f32,
+
+    // Capsule-shape knobs — how much of the ranked list is returned.
+    // Includes the v1.5 adaptive-pivot schedule (see §4.8 below).
+    pivot_schedule: PivotSchedule,
+
     // room to grow
 }
 ```
@@ -355,6 +363,87 @@ Policy progression, anchored to roadmap phases (§10):
 
 Full RL (PPO, Q-learning over ranked lists) is **not on the path** — see §4.3.
 
+### 4.8 Capsule shape as a learnable action — the v1.5 case
+
+The adaptive pivot cap shipped in [`docs/explicit-symbol-anchors.md`](explicit-symbol-anchors.md#v15--adaptive-pivot-cap-based-on-anchor-confidence-landed)
+is a hand-crafted contextual policy: given a context (`AnchorStats` — how many
+anchor hits were exact, how many were BM25 fallback, how many distinct source
+files), it picks an action (`effective_pivots ∈ {3, 5, 8}`) via a three-bucket
+rule:
+
+```
+CLEAN    (≥3 exact, 0 fuzzy, ≥2 distinct source files) → 3 pivots
+MEDIUM   (≥1 exact OR any fuzzy)                        → 5 pivots
+DEFAULT  (no anchor fires)                              → 8 pivots
+```
+
+This is exactly the shape of problem the self-improvement loop is designed
+to handle. Three observations make it a near-ideal first target:
+
+1. **The reward already scores this correctly.** Precision penalty
+   (§2) penalises wasted capsule slots, while recall rewards keeping enough
+   pivots to cover the edited FQNs. Over-capping hurts recall; under-capping
+   hurts precision. No new reward machinery needed.
+2. **The context is already computed.** `AnchorStats` is returned from
+   `anchor_candidates`; we just need to log it alongside each call.
+3. **The v1.5 rule gives a strong seed arm.** The hand-tuned thresholds are
+   a reasonable prior — we don't start from scratch.
+
+#### Pivot policy as an arm parameter
+
+Capsule shape is a *separate action dimension* from ranker parameters. We
+encode it as `PivotSchedule` on `PolicyArm`:
+
+```rust
+enum PivotSchedule {
+    /// Fixed cap regardless of context. Useful as a sanity-check arm.
+    Fixed(usize),
+    /// v1.5-style bucketed rule over AnchorStats. Thresholds are data.
+    Bucketed {
+        clean:   usize,   // 3 in v1.5
+        medium:  usize,   // 5 in v1.5
+        default: usize,   // 8 in v1.5
+    },
+    /// Phase 3 only: learned mapping from context features to pivot count.
+    Learned { model_id: String },
+}
+```
+
+#### Per-phase treatment
+
+- **Phase 0.** Log `AnchorStats` and the chosen `effective_pivots` on every
+  call. Add two columns to `calls` (or serialise into `task_features`):
+  `anchor_stats_json`, `effective_pivots`. No behavior change.
+- **Phase 1 (ε-greedy).** Seed a few `PivotSchedule::Bucketed` arms:
+  - `baseline_v15` (frozen): `{clean:3, medium:5, default:8}` — the shipped rule.
+  - `aggressive`: `{clean:2, medium:4, default:6}`
+  - `conservative`: `{clean:5, medium:7, default:10}`
+  - `flat_5` (`Fixed(5)`): ignores anchor stats — counterfactual sanity check.
+
+  Validates whether v1.5's thresholds are actually best.
+- **Phase 3 (contextual).** Add `AnchorStats` to the feature vector
+  (`resolved_exact`, `resolved_bm25_name`, `distinct_source_files`,
+  `anchors_extracted`). Linear Thompson now learns
+  `pivot_count ← f(anchor_stats, intent, workspace_langs, …)` directly.
+  The bucketed rule becomes learned decision boundaries, and those boundaries
+  can differ per intent (a "fix" may want fewer pivots than a "refactor").
+  Realised as `PivotSchedule::Learned` — the model is fit offline from logs,
+  same pattern as the Phase 4a LambdaMART reranker.
+
+#### What this pattern generalises
+
+v1.5 is the first of several capsule-shape knobs that want learning:
+
+- **Number of pivots** — covered above.
+- **Number of skeletons** — fixed at 20; similarly context-dependent.
+- **Token budget fraction spent on skeletons vs pivot bodies** — currently
+  implicit in the pivot/skeleton count ratio.
+- **Whether to include adjacent symbols** — boolean action.
+
+All of these follow the same recipe: context = features we already compute,
+action = a small discrete or scalar parameter, reward = the same §2 reward.
+Treat §4.8 as the template; we don't need a new doc each time.
+
 ## 5. Offline loop
 
 ### Replay harness
@@ -536,7 +625,9 @@ real workspaces. No policy yet — the existing ranker runs unchanged.
   Integration test that synthesizes a call + simulated fs events and asserts
   reward matches hand-computed value.
 - **PR 0.4** — Wire `log_call` into `run_pipeline` in `cs-mcp`. Feature-gated
-  by `[telemetry] enabled`.
+  by `[telemetry] enabled`. Logs the already-computed `AnchorStats` and
+  `effective_pivots` alongside the capsule (see §4.8) — no behavior change
+  to v1.5, just observation.
 - **PR 0.5** — `codesurgeon telemetry audit` CLI: prints the last N calls
   with capsule, edits, and reward side-by-side.
 - **PR 0.6** — `.gitignore` template updates, README section, docs link.
@@ -566,11 +657,13 @@ is only as good as the signal.
 
 **PR breakdown.**
 - **PR 1.1** — Arm registry crate-module + config loader + baseline/frozen
-  semantics. Tests for config parse errors.
+  semantics, including `PivotSchedule` (§4.8). Tests for config parse errors.
 - **PR 1.2** — `arm_stats` reader with lazy decay. Property test: two reads
   with no writes between them return identical decayed values.
 - **PR 1.3** — ε-greedy policy (seeded RNG), `selection_prob` computation,
-  wiring into the ranker's arm-parameter application path.
+  wiring into both the ranker's arm-parameter application path *and* the
+  `effective_pivots` selection (replacing v1.5's hand-coded match with the
+  chosen arm's `PivotSchedule`).
 - **PR 1.4** — Intent stratification toggle.
 - **PR 1.5** — `get_stats` `self_improvement` section.
 - **PR 1.6** — Kill switch (`policy = "off"`) integration test.
