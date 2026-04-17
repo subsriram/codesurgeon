@@ -68,11 +68,16 @@ log "  long runs, to avoid ~/.claude.json write contention during token refresh"
 # Phase 1 — agent runs. Writes target/swebench/results.jsonl incrementally.
 log "phase 1/3: agent runs (${TASKS} tasks × 2 arms)"
 AGENT_ARGS=(
-  --tasks "${TASKS}"
   --clean
   --max-budget-usd "${BUDGET}"
   --timeout "${TIMEOUT}"
 )
+if [[ -n "${PILOT_INSTANCE_IDS:-}" ]]; then
+  AGENT_ARGS+=(--instance-ids "${PILOT_INSTANCE_IDS}")
+  log "  using explicit instance-ids slice (${PILOT_INSTANCE_IDS})"
+else
+  AGENT_ARGS+=(--tasks "${TASKS}")
+fi
 if [[ -n "${MODEL}" ]]; then
   AGENT_ARGS+=(--model "${MODEL}")
 fi
