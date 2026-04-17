@@ -1,6 +1,6 @@
 # Design: Explicit Symbol-Name Anchors in the Ranking Pipeline
 
-> **Status**: v1 implemented, v1.1 pending (see "Post-implementation finding")
+> **Status**: v1 + v1.1 implemented. **v1.2 pending** (see section below).
 > **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`
 > **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`
 > **Motivation**: SWE-bench #29c revealed that capsule ranking misses the target
@@ -11,7 +11,227 @@
 
 ---
 
-## 🚨 READ THIS FIRST — Post-implementation finding (v1.1 work)
+## 🚨 READ THIS FIRST — v1.2 pending improvements
+
+**Status of prior rounds:**
+- **v1** (exact-name anchor lookup) — landed in `anchors.rs` + `anchor_candidates`.
+- **v1.1** (BM25-name fallback for substring matches) — landed. Catches the
+  sphinx-9711 case where user says `needs_extensions` but the symbol is
+  `verify_needs_extensions`.
+- **Benchmark driver change** — `benches/swebench/run.py` `PROMPT_PREFIX` now
+  instructs the agent to preserve identifiers verbatim in the `task` field
+  (rather than paraphrasing them away). This is an *orthogonal* fix that
+  makes anchors fire reliably. Keep it.
+
+**End-to-end validation against the 3 regression case studies** (with pre-indexed
+workspaces, identifier-preserving task strings, post-v1.1 binary):
+
+| Case | Anchor input | Target rank | Notes |
+|---|---|---|---|
+| sphinx-9711 | `needs_extensions` | **#6** | exact=0, bm25-name=1 hit; target rank-6 due to RRF dilution |
+| xarray-7229 | `keep_attrs` (dotted `xr.where` not extracted from prose) | **#7** | bm25-name found `_get_keep_attrs`; real target `where` never anchored |
+| sympy-21612 | `parse_latex` | **#1** 🎯 | exact=2 + bm25-name=3; clean win |
+
+**v1.2 closes the remaining gaps on sphinx and xarray.** Four changes, in
+priority order — all are small (≤30 lines each), zero breaking risk.
+
+### v1.2.a — Gate BM25-name fallback on exact-miss (PRECISION FIX)
+
+**Why**: v1.1 currently runs BM25-name *unconditionally*, even when exact-name
+already returned hits. For common symbol names (e.g., `where` has multiple
+exact matches across xarray), BM25-name adds fuzzy decoys (`where_method`,
+`sum_where`, `test_where`) that consume anchor slots and dilute the
+contribution of the real target in RRF.
+
+**Fix**: only run BM25-name when exact returned 0 hits. Keeps the fuzzy
+fallback for shortenings like `needs_extensions` → `verify_needs_extensions`,
+but doesn't add noise when exact is already precise.
+
+```rust
+// In anchor_candidates, replace the current unconditional fallback with:
+for name in &anchors.symbol_names {
+    let lookup = name.rsplit('.').next().unwrap_or(name);
+
+    let exact_ids = db
+        .symbols_by_exact_name(lookup, ANCHOR_ROWS_PER_NAME)
+        .unwrap_or_default();
+    let had_exact_hits = !exact_ids.is_empty();
+
+    for id in exact_ids {
+        if seen.insert(id) {
+            out.push((id, 1.0));
+            resolved_exact += 1;
+            if out.len() >= limit { break 'outer; }
+        }
+    }
+
+    // Fuzzy fallback ONLY if exact returned nothing — keeps precision high
+    // when the user named a real symbol exactly (multiple symbols with the
+    // same name are fine; we already captured them above).
+    if !had_exact_hits {
+        match search.search_name(lookup, ANCHOR_ROWS_PER_NAME) {
+            Ok(hits) => {
+                for (id, _) in hits {
+                    if seen.insert(id) {
+                        out.push((id, 0.9));
+                        resolved_bm25 += 1;
+                        if out.len() >= limit { break 'outer; }
+                    }
+                }
+            }
+            Err(e) => tracing::debug!("name-BM25 fallback failed for {:?}: {}", lookup, e),
+        }
+    }
+}
+```
+
+**Test**: for xarray-7229 with task `"fix xr.where keep_attrs overwriting coordinate attributes"`,
+extraction should yield `keep_attrs` (and v1.2.b will also yield `xr.where`).
+Exact on `keep_attrs` returns 0 → BM25-name runs → returns `_get_keep_attrs` etc.
+Exact on `where` returns multiple → BM25-name does NOT run → no `where_method` decoys.
+
+### v1.2.b — Extract dotted calls from prose, not just code blocks
+
+**Why**: The current prose extraction regex `\b[A-Za-z_][A-Za-z0-9_]{3,}\b`
+stops at the `.` in `xr.where`. So inline mentions like `"fix xr.where
+keep_attrs"` extract only `keep_attrs` (snake_case) — `xr.where` is lost.
+Code blocks catch dotted calls via `call_re`, but prose does not.
+
+**Fix**: after the existing prose loop in `extract()`, add a second pass
+that matches `identifier.identifier(.identifier)*` anywhere in the query
+(not just inside code blocks) and treats each dotted form as an anchor
+with the last segment as the lookup key.
+
+```rust
+// In anchors.rs::extract, after the existing prose loop, add:
+static DOTTED_PROSE_RE: OnceLock<Regex> = OnceLock::new();
+let dotted_re = DOTTED_PROSE_RE.get_or_init(|| {
+    // Identifier-dotted-identifier chain, min 2 segments
+    Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b").unwrap()
+});
+for m in dotted_re.find_iter(query) {
+    let full = m.as_str();
+    push(&mut out, &mut seen, full);
+    if let Some(last) = full.rsplit('.').next() {
+        if last != full && last.len() > 2 {
+            push(&mut out, &mut seen, last);
+        }
+    }
+}
+```
+
+**Test**: task `"fix xr.where keep_attrs"` → anchors contains `xr.where`,
+`where`, `keep_attrs`. Exact lookup on `where` finds `core/computation.py::where`
+and `core/duck_array_ops.py::where` directly.
+
+Combined with v1.2.a, xarray-7229 should now put `core/computation.py::where`
+in the top 5.
+
+### v1.2.c — Prefer module-level fqn on dotted anchors
+
+**Why**: Even with v1.2.b, `where` has multiple exact matches in xarray —
+some at the module level (`xarray/core/computation.py::where`) and some as
+class methods (`xarray/core/common.py::DataWithCoords::where`). When the
+anchor originated from a **dotted call** like `xr.where(...)`, it's
+almost certainly a module-level function call, not a method. Rank
+module-level matches above class-method matches.
+
+**Heuristic**: count `::` in the fqn. Module-level = 1 `::`. Class method = 2+.
+
+**Fix**: pass a flag through the anchor extractor indicating which names came
+from dotted calls. In `anchor_candidates`, when looking up such a name, sort
+the results by `::` count ascending before pushing.
+
+```rust
+// Extend Anchors to carry provenance:
+pub struct Anchors {
+    pub symbol_names: Vec<String>,
+    pub module_paths: Vec<String>,
+    /// Names that came from a dotted call (e.g. `xr.where`).
+    /// For these, we prefer module-level symbols (fqn with 1 `::`) over
+    /// class methods (fqn with 2+ `::`) when multiple exact matches exist.
+    pub from_dotted_call: HashSet<String>,
+}
+
+// In anchor_candidates, when looking up a name in from_dotted_call:
+let mut ids = db.symbols_by_exact_name(lookup, ANCHOR_ROWS_PER_NAME * 2)?;
+if anchors.from_dotted_call.contains(lookup) {
+    // Re-sort: prefer fewer "::" (module-level functions first).
+    ids.sort_by_key(|id| {
+        graph.get_symbol(*id)
+            .map(|s| s.fqn.matches("::").count())
+            .unwrap_or(usize::MAX)
+    });
+    ids.truncate(ANCHOR_ROWS_PER_NAME);
+}
+```
+
+**Test**: xarray-7229 anchor `where` (from dotted `xr.where`) → `core/computation.py::where`
+(1 `::`) ranks above `core/common.py::DataWithCoords::where` (2 `::`).
+
+### v1.2.d — Tune RRF k for anchor list (TUNING)
+
+**Why**: anchors currently fuse into RRF with the global `RRF_K = 60`. Rank-1
+anchor hit contributes `1/61 ≈ 0.0164`, which is exactly the same as rank-1
+BM25. If BM25 and ANN both rank the wrong file at #1 (as in sphinx-9711 where
+`bump_version.py::bump_version` wins BM25 + ANN), their combined contribution
+(~0.032) beats a lone anchor hit (~0.016). The target gets pushed to rank 6.
+
+**Fix**: use a smaller k (stronger boost) for the anchor list only:
+
+```rust
+// In ranking.rs:
+pub(crate) const ANCHOR_RRF_K: f32 = 15.0;  // was effectively 60
+
+// In build_context_capsule, do per-list RRF instead of shared k:
+let anchor_rrf = rrf_single(&anchor_results, ANCHOR_RRF_K);
+let bm25_rrf = rrf_single(&bm25_results, RRF_K);
+let graph_rrf = rrf_single(&graph_results, RRF_K);
+let ann_rrf = rrf_single(&ann_results, RRF_K);
+let merged = sum_rrf_tables(&[anchor_rrf, bm25_rrf, graph_rrf, ann_rrf]);
+```
+
+With `k=15`: rank-1 anchor contributes `1/16 ≈ 0.0625` — ~4× stronger than a
+rank-1 BM25 hit. Enough to overcome the BM25+ANN combo on sphinx-9711.
+
+**Risk**: over-boost — an anchor hit that's actually not the right file gets
+pushed past relevant BM25/ANN hits. Mitigate with v1.2.a (don't dilute) and by
+capping the anchor list size (`ANCHOR_CANDIDATES = 20` already).
+
+**Test**: re-run sphinx-9711 after v1.2.a + v1.2.d. Expected:
+`verify_needs_extensions` rank 6 → rank 1–3.
+
+### Summary of v1.2 impact on the three regressions
+
+| Case | After v1.2.a | After v1.2.a+b | After v1.2.a+b+c | After v1.2.a+b+c+d |
+|---|---|---|---|---|
+| sphinx-9711 (`needs_extensions`) | rank 6 (unchanged — exact was 0, fallback still fires) | same | same | **rank 1–3** (k=15 boosts anchor) |
+| xarray-7229 (`xr.where`, `keep_attrs`) | rank 7 (no decoys) | `where` now extracted, rank improves | `core/computation.py::where` prioritized over methods | **rank 1–3** |
+| sympy-21612 (`parse_latex`) | rank 1 (unchanged — clean win) | same | same | rank 1 |
+
+### Implementation order
+
+1. **v1.2.a** (gate fallback) — single `if !had_exact_hits` check around the existing fallback block. 3-line change + existing tests still pass.
+2. **v1.2.b** (dotted prose) — add the regex + loop in `extract()`. Write 2 new unit tests.
+3. **v1.2.d** (RRF tuning) — add `ANCHOR_RRF_K`, split the RRF merge. Validate against sphinx-9711.
+4. **v1.2.c** (module-vs-method) — extends `Anchors` struct. Larger scope than the others; do it last, only if xarray still misses after a+b+d.
+
+### Validation after v1.2
+
+Re-run all three cases using:
+```bash
+# Assumes /tmp/sphinx-repro, /tmp/xarray-repro, /tmp/sympy-repro are pre-indexed
+# with the v1.2 binary.
+for ws in sphinx-repro xarray-repro sympy-repro; do
+    python3 /Users/sriram/projects/codesurgeon/scripts/test_anchors_on_regression.py /tmp/$ws
+done
+```
+
+Success = all three targets in top 3 pivots.
+
+---
+
+## 🚨 HISTORICAL — v1.1 post-implementation finding (addressed, kept for reference)
 
 **v1 landed** (`anchors.rs` + `anchor_candidates` in `engine.rs`). End-to-end test
 against `sphinx-doc__sphinx-9711` with the pre-indexed sphinx workspace confirmed:

@@ -73,17 +73,36 @@ utility function called by 200 places would flood the pool with noise).
   3. **Prose identifiers** — snake_case or CamelCase tokens in the problem statement (stop-list filtered)
 - For each extracted name, looks up matching symbols in two stages:
   1. **Exact name** in SQLite (`symbols_by_exact_name`) — strongest signal, score 1.0.
-  2. **Name-field BM25** via Tantivy (`search_name`) — fallback when exact lookup
-     returns nothing. Tantivy's default tokenizer splits on `_`, so
-     `needs_extensions` matches `verify_needs_extensions` naturally. Scored
-     slightly lower (0.9) so exact matches rank above tokenised matches when
-     both fire. Restricting to the `name` field avoids the signal dilution that
-     caused the full-pipeline BM25 to lose the target to body-heavy prose.
-- Dotted calls (`xr.where`) use their last segment (`where`).
+  2. **Name-field BM25** via Tantivy (`search_name`) — fallback **only when
+     exact returned zero hits**. This gate (v1.2.a) keeps common symbol names
+     like `where` from dragging fuzzy decoys (`where_method`, `test_where`)
+     into the anchor pool and diluting the target's RRF contribution.
+     Tantivy's default tokenizer splits on `_`, so `needs_extensions` matches
+     `verify_needs_extensions` naturally. Scored slightly lower (0.9) so exact
+     matches rank above tokenised matches.
+- **Module-vs-method preference for dotted calls** (v1.2.c): when a name came
+  from a dotted call (`xr.where(...)` inside a code block, or inline prose
+  mentions of `xr.where`), the resolver fetches 2× rows and re-sorts by fqn
+  depth (`::` count ascending) before truncating. Module-level functions
+  (`core/computation.py::where`, 1 `::`) rank above class methods
+  (`core/common.py::DataWithCoords::where`, 2 `::`).
+- Dotted calls (`xr.where`) use their last segment (`where`) as the DB/BM25
+  lookup key. Dotted-call extraction runs both inside fenced code blocks
+  (`call_re`) and in inline prose (`dotted_prose_re`, v1.2.b).
 - Up to `ANCHOR_ROWS_PER_NAME = 5` hits per name per stage; the merged list is
   capped at `ANCHOR_CANDIDATES = 20`.
 - Order reflects extraction priority (code blocks first, then prose) and, within
   each name, exact matches before name-BM25 matches.
+
+**Why anchors fuse into RRF with a smaller `k` (v1.2.d):**
+the global `RRF_K = 60` gives a rank-1 hit a weight of `1/61 ≈ 0.016`, identical
+for all sources. If BM25 and ANN both wrong-answer the query (as in sphinx-9711
+where `bump_version.py::bump_version` wins both), their combined weight
+(~0.032) beats a lone anchor hit (~0.016) and the real target gets pushed out
+of the top 5. With `ANCHOR_RRF_K = 15`, a rank-1 anchor hit contributes
+`1/16 ≈ 0.063` — ~4× stronger — enough to overcome the wrong-answer combo.
+Safe to boost because anchor extraction is precision-first (stop-word filter +
+exact-match gate) and the anchor pool is capped at 20.
 
 **Why precision, not recall:** BM25 already handles fuzzy retrieval. Anchors exist to
 short-circuit the "task literally names the target function" case where BM25 tokenises
@@ -129,9 +148,11 @@ RRF(candidate) = Σ  1 / (60 + rank_i + 1)
 ```
 
 One term per retriever list `i` in which the candidate appears.
-`k = 60` is the standard default from the original RRF paper (Cormack et al. 2009).
-Candidates present in all four lists (strong lexical + graph + semantic + anchor signal)
-receive the highest fused scores.
+`k = 60` is the standard default from the original RRF paper (Cormack et al. 2009)
+and applies to BM25, graph, and ANN. The anchor list uses `k = 15` via
+`rrf_merge_ks` so precision-first anchor hits outweigh fuzzy rank-1 hits from
+the other sources. Candidates present in all four lists (strong lexical + graph
++ semantic + anchor signal) receive the highest fused scores.
 
 ---
 
@@ -330,7 +351,8 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | Semantic retrieval candidates | 25 | `ranking.rs:ANN_CANDIDATES` |
 | Explicit anchor candidates | 20 | `ranking.rs:ANCHOR_CANDIDATES` |
 | Anchor rows per distinct name | 5 | `ranking.rs:ANCHOR_ROWS_PER_NAME` |
-| RRF k constant | 60 | `ranking.rs:RRF_K` |
+| RRF k (BM25 / graph / ANN) | 60 | `ranking.rs:RRF_K` |
+| RRF k (explicit anchors) | 15 | `ranking.rs:ANCHOR_RRF_K` |
 | Structural injection cap | `max_pivots * 2` = 16 | `engine.rs:inject_structural_candidates` |
 | Injected candidate score | `family_in_degree * 5.0` | `engine.rs:inject_structural_candidates` |
 | Centrality boost multiplier | 3.0 | `engine.rs:apply_centrality_and_semantics` |

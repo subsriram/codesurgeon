@@ -30,6 +30,12 @@ pub(crate) const ANCHOR_ROWS_PER_NAME: usize = 5;
 
 /// RRF rank fusion constant (k=60 from the original paper).
 pub(crate) const RRF_K: f32 = 60.0;
+/// RRF k for the explicit-anchor list only. Lower than the global `RRF_K`
+/// (k=15 vs 60) so rank-1 anchor hits contribute ~4× more than rank-1 BM25 —
+/// enough to overcome a BM25+ANN combo that both wrong-answer the query.
+/// Safe because anchor extraction is precision-first: most noise is filtered
+/// out by the stop-word list and the exact-match gate in `anchor_candidates`.
+pub(crate) const ANCHOR_RRF_K: f32 = 15.0;
 /// Structural injection: score multiplier for injected hub types.
 pub(crate) const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
 /// Centrality boost multiplier applied to BM25 score.
@@ -59,9 +65,12 @@ pub(crate) const STUB_SCORE_WEIGHT: f32 = 0.3;
 /// Reciprocal Rank Fusion over multiple ranked lists.
 /// Each list contributes `1 / (k + rank + 1)` to a candidate's score.
 /// Lists that agree on a candidate amplify its score; unique candidates are preserved.
-pub(crate) fn rrf_merge(lists: &[&[(u64, f32)]], k: f32) -> Vec<(u64, f32)> {
+/// Reciprocal Rank Fusion with a per-list `k`. Lists with smaller `k` boost
+/// their top-ranked candidates more aggressively; use this when one retriever
+/// is known to be higher-precision than the others (e.g. explicit anchors).
+pub(crate) fn rrf_merge_ks(lists: &[(&[(u64, f32)], f32)]) -> Vec<(u64, f32)> {
     let mut scores: HashMap<u64, f32> = HashMap::new();
-    for list in lists {
+    for (list, k) in lists {
         for (rank, (id, _)) in list.iter().enumerate() {
             *scores.entry(*id).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
         }

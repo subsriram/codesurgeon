@@ -164,6 +164,16 @@ fn code_block_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"```[\w]*\n([\s\S]*?)```").unwrap())
 }
 
+fn dotted_prose_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Identifier-dotted-identifier chain of at least 2 segments. Each segment
+    // must start with a letter or underscore. Captures the full chain (e.g.
+    // `xr.where`, `urllib.request.urlopen`).
+    RE.get_or_init(|| {
+        Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b").unwrap()
+    })
+}
+
 /// Extracted anchors, in order of discovery.
 #[derive(Debug, Default, Clone)]
 pub struct Anchors {
@@ -171,6 +181,12 @@ pub struct Anchors {
     pub symbol_names: Vec<String>,
     /// Module paths (from import statements).
     pub module_paths: Vec<String>,
+    /// Names that came from a dotted call (e.g. `xr.where`, whether from a
+    /// code block or inline prose). When multiple exact matches exist for such
+    /// a name, the anchor resolver prefers module-level fqns (1 `::`) over
+    /// class methods (2+ `::`), since a dotted call is almost always a
+    /// module-level function, not a method.
+    pub from_dotted_call: HashSet<String>,
 }
 
 /// Extract anchor candidates from a free-form query.
@@ -211,10 +227,17 @@ pub fn extract(query: &str) -> Anchors {
         // Function/method calls inside the code block.
         for cap in call_re().captures_iter(block) {
             let full = &cap[1];
+            let is_dotted = full.contains('.');
             push(&mut out, &mut seen, full);
+            if is_dotted {
+                out.from_dotted_call.insert(full.to_string());
+            }
             if let Some(last) = full.rsplit('.').next() {
                 if last != full {
                     push(&mut out, &mut seen, last);
+                    if is_dotted && last.len() > 2 {
+                        out.from_dotted_call.insert(last.to_string());
+                    }
                 }
             }
         }
@@ -253,6 +276,23 @@ pub fn extract(query: &str) -> Anchors {
             continue;
         }
         push(&mut out, &mut seen, tok);
+    }
+
+    // 4. Dotted-identifier chains anywhere in the query (inline prose API
+    //    calls like `xr.where`). The prose regex above stops at `.` so it
+    //    would miss these; this pass catches them and marks them as
+    //    originating from a dotted call so the resolver prefers module-level
+    //    symbols over class methods.
+    for m in dotted_prose_re().find_iter(query) {
+        let full = m.as_str();
+        push(&mut out, &mut seen, full);
+        out.from_dotted_call.insert(full.to_string());
+        if let Some(last) = full.rsplit('.').next() {
+            if last != full && last.len() > 2 {
+                push(&mut out, &mut seen, last);
+                out.from_dotted_call.insert(last.to_string());
+            }
+        }
     }
 
     // Deduplicate module_paths while preserving order.
@@ -342,5 +382,43 @@ mod tests {
         let a = extract("");
         assert!(a.symbol_names.is_empty());
         assert!(a.module_paths.is_empty());
+    }
+
+    #[test]
+    fn dotted_prose_call_extracted() {
+        // v1.2.b: "fix xr.where keep_attrs overwriting coordinate attributes"
+        // should extract xr.where (dotted) and where (last segment), both
+        // marked as from_dotted_call — and also keep_attrs as a regular prose
+        // identifier.
+        let a = extract("fix xr.where keep_attrs overwriting coordinate attributes");
+        assert!(a.symbol_names.contains(&"xr.where".to_string()));
+        assert!(a.symbol_names.contains(&"where".to_string()));
+        assert!(a.symbol_names.contains(&"keep_attrs".to_string()));
+        assert!(a.from_dotted_call.contains("xr.where"));
+        assert!(a.from_dotted_call.contains("where"));
+        // keep_attrs is a plain snake_case identifier, not from a dotted call.
+        assert!(!a.from_dotted_call.contains("keep_attrs"));
+    }
+
+    #[test]
+    fn dotted_prose_three_segments() {
+        // Multi-level dotted chains: only the full chain and the last segment
+        // are pushed; intermediate segments are not (keeps precision high).
+        let a = extract("calls urllib.request.urlopen internally");
+        assert!(a
+            .symbol_names
+            .contains(&"urllib.request.urlopen".to_string()));
+        assert!(a.symbol_names.contains(&"urlopen".to_string()));
+        assert!(a.from_dotted_call.contains("urllib.request.urlopen"));
+        assert!(a.from_dotted_call.contains("urlopen"));
+    }
+
+    #[test]
+    fn code_block_dotted_marked_as_from_dotted_call() {
+        // v1.2.c: code-block dotted calls should also populate from_dotted_call.
+        let q = "```python\nxr.where(cond, a, b)\n```";
+        let a = extract(q);
+        assert!(a.from_dotted_call.contains("xr.where"));
+        assert!(a.from_dotted_call.contains("where"));
     }
 }

@@ -18,8 +18,9 @@ use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    resolve_adjacents, rrf_merge, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_ROWS_PER_NAME,
-    CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
+    resolve_adjacents, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_ROWS_PER_NAME,
+    ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K,
+    STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2041,6 +2042,7 @@ impl CoreEngine {
         let mut seen: HashSet<u64> = HashSet::new();
         let db = self.db.lock();
         let search = self.search.lock();
+        let graph = self.graph.read();
 
         let mut resolved_exact = 0usize;
         let mut resolved_bm25 = 0usize;
@@ -2050,39 +2052,69 @@ impl CoreEngine {
             // the last segment is the actual symbol name. For plain tokens
             // (no dot) `rsplit` yields the token itself.
             let lookup = name.rsplit('.').next().unwrap_or(name);
+            let prefer_module = anchors.from_dotted_call.contains(lookup)
+                || anchors.from_dotted_call.contains(name);
 
             // (1) Exact name match — strongest signal, highest score.
-            match db.symbols_by_exact_name(lookup, ANCHOR_ROWS_PER_NAME) {
-                Ok(ids) => {
-                    for id in ids {
-                        if seen.insert(id) {
-                            out.push((id, 1.0));
-                            resolved_exact += 1;
-                            if out.len() >= limit {
-                                break 'outer;
-                            }
-                        }
+            // For names that came from a dotted call we fetch 2× rows and
+            // re-sort to prefer module-level fqns (1 `::`) over class methods
+            // (2+ `::`), since a dotted call is almost always a module-level
+            // function invocation.
+            let fetch = if prefer_module {
+                ANCHOR_ROWS_PER_NAME * 2
+            } else {
+                ANCHOR_ROWS_PER_NAME
+            };
+            let exact_ids = match db.symbols_by_exact_name(lookup, fetch) {
+                Ok(mut ids) => {
+                    if prefer_module {
+                        ids.sort_by_key(|id| {
+                            graph
+                                .get_symbol(*id)
+                                .map(|s| s.fqn.matches("::").count())
+                                .unwrap_or(usize::MAX)
+                        });
+                        ids.truncate(ANCHOR_ROWS_PER_NAME);
+                    }
+                    ids
+                }
+                Err(e) => {
+                    tracing::debug!("exact anchor lookup failed for {:?}: {}", lookup, e);
+                    vec![]
+                }
+            };
+            let had_exact_hits = !exact_ids.is_empty();
+            for id in exact_ids {
+                if seen.insert(id) {
+                    out.push((id, 1.0));
+                    resolved_exact += 1;
+                    if out.len() >= limit {
+                        break 'outer;
                     }
                 }
-                Err(e) => tracing::debug!("exact anchor lookup failed for {:?}: {}", lookup, e),
             }
 
-            // (2) Name-field BM25 fallback — catches tokenised substring matches
-            // like `needs_extensions` → `verify_needs_extensions`. Scored
-            // slightly lower than exact so RRF preserves the ordering.
-            match search.search_name(lookup, ANCHOR_ROWS_PER_NAME) {
-                Ok(hits) => {
-                    for (id, _) in hits {
-                        if seen.insert(id) {
-                            out.push((id, 0.9));
-                            resolved_bm25 += 1;
-                            if out.len() >= limit {
-                                break 'outer;
+            // (2) Name-field BM25 fallback — only when exact returned nothing.
+            // Unconditional fallback leaks fuzzy decoys (e.g. `where_method`,
+            // `test_where`) into the anchor pool when the user named a real
+            // symbol exactly, diluting the target's RRF contribution.
+            if !had_exact_hits {
+                match search.search_name(lookup, ANCHOR_ROWS_PER_NAME) {
+                    Ok(hits) => {
+                        for (id, _) in hits {
+                            if seen.insert(id) {
+                                out.push((id, 0.9));
+                                resolved_bm25 += 1;
+                                if out.len() >= limit {
+                                    break 'outer;
+                                }
                             }
                         }
                     }
+                    Err(e) => {
+                        tracing::debug!("name-BM25 anchor lookup failed for {:?}: {}", lookup, e)
+                    }
                 }
-                Err(e) => tracing::debug!("name-BM25 anchor lookup failed for {:?}: {}", lookup, e),
             }
         }
 
@@ -2235,17 +2267,25 @@ impl CoreEngine {
         let anchor_results = self.anchor_candidates(query, ANCHOR_CANDIDATES);
 
         // ANN semantic retrieval + RRF fusion across all four sources.
+        // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
+        // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
+        // lost the target to body-field noise.
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
-            rrf_merge(
-                &[&bm25_results, &graph_results, &ann_results, &anchor_results],
-                RRF_K,
-            )
+            rrf_merge_ks(&[
+                (&bm25_results, RRF_K),
+                (&graph_results, RRF_K),
+                (&ann_results, RRF_K),
+                (&anchor_results, ANCHOR_RRF_K),
+            ])
         };
         #[cfg(not(feature = "embeddings"))]
-        let mut search_results =
-            rrf_merge(&[&bm25_results, &graph_results, &anchor_results], RRF_K);
+        let mut search_results = rrf_merge_ks(&[
+            (&bm25_results, RRF_K),
+            (&graph_results, RRF_K),
+            (&anchor_results, ANCHOR_RRF_K),
+        ]);
 
         let graph = self.graph.read();
 
