@@ -18,6 +18,13 @@ pub(crate) const BM25_POOL_SIZE: usize = 50;
 pub(crate) const ANN_CANDIDATES: usize = 25;
 /// Number of graph-neighbor candidates expanded from BM25 seeds per query.
 pub(crate) const GRAPH_CANDIDATES: usize = 25;
+/// Explicit-anchor candidate pool size. Anchors are exact symbol-name matches
+/// extracted from the query (prose identifiers, import targets, code-block API
+/// calls). Kept small because the goal is precision, not recall.
+pub(crate) const ANCHOR_CANDIDATES: usize = 20;
+/// Max rows to fetch per distinct anchor name (limits blast radius on common
+/// names like `where` or `get`).
+pub(crate) const ANCHOR_ROWS_PER_NAME: usize = 5;
 
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 

@@ -1,3 +1,4 @@
+pub mod anchors;
 pub mod capsule;
 pub mod db;
 pub mod diff;

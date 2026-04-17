@@ -246,6 +246,21 @@ impl Database {
         Ok(ids)
     }
 
+    /// Look up symbol IDs by exact name (not FQN). Used for explicit-anchor
+    /// retrieval where we want precise symbol-name matches rather than BM25
+    /// tokenized scoring. Returns at most `limit` rows.
+    pub fn symbols_by_exact_name(&self, name: &str, limit: usize) -> Result<Vec<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM symbols WHERE name = ?1 LIMIT ?2")?;
+        let ids = stmt
+            .query_map(params![name, limit as i64], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .map(|id| id as u64)
+            .collect();
+        Ok(ids)
+    }
+
     /// Delete all edges referencing any of the given symbol IDs.
     ///
     /// Uses a single batched DELETE with `IN (...)` instead of one statement per

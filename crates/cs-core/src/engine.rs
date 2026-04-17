@@ -18,8 +18,8 @@ use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    resolve_adjacents, rrf_merge, select_adjacents, CENTRALITY_BOOST, GRAPH_CANDIDATES,
-    MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
+    resolve_adjacents, rrf_merge, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_ROWS_PER_NAME,
+    CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -926,10 +926,9 @@ impl CoreEngine {
                 let db = self.db.lock();
                 db.begin_transaction()?;
                 let mut failed_chunks = 0u32;
-                let total_chunks = (all_symbols.len() + 63) / 64;
+                let total_chunks = all_symbols.len().div_ceil(64);
                 for chunk_syms in all_symbols.chunks(64) {
-                    let chunk_texts: Vec<String> =
-                        chunk_syms.iter().map(|s| skeleton_text(s)).collect();
+                    let chunk_texts: Vec<String> = chunk_syms.iter().map(skeleton_text).collect();
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
                     match emb.embed_batch(&refs) {
                         Ok(vecs) => {
@@ -2023,6 +2022,56 @@ impl CoreEngine {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
+    /// Stage 1: explicit symbol-name anchors.
+    ///
+    /// Extracts identifier-shaped tokens from the query (prose, imports, and
+    /// code-block API calls) and looks them up by exact name in the symbol
+    /// table. Unlike BM25, this is a precision-first signal: if a task names
+    /// `parse_latex` or calls `xr.where(...)`, we want that symbol promoted
+    /// directly regardless of how many other files mention the word.
+    ///
+    /// Returns `(symbol_id, 1.0)` pairs in extraction order. RRF fusion
+    /// handles rank-based blending with BM25 / graph / ANN.
+    fn anchor_candidates(&self, query: &str, limit: usize) -> Vec<(u64, f32)> {
+        let anchors = crate::anchors::extract(query);
+        if anchors.symbol_names.is_empty() {
+            return vec![];
+        }
+        let mut out: Vec<(u64, f32)> = Vec::with_capacity(limit);
+        let mut seen: HashSet<u64> = HashSet::new();
+        let db = self.db.lock();
+        for name in &anchors.symbol_names {
+            // Dotted paths like `xr.where` won't match `name` column directly —
+            // the last segment is the actual symbol name. For plain tokens
+            // (no dot) `rsplit` yields the token itself.
+            let lookup = name.rsplit('.').next().unwrap_or(name);
+            match db.symbols_by_exact_name(lookup, ANCHOR_ROWS_PER_NAME) {
+                Ok(ids) => {
+                    for id in ids {
+                        if seen.insert(id) {
+                            out.push((id, 1.0));
+                            if out.len() >= limit {
+                                tracing::debug!(
+                                    "anchors: {} extracted, {} resolved (cap hit)",
+                                    anchors.symbol_names.len(),
+                                    out.len()
+                                );
+                                return out;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("anchor lookup failed for {:?}: {}", lookup, e),
+            }
+        }
+        tracing::debug!(
+            "anchors: {} extracted, {} resolved",
+            anchors.symbol_names.len(),
+            out.len()
+        );
+        out
+    }
+
     /// Stage 1.5: parallel flat cosine scan over the embedding cache for the top-K nearest symbols.
     /// Returns `(symbol_id, cosine_similarity)` pairs, sorted descending by similarity.
     ///
@@ -2155,14 +2204,24 @@ impl CoreEngine {
             graph_candidates(&graph, &bm25_ids, GRAPH_CANDIDATES)
         };
 
-        // ANN semantic retrieval + RRF fusion across all three sources.
+        // Explicit-anchor retrieval: exact symbol-name matches extracted from
+        // the query (prose identifiers, imports, code-block API calls). Empty
+        // when the query has no extractable identifiers, in which case the
+        // RRF blend is unchanged.
+        let anchor_results = self.anchor_candidates(query, ANCHOR_CANDIDATES);
+
+        // ANN semantic retrieval + RRF fusion across all four sources.
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
-            rrf_merge(&[&bm25_results, &graph_results, &ann_results], RRF_K)
+            rrf_merge(
+                &[&bm25_results, &graph_results, &ann_results, &anchor_results],
+                RRF_K,
+            )
         };
         #[cfg(not(feature = "embeddings"))]
-        let mut search_results = rrf_merge(&[&bm25_results, &graph_results], RRF_K);
+        let mut search_results =
+            rrf_merge(&[&bm25_results, &graph_results, &anchor_results], RRF_K);
 
         let graph = self.graph.read();
 
