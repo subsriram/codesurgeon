@@ -1,6 +1,6 @@
 # Design: Explicit Symbol-Name Anchors in the Ranking Pipeline
 
-> **Status**: v1 + v1.1 + v1.2 implemented. **v1.3 pending** (see "v1.3 pending improvement" section for the matplotlib-26208 regression fix).
+> **Status**: v1 + v1.1 + v1.2 + v1.3 + v1.5 implemented. v1.5 (adaptive pivot cap) is the most recent; see the "v1.5" section at the top.
 > **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`
 > **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`
 > **Motivation**: SWE-bench #29c revealed that capsule ranking misses the target
@@ -8,6 +8,59 @@
 > enabled. The failure mode is always the same: the task explicitly names the
 > target symbol, but the ranker treats it as bag-of-words and surfaces
 > tangentially-related files instead.
+
+---
+
+## v1.5 — adaptive pivot cap based on anchor confidence (LANDED)
+
+**Problem**: v1 – v1.3 shipped high-quality anchor retrieval but left the
+pivot count hard-coded at `max_pivots = 8`. On SWE-bench tasks where anchors
+resolve cleanly (e.g. sympy-21612: `parse_latex` → 3 exact hits across 3
+distinct source files, zero fuzzy fallback) the bottom 5 pivots are BM25/ANN
+residue that adds tokens without adding load-bearing context. Measured on
+sympy-21612 v1.4 run: +21% total tokens vs v1.0 baseline despite -28% cost,
+because the cache-miss pivots ballooned even though the anchor was precise.
+
+**Fix**: return confidence stats from `anchor_candidates` and pick an
+adaptive pivot cap:
+
+```rust
+pub struct AnchorStats {
+    pub extracted: usize,
+    pub resolved_exact: usize,
+    pub resolved_bm25_name: usize,
+    pub distinct_source_files: usize,  // non-test files among exact hits
+}
+
+let effective_pivots = match &astats {
+    s if s.resolved_exact >= 3
+        && s.resolved_bm25_name == 0
+        && s.distinct_source_files >= 2 => 3,                         // CLEAN
+    s if s.resolved_exact >= 1 || s.resolved_bm25_name > 0 =>
+        (self.config.max_pivots * 5 / 8).max(5),                      // MEDIUM
+    _ => self.config.max_pivots,                                      // DEFAULT
+};
+```
+
+- **Clean** (high-precision anchor): ≥3 exact hits, no fuzzy fallback,
+  across ≥2 distinct non-test files → 3 pivots. The anchor is doing the
+  work; adjacent symbols and skeletons provide the rest of the context.
+- **Medium** (some anchor resolution): ≥1 exact hit OR any fuzzy hit →
+  5 pivots. Still useful signal but noisier, so keep a wider net.
+- **Default** (no anchor fires, or empty stats): 8 pivots. Unchanged from
+  v1.3 baseline.
+
+Test files are excluded from the `distinct_source_files` count so that three
+exact hits all inside `tests/` falls back to medium, not clean — test copies
+don't confirm the target implementation lives in multiple modules.
+
+Skeletons are unchanged (still 20). The pivot body is what dominates token
+count; skeleton lines are cheap and useful for navigation regardless of
+anchor quality.
+
+**Tests**: `crates/cs-core/tests/ranking_adaptive.rs` covers all four bucket
+transitions with integration tests that assert observed pivot counts against
+a tempdir workspace. See also the `AnchorStats` struct in `engine.rs`.
 
 ---
 

@@ -274,6 +274,20 @@ pub struct FlowResult {
 
 // ── ANN index ─────────────────────────────────────────────────────────────────
 
+/// Summary of how cleanly the anchor extractor resolved identifiers from the
+/// query. Used by `build_context_capsule` to pick an adaptive pivot cap — a
+/// high-confidence resolution (multiple exact hits across multiple source
+/// files, zero fuzzy fallback) means the capsule can be much smaller without
+/// losing the load-bearing symbols.
+#[derive(Debug, Default, Clone)]
+pub struct AnchorStats {
+    pub extracted: usize,
+    pub resolved_exact: usize,
+    pub resolved_bm25_name: usize,
+    /// Distinct non-test file paths among the exact-name anchor hits.
+    pub distinct_source_files: usize,
+}
+
 // ── CoreEngine ────────────────────────────────────────────────────────────────
 
 pub struct CoreEngine {
@@ -2033,10 +2047,10 @@ impl CoreEngine {
     ///
     /// Returns `(symbol_id, 1.0)` pairs in extraction order. RRF fusion
     /// handles rank-based blending with BM25 / graph / ANN.
-    fn anchor_candidates(&self, query: &str, limit: usize) -> Vec<(u64, f32)> {
+    fn anchor_candidates(&self, query: &str, limit: usize) -> (Vec<(u64, f32)>, AnchorStats) {
         let anchors = crate::anchors::extract(query);
         if anchors.symbol_names.is_empty() {
-            return vec![];
+            return (vec![], AnchorStats::default());
         }
         let mut out: Vec<(u64, f32)> = Vec::with_capacity(limit);
         let mut seen: HashSet<u64> = HashSet::new();
@@ -2046,6 +2060,7 @@ impl CoreEngine {
 
         let mut resolved_exact = 0usize;
         let mut resolved_bm25 = 0usize;
+        let mut exact_source_files: HashSet<String> = HashSet::new();
 
         'outer: for name in &anchors.symbol_names {
             // Dotted paths like `xr.where` don't match the `name` column directly —
@@ -2086,6 +2101,17 @@ impl CoreEngine {
             let had_exact_hits = !exact_ids.is_empty();
             for id in exact_ids {
                 if seen.insert(id) {
+                    if let Some(sym) = graph.get_symbol(id) {
+                        let p = &sym.file_path;
+                        let is_test = p.contains("/test")
+                            || p.contains("_test.")
+                            || p.contains("test_")
+                            || p.contains("/spec")
+                            || p.contains("_spec.");
+                        if !is_test {
+                            exact_source_files.insert(p.clone());
+                        }
+                    }
                     out.push((id, 1.0));
                     resolved_exact += 1;
                     if out.len() >= limit {
@@ -2142,7 +2168,13 @@ impl CoreEngine {
             resolved_bm25,
             out.len()
         );
-        out
+        let stats = AnchorStats {
+            extracted: anchors.symbol_names.len(),
+            resolved_exact,
+            resolved_bm25_name: resolved_bm25,
+            distinct_source_files: exact_source_files.len(),
+        };
+        (out, stats)
     }
 
     /// Stage 1.5: parallel flat cosine scan over the embedding cache for the top-K nearest symbols.
@@ -2281,7 +2313,28 @@ impl CoreEngine {
         // the query (prose identifiers, imports, code-block API calls). Empty
         // when the query has no extractable identifiers, in which case the
         // RRF blend is unchanged.
-        let anchor_results = self.anchor_candidates(query, ANCHOR_CANDIDATES);
+        let (anchor_results, astats) = self.anchor_candidates(query, ANCHOR_CANDIDATES);
+
+        // Adaptive pivot cap: when anchors resolve cleanly we can shrink the
+        // capsule without losing load-bearing symbols. See
+        // `docs/explicit-symbol-anchors.md` "v1.5" section.
+        let effective_pivots = match &astats {
+            s if s.resolved_exact >= 3
+                && s.resolved_bm25_name == 0
+                && s.distinct_source_files >= 2 =>
+            {
+                3
+            }
+            s if s.resolved_exact >= 1 || s.resolved_bm25_name > 0 => {
+                (self.config.max_pivots * 5 / 8).max(5)
+            }
+            _ => self.config.max_pivots,
+        };
+        tracing::debug!(
+            "adaptive pivots: {} (stats: {:?})",
+            effective_pivots,
+            astats
+        );
 
         // ANN semantic retrieval + RRF fusion across all four sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
@@ -2308,7 +2361,7 @@ impl CoreEngine {
 
         // 2. Inject high-centrality types for Structural queries (BM25 can't surface them)
         if *intent == SearchIntent::Structural {
-            inject_structural_candidates(&graph, &mut search_results, self.config.max_pivots);
+            inject_structural_candidates(&graph, &mut search_results, effective_pivots);
         }
 
         // 3. Re-rank by query proximity + centrality + optional semantic similarity
@@ -2373,7 +2426,7 @@ impl CoreEngine {
                 true
             });
         }
-        let max_pivots = max_results.unwrap_or(self.config.max_pivots);
+        let max_pivots = max_results.unwrap_or(effective_pivots);
 
         // 6. Select pivots and adjacents
         // Stubs are excluded from pivots — they are skeleton-only references.
