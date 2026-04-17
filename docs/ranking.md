@@ -71,11 +71,19 @@ utility function called by 200 places would flood the pool with noise).
   1. **Code-block API calls** — `xr.where(...)`, `parse_latex(...)` inside fenced code blocks
   2. **Import statements** — `from sympy.parsing.latex import parse_latex`
   3. **Prose identifiers** — snake_case or CamelCase tokens in the problem statement (stop-list filtered)
-- For each extracted name, looks up matching symbols by **exact name** in SQLite (not FTS/BM25).
-  Dotted calls (`xr.where`) use their last segment (`where`).
-- Up to `ANCHOR_ROWS_PER_NAME = 5` hits per name; the list is capped at `ANCHOR_CANDIDATES = 20`.
-- All hits score 1.0 — RRF uses rank, not score. Order reflects extraction priority
-  (code blocks first, then prose).
+- For each extracted name, looks up matching symbols in two stages:
+  1. **Exact name** in SQLite (`symbols_by_exact_name`) — strongest signal, score 1.0.
+  2. **Name-field BM25** via Tantivy (`search_name`) — fallback when exact lookup
+     returns nothing. Tantivy's default tokenizer splits on `_`, so
+     `needs_extensions` matches `verify_needs_extensions` naturally. Scored
+     slightly lower (0.9) so exact matches rank above tokenised matches when
+     both fire. Restricting to the `name` field avoids the signal dilution that
+     caused the full-pipeline BM25 to lose the target to body-heavy prose.
+- Dotted calls (`xr.where`) use their last segment (`where`).
+- Up to `ANCHOR_ROWS_PER_NAME = 5` hits per name per stage; the merged list is
+  capped at `ANCHOR_CANDIDATES = 20`.
+- Order reflects extraction priority (code blocks first, then prose) and, within
+  each name, exact matches before name-BM25 matches.
 
 **Why precision, not recall:** BM25 already handles fuzzy retrieval. Anchors exist to
 short-circuit the "task literally names the target function" case where BM25 tokenises

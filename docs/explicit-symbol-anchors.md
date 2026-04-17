@@ -1,13 +1,181 @@
 # Design: Explicit Symbol-Name Anchors in the Ranking Pipeline
 
-> **Status**: design / proposal
-> **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`
+> **Status**: v1 implemented, v1.1 pending (see "Post-implementation finding")
+> **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`
 > **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`
 > **Motivation**: SWE-bench #29c revealed that capsule ranking misses the target
 > file in 5 out of 6 regression tasks even with semantic (embedding) retrieval
 > enabled. The failure mode is always the same: the task explicitly names the
 > target symbol, but the ranker treats it as bag-of-words and surfaces
 > tangentially-related files instead.
+
+---
+
+## 🚨 READ THIS FIRST — Post-implementation finding (v1.1 work)
+
+**v1 landed** (`anchors.rs` + `anchor_candidates` in `engine.rs`). End-to-end test
+against `sphinx-doc__sphinx-9711` with the pre-indexed sphinx workspace confirmed:
+
+- **Extraction works**: debug log showed `anchors: 1 extracted, 0 resolved` for the query
+  `"fix needs_extensions version comparison using strings instead of version tuples"`.
+- **Lookup too strict**: the real symbol is `sphinx/extension.py::verify_needs_extensions`,
+  but the user prose says `needs_extensions`. Exact-name DB lookup fails on the mismatch.
+
+### What v1.1 must add: name-field BM25 lookup as a second resolution path
+
+BM25 already tokenises identifiers on `_` via Tantivy's default tokenizer —
+`verify_needs_extensions` is indexed as `{verify, needs, extensions}`.
+A BM25 query for `"needs_extensions"` will tokenise to `{needs, extensions}`
+and score `verify_needs_extensions` very high **if the search is restricted
+to the `name` field**.
+
+The reason the full-pipeline BM25 misses the target is **signal dilution from
+the rest of the prose query**. Evidence — two CLI `search` calls against the
+same sphinx corpus:
+
+| Query | Tantivy BM25 top-1 |
+|---|---|
+| `"needs_extensions version"` (2 tokens) | ✅ `sphinx/extension.py::verify_needs_extensions` |
+| `"fix needs_extensions version comparison using strings instead of version tuples"` (10 tokens) | ❌ `utils/bump_version.py::bump_version` |
+
+The extra tokens (`fix`, `comparison`, `using`, `strings`, `instead`, `tuples`)
+all match heavily against `bump_version.py`'s long body (body field contains
+"version" 30+ times across many related functions). `verify_needs_extensions`
+has a ~10-line body with `needs` and `extensions` each appearing once — when
+BM25 sums across `{name, signature, docstring, body}`, the noise wins.
+
+### The fix in one paragraph
+
+In `anchor_candidates`, after the exact-name DB lookup fails, run a **second**
+lookup that is a Tantivy BM25 query restricted to the `name` field only,
+with just the anchor token as the query. This bypasses body/docstring/signature
+noise completely. Tokenisation on `_` makes `needs_extensions` match
+`verify_needs_extensions` naturally.
+
+### Implementation (≈20 net lines)
+
+Add to `crates/cs-core/src/search.rs` alongside the existing `search()` method:
+
+```rust
+/// BM25 restricted to the symbol `name` field.
+///
+/// Used by the anchor pipeline to resolve a short identifier (e.g.
+/// `needs_extensions`) against symbol names (e.g. `verify_needs_extensions`)
+/// without the noise of body/docstring/signature matches that would dominate
+/// a full-field query. The `name` field uses Tantivy's default tokenizer
+/// which splits on `_`, so `needs_extensions` → {needs, extensions} matches
+/// any symbol whose name contains both tokens.
+pub fn search_name(&self, query: &str, limit: usize) -> Result<Vec<(u64, f32)>> {
+    let reader = self
+        .index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()?;
+    let searcher = reader.searcher();
+    let qp = QueryParser::for_index(&self.index, vec![self.schema.f_name]);
+    let parsed = qp
+        .parse_query(query)
+        .or_else(|_| qp.parse_query(&escape_for_tantivy(query)))
+        .unwrap_or_else(|_| qp.parse_query("*").expect("wildcard is always parseable"));
+    let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit))?;
+    let mut results = Vec::new();
+    for (score, addr) in top_docs {
+        let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
+        if let Some(id_val) = doc.get_first(self.schema.f_id) {
+            if let Some(id) = id_val.as_u64() {
+                results.push((id, score));
+            }
+        }
+    }
+    Ok(results)
+}
+```
+
+Modify `anchor_candidates` in `crates/cs-core/src/engine.rs` to use this as
+a fallback when exact-name DB lookup returns zero hits:
+
+```rust
+fn anchor_candidates(&self, query: &str, limit: usize) -> Vec<(u64, f32)> {
+    let anchors = crate::anchors::extract(query);
+    if anchors.symbol_names.is_empty() { return vec![]; }
+
+    let mut out: Vec<(u64, f32)> = Vec::with_capacity(limit);
+    let mut seen: HashSet<u64> = HashSet::new();
+    let db = self.db.lock();
+    let search = self.search.lock();
+
+    let mut extracted = 0usize;
+    let mut resolved_exact = 0usize;
+    let mut resolved_bm25 = 0usize;
+
+    for name in &anchors.symbol_names {
+        extracted += 1;
+        let lookup = name.rsplit('.').next().unwrap_or(name);
+
+        // 1) Exact name match — strongest signal. Highest score.
+        if let Ok(ids) = db.symbols_by_exact_name(lookup, ANCHOR_ROWS_PER_NAME) {
+            for id in ids {
+                if seen.insert(id) {
+                    out.push((id, 1.0));
+                    resolved_exact += 1;
+                    if out.len() >= limit { break; }
+                }
+            }
+        }
+        if out.len() >= limit { break; }
+
+        // 2) Name-field BM25 fallback — catches `needs_extensions` → `verify_needs_extensions`.
+        // Score slightly lower than exact so RRF preserves the ordering.
+        if let Ok(hits) = search.search_name(lookup, ANCHOR_ROWS_PER_NAME) {
+            for (id, _) in hits {
+                if seen.insert(id) {
+                    out.push((id, 0.9));
+                    resolved_bm25 += 1;
+                    if out.len() >= limit { break; }
+                }
+            }
+        }
+        if out.len() >= limit { break; }
+    }
+
+    tracing::debug!(
+        "anchors: {} extracted, {} exact, {} bm25-name (total {})",
+        extracted, resolved_exact, resolved_bm25, out.len()
+    );
+    out
+}
+```
+
+### Validation checklist
+
+After landing v1.1, re-run the sphinx-9711 validation test. The command:
+
+```bash
+# MCP server on a persistent connection (subprocess.Popen) against a pre-indexed sphinx repo
+# at /tmp/sphinx-repro (clone → base_commit 81a4fd973d... → codesurgeon index --workspace ...).
+# Send run_pipeline with task="fix needs_extensions version comparison using strings instead of version tuples".
+```
+
+Success = `sphinx/extension.py::verify_needs_extensions` appears in the top 3 pivots
+(currently it's not in the top 8 even with v1 anchors).
+
+Add a unit test in `search.rs` that seeds `{verify_needs_extensions, bump_version, parse_version}`
+and asserts `search_name("needs_extensions")` returns `verify_needs_extensions` at rank 1.
+
+### Why this isn't covered by existing BM25
+
+The engine's existing `search()` queries `[f_name, f_signature, f_docstring, f_body]`
+as a union. When prose is 10 tokens and only 1 is the "anchor," the other 9
+tokens dominate the sum. `search_name` is a targeted escape hatch for the
+specific case where an anchor has been extracted from the query. Keep both;
+don't weaken the general search.
+
+### Why not fuzzy SQL LIKE (`WHERE name LIKE '%needs_extensions%'`)
+
+Considered and rejected: `LIKE '%X%'` is O(table scan), can't use an index,
+and returns unscored results. The Tantivy name-field query is O(log n) via
+the inverted index, applies BM25 scoring naturally, and reuses the
+tokeniser we already depend on.
 
 ---
 

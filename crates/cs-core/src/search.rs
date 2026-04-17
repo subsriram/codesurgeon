@@ -164,6 +164,42 @@ impl SearchIndex {
         Ok(results)
     }
 
+    /// BM25 restricted to the symbol `name` field.
+    ///
+    /// Used by the anchor pipeline to resolve a short identifier (e.g.
+    /// `needs_extensions`) against symbol names (e.g. `verify_needs_extensions`)
+    /// without the noise of body/docstring/signature matches that would
+    /// dominate a full-field query. Tantivy's default tokenizer splits on `_`,
+    /// so `needs_extensions` tokenises to `{needs, extensions}` and matches
+    /// any symbol whose name contains both tokens.
+    pub fn search_name(&self, query: &str, limit: usize) -> Result<Vec<(u64, f32)>> {
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let searcher = reader.searcher();
+        let qp = QueryParser::for_index(&self.index, vec![self.schema.f_name]);
+        let parsed = qp
+            .parse_query(query)
+            .or_else(|_| qp.parse_query(&escape_for_tantivy(query)))
+            .unwrap_or_else(|_| {
+                qp.parse_query("*")
+                    .expect("parsing literal '*' query should never fail")
+            });
+        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit))?;
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, addr) in top_docs {
+            let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
+            if let Some(id_val) = doc.get_first(self.schema.f_id) {
+                if let Some(id) = id_val.as_u64() {
+                    results.push((id, score));
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// TF-IDF re-ranking on top of BM25 results.
     /// Applies name/signature term boosts, file path penalties (test/utility files),
     /// and symbol-kind boosts for structural/explore queries.
@@ -368,4 +404,63 @@ impl SearchIntent {
 
 fn contains_any(s: &str, terms: &[&str]) -> bool {
     terms.iter().any(|t| s.contains(t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::Language;
+    use crate::symbol::SymbolKind;
+
+    fn sym(name: &str) -> Symbol {
+        Symbol::new(
+            "src/lib.rs",
+            name,
+            SymbolKind::Function,
+            1,
+            10,
+            format!("fn {}()", name),
+            None,
+            String::new(),
+            Language::Rust,
+        )
+    }
+
+    #[test]
+    fn search_name_matches_tokenised_substring() {
+        // Regression: v1 anchors failed sphinx-9711 because the user prose said
+        // `needs_extensions` but the real symbol was `verify_needs_extensions`.
+        // `search_name` should tokenise on `_` and rank the longer name as rank 1.
+        let mut idx = SearchIndex::new().unwrap();
+        idx.index_symbol(&sym("verify_needs_extensions")).unwrap();
+        idx.index_symbol(&sym("bump_version")).unwrap();
+        idx.index_symbol(&sym("parse_version")).unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search_name("needs_extensions", 5).unwrap();
+        assert!(!hits.is_empty(), "expected at least one hit");
+        let top_id = hits[0].0;
+        let expected = sym("verify_needs_extensions").id;
+        assert_eq!(
+            top_id, expected,
+            "expected verify_needs_extensions at rank 1 for needs_extensions query"
+        );
+    }
+
+    #[test]
+    fn search_name_ignores_body_noise() {
+        // Full `search()` gets dragged off-target by body matches; `search_name`
+        // should not — it only looks at the `name` field.
+        let mut idx = SearchIndex::new().unwrap();
+        // A symbol whose body mentions "version" many times — irrelevant for name search.
+        let mut noisy = sym("bump_version");
+        noisy.body = "version ".repeat(50);
+        idx.index_symbol(&noisy).unwrap();
+        idx.index_symbol(&sym("verify_needs_extensions")).unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search_name("needs_extensions", 5).unwrap();
+        let top = hits[0].0;
+        assert_eq!(top, sym("verify_needs_extensions").id);
+    }
 }

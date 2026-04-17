@@ -2040,33 +2040,57 @@ impl CoreEngine {
         let mut out: Vec<(u64, f32)> = Vec::with_capacity(limit);
         let mut seen: HashSet<u64> = HashSet::new();
         let db = self.db.lock();
-        for name in &anchors.symbol_names {
-            // Dotted paths like `xr.where` won't match `name` column directly —
+        let search = self.search.lock();
+
+        let mut resolved_exact = 0usize;
+        let mut resolved_bm25 = 0usize;
+
+        'outer: for name in &anchors.symbol_names {
+            // Dotted paths like `xr.where` don't match the `name` column directly —
             // the last segment is the actual symbol name. For plain tokens
             // (no dot) `rsplit` yields the token itself.
             let lookup = name.rsplit('.').next().unwrap_or(name);
+
+            // (1) Exact name match — strongest signal, highest score.
             match db.symbols_by_exact_name(lookup, ANCHOR_ROWS_PER_NAME) {
                 Ok(ids) => {
                     for id in ids {
                         if seen.insert(id) {
                             out.push((id, 1.0));
+                            resolved_exact += 1;
                             if out.len() >= limit {
-                                tracing::debug!(
-                                    "anchors: {} extracted, {} resolved (cap hit)",
-                                    anchors.symbol_names.len(),
-                                    out.len()
-                                );
-                                return out;
+                                break 'outer;
                             }
                         }
                     }
                 }
-                Err(e) => tracing::debug!("anchor lookup failed for {:?}: {}", lookup, e),
+                Err(e) => tracing::debug!("exact anchor lookup failed for {:?}: {}", lookup, e),
+            }
+
+            // (2) Name-field BM25 fallback — catches tokenised substring matches
+            // like `needs_extensions` → `verify_needs_extensions`. Scored
+            // slightly lower than exact so RRF preserves the ordering.
+            match search.search_name(lookup, ANCHOR_ROWS_PER_NAME) {
+                Ok(hits) => {
+                    for (id, _) in hits {
+                        if seen.insert(id) {
+                            out.push((id, 0.9));
+                            resolved_bm25 += 1;
+                            if out.len() >= limit {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("name-BM25 anchor lookup failed for {:?}: {}", lookup, e),
             }
         }
+
         tracing::debug!(
-            "anchors: {} extracted, {} resolved",
+            "anchors: {} extracted, {} exact, {} bm25-name (total {})",
             anchors.symbol_names.len(),
+            resolved_exact,
+            resolved_bm25,
             out.len()
         );
         out
