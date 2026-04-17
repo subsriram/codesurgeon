@@ -201,8 +201,8 @@ so the policy tracks drift.
 - **Pros.** One knob, trivially debuggable, freeze by setting ε=0.
 - **Cons.** Wastes exploration budget uniformly across arms; converges slowly
   when stratified (intent × arm).
-- **Verdict.** **Adopt as the v1 policy.** It's the right shape for step 1 —
-  you're still validating the reward signal itself.
+- **Verdict.** **Adopt in Phase 1.** It's the right shape for the first live
+  policy — you're still validating the reward signal itself.
 
 #### UCB1
 
@@ -231,9 +231,9 @@ decay:    α, β ← α · e^(-Δt / τ), β · e^(-Δt / τ) + 1    # keep a mi
   sample-efficient; handles intent stratification cleanly (separate posterior
   per `intent × arm`).
 - **Cons.** One more concept (posterior), prior choice matters a little.
-- **Verdict.** **Adopt as the v2 policy.** Swap-in after ε-greedy validates
-  the reward signal. No schema change needed — `alpha`/`beta` columns already
-  in `arm_stats`.
+- **Verdict.** **Adopt in Phase 3** (first policy of that phase). Swap-in
+  after ε-greedy validates the reward signal. No schema change needed —
+  `alpha`/`beta` columns already in `arm_stats`.
 
 ### 4.2 Contextual bandits
 
@@ -265,8 +265,8 @@ Per arm, maintain `A_a ∈ R^{d×d}` and `b_a ∈ R^d`; estimate `θ_a = A_a^{-1
   understood regret bounds. Fits in SQLite blobs (d=50 → 2.5 KB per arm).
 - **Cons.** Linearity assumption; needs careful feature scaling. Sparse intents
   can destabilize `A_a^{-1}` early — ridge it.
-- **Verdict.** **Adopt as the v3 policy** once v2 shows gains. This is where
-  real sample efficiency kicks in.
+- **Verdict.** **Adopt later in Phase 3** once flat Thompson shows gains.
+  This is where real sample efficiency kicks in.
 
 #### Neural contextual bandit
 
@@ -337,21 +337,23 @@ This is the glue that makes the offline replay harness (§5) trustworthy.
 - Store per-call `selection_prob[chosen_arm]` from the policy (ε-greedy and
   Thompson both yield this).
 - At eval time, weight each logged reward by `π'(a|x) / π(a|x)`.
-- **Verdict.** **Adopt alongside v1.** It's a schema detail (one extra REAL
-  column) but unlocks honest offline comparison.
+- **Verdict.** **Adopt alongside Phase 1.** It's a schema detail (one extra
+  REAL column, `selection_prob`) but unlocks honest offline comparison.
 
 ### 4.7 Recommendation
 
-Sequence:
+Policy progression, anchored to roadmap phases (§10):
 
-1. **v1: ε-greedy, non-contextual, intent-stratified.** Ship. Validate signal.
-2. **v2: Thompson sampling.** Swap policy, same schema.
-3. **v3: Linear Thompson / LinUCB with a 50-dim context.** Introduce features.
-4. **v4 (optional): LambdaMART reranker** trained on accumulated logs, slotted
-   in as one more arm so the bandit decides when to use it.
-5. **v5 (optional): DPO on pairwise counterfactuals.**
+| Phase | Policy | Rationale |
+|-------|--------|-----------|
+| Phase 0 | *none* (logging only) | Collect data, validate reward signal |
+| Phase 1 | ε-greedy, non-contextual, intent-stratified | One knob, fully debuggable |
+| Phase 2 | (unchanged) — add guard rails + offline replay | Make the loop honest before scaling it |
+| Phase 3 | Thompson sampling → Linear Thompson | Sample efficiency; contextual features |
+| Phase 4a *(optional)* | LambdaMART reranker as a new arm | Train the scorer itself, let bandit choose |
+| Phase 4b *(optional)* | DPO on pairwise counterfactuals | Learn from logged `A ≻ B` pairs |
 
-Full RL is not on the path.
+Full RL (PPO, Q-learning over ranked lists) is **not on the path** — see §4.3.
 
 ## 5. Offline loop
 
@@ -496,9 +498,14 @@ New MCP tool `get_learning_report` (optional) returns the same structured.
 
 ## 10. Roadmap
 
-Milestones are coarse phases; each breaks into the small PRs listed under
-"PR breakdown". Every phase must ship behind a config flag and leave the
-default user experience unchanged until it's proven.
+**Terminology.** *Phase N* is a roadmap milestone — a block of work with one
+exit criterion. It breaks into *PR N.M* units listed under "PR breakdown".
+Policies (ε-greedy, Thompson, Linear Thompson, …) are referred to by name,
+never as "v1/v2/..."; each phase's policy column in §4.7 shows which policy
+ships where.
+
+Every phase must ship behind a config flag and leave the default user
+experience unchanged until it's proven.
 
 ### Phase 0 — Foundation (1–2 weeks)
 
@@ -671,5 +678,5 @@ mini-RFC before PRs.
 - *Precision penalty for unused capsule entries.* Adopted with small default
   `λ = 0.1`, tunable in config. Goal: nudge toward tighter capsules without
   dominating the reward signal until we have data to tune it.
-- *Window length.* 600s fixed for v1. Not adaptive yet — revisit if coverage
-  metrics suggest users have systematically shorter/longer sessions.
+- *Window length.* 600s fixed for Phase 0. Not adaptive yet — revisit if
+  coverage metrics suggest users have systematically shorter/longer sessions.
