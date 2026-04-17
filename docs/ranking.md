@@ -74,12 +74,20 @@ utility function called by 200 places would flood the pool with noise).
 - For each extracted name, looks up matching symbols in two stages:
   1. **Exact name** in SQLite (`symbols_by_exact_name`) — strongest signal, score 1.0.
   2. **Name-field BM25** via Tantivy (`search_name`) — fallback **only when
-     exact returned zero hits**. This gate (v1.2.a) keeps common symbol names
-     like `where` from dragging fuzzy decoys (`where_method`, `test_where`)
-     into the anchor pool and diluting the target's RRF contribution.
-     Tantivy's default tokenizer splits on `_`, so `needs_extensions` matches
-     `verify_needs_extensions` naturally. Scored slightly lower (0.9) so exact
-     matches rank above tokenised matches.
+     exact returned zero hits AND the fallback itself is precise**. The
+     exact-hit gate (v1.2.a) keeps common symbol names like `where` from
+     dragging fuzzy decoys (`where_method`, `test_where`) into the anchor
+     pool when exact already resolved the target. The precision gate (v1.3)
+     probes up to `ANCHOR_FUZZY_PROBE = 20` name-BM25 hits per lookup and
+     drops the anchor entirely when the result exceeds
+     `ANCHOR_FUZZY_CUTOFF = 3`. Without this cap, a common identifier like
+     `update_datalim` (dozens of fuzzy matches across matplotlib's Axes
+     subclasses) gets all its decoys boosted by `ANCHOR_RRF_K`, amplifying
+     ranker bias toward public-API symbols and pushing the real target out
+     of the top pivots (matplotlib-26208 regression). Tantivy's default
+     tokenizer splits on `_`, so `needs_extensions` matches
+     `verify_needs_extensions` naturally. Scored slightly lower (0.9) so
+     exact matches rank above tokenised matches.
 - **Module-vs-method preference for dotted calls** (v1.2.c): when a name came
   from a dotted call (`xr.where(...)` inside a code block, or inline prose
   mentions of `xr.where`), the resolver fetches 2× rows and re-sorts by fqn
@@ -351,6 +359,8 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | Semantic retrieval candidates | 25 | `ranking.rs:ANN_CANDIDATES` |
 | Explicit anchor candidates | 20 | `ranking.rs:ANCHOR_CANDIDATES` |
 | Anchor rows per distinct name | 5 | `ranking.rs:ANCHOR_ROWS_PER_NAME` |
+| Anchor fuzzy-fallback probe depth | 20 | `ranking.rs:ANCHOR_FUZZY_PROBE` |
+| Anchor fuzzy-fallback cutoff | 3 | `ranking.rs:ANCHOR_FUZZY_CUTOFF` |
 | RRF k (BM25 / graph / ANN) | 60 | `ranking.rs:RRF_K` |
 | RRF k (explicit anchors) | 15 | `ranking.rs:ANCHOR_RRF_K` |
 | Structural injection cap | `max_pivots * 2` = 16 | `engine.rs:inject_structural_candidates` |

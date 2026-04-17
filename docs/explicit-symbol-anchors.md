@@ -1,6 +1,6 @@
 # Design: Explicit Symbol-Name Anchors in the Ranking Pipeline
 
-> **Status**: v1 + v1.1 implemented. **v1.2 pending** (see section below).
+> **Status**: v1 + v1.1 + v1.2 implemented. **v1.3 pending** (see "v1.3 pending improvement" section for the matplotlib-26208 regression fix).
 > **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`
 > **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`
 > **Motivation**: SWE-bench #29c revealed that capsule ranking misses the target
@@ -11,7 +11,7 @@
 
 ---
 
-## 🚨 READ THIS FIRST — v1.2 pending improvements
+## 🚨 READ THIS FIRST — v1.3 is the active work; v1.2 is done (see below for v1.2 history)
 
 **Status of prior rounds:**
 - **v1** (exact-name anchor lookup) — landed in `anchors.rs` + `anchor_candidates`.
@@ -228,6 +228,140 @@ done
 ```
 
 Success = all three targets in top 3 pivots.
+
+---
+
+## 🚨 READ THIS — v1.3 pending improvement (found during v1.2 validation)
+
+v1.2 was validated against **six** SWE-bench tasks in the with-arm: the three
+regression cases (sphinx-9711, xarray-7229, sympy-21612) plus three of the
+largest-token-overshoot tasks from 29c (sympy-19040, sympy-21379, matplotlib-26208).
+
+**Five of six improved or held steady. One regressed: `matplotlib-26208`.**
+
+### The matplotlib-26208 regression (evidence)
+
+| | v1.0 (BM25+graph only, no embeddings) | v1.2 (BM25+graph+embeddings+anchors) |
+|---|---:|---:|
+| Walltime | 364s | **479s (+32%)** |
+| Output tokens | 23,038 | 29,235 (+27%) |
+| Cost | $1.37 | **$1.68 (+22%)** |
+| Tool calls | (not captured) | 62 (many Grep+Read after capsule) |
+
+**Agent's v1.2 task string** (identifier-preserving, per the prompt update):
+```
+"fix dataLims get replaced by inf for charts with twinx if ax1 is a stackplot,
+ stackplot update_datalim"
+```
+
+Anchor extraction pulled `dataLims` (CamelCase) and `update_datalim` (snake_case).
+Both passed the shape filter. But:
+
+- Top pivots were `parasite_axes.py::HostAxesBase::twinx`,
+  `pyplot.py::twinx`, `axis.py::Axis::_update_axisinfo`, `axis.py::Axis::get_tightbbox`...
+- **Target `lib/matplotlib/axes/_base.py::_AxesBase::update_datalim` was NOT in top 8**.
+- Agent chased the high-ranked pivots, found none were the bug, then did
+  extensive Grep/Read to locate the real fix site in `_base.py`.
+
+### Why v1.2 made this worse, not better
+
+The anchor `update_datalim` triggered BM25-name fallback (since exact-name
+probably had multiple hits across matplotlib's many Axes subclasses). **That
+fallback returned many fuzzy matches**. With the aggressive `ANCHOR_RRF_K=15`
+boost applied uniformly, each of those decoys ranked high in the fused list.
+The real target `_AxesBase::update_datalim` was one of several hits but got
+outweighed by the collective of similarly-named methods.
+
+In v1.0 (pure BM25+graph), pure accidental scoring happened to land `_base.py`
+higher for the original, shorter task string. The richer v1.2 pipeline
+steered the agent toward public-facing symbols (`twinx`, `stackplot`) that
+match the symptom but not the bug site.
+
+This generalises a pattern noted in the v1 motivation section:
+> Ranker appears biased toward public symbols / top-level APIs.
+v1.2's anchor boost **amplifies** that bias when the user's task mentions
+public APIs (symptoms) rather than the internal function that holds the bug.
+
+### v1.3 fix: adaptive anchor boost based on hit precision
+
+Currently every anchor hit gets `ANCHOR_RRF_K=15` regardless of how many
+matches it resolved. Proposed change: **dial down the boost as the number
+of matches grows**. High precision (1–3 hits) keeps the aggressive boost;
+low precision (10+ hits) falls back to baseline `RRF_K=60`.
+
+```rust
+// In engine.rs, compute per-lookup boost at anchor_candidates time.
+// Each anchor hit carries its own effective-k, and rrf_merge_ks uses the
+// per-hit k rather than one constant for the whole list.
+
+fn effective_anchor_k(n_hits: usize) -> f32 {
+    match n_hits {
+        1 => 15.0,       // precise — maximum boost
+        2..=3 => 20.0,   // mostly precise
+        4..=8 => 35.0,   // getting fuzzy — half-boost
+        _ => 60.0,       // bulk match — no extra boost beyond baseline
+    }
+}
+```
+
+This would neutralise the matplotlib regression: `update_datalim` with many
+matches gets `k=60` (same as BM25), so its RRF contribution matches BM25's
+— the real target isn't pushed around. Precise anchors like `parse_latex`
+(2 exact hits in sympy-21612) still get `k=20` and remain dominant.
+
+### Implementation sketch
+
+Option A — per-hit k (cleanest, small):
+```rust
+// Anchors enriched with a per-hit k. anchor_candidates returns
+// Vec<(symbol_id, score, k)> instead of Vec<(symbol_id, score)>.
+// Threads through rrf_merge_ks.
+
+pub fn anchor_candidates(&self, query: &str, limit: usize) -> Vec<(u64, f32, f32)> {
+    let anchors = crate::anchors::extract(query);
+    let mut per_lookup_hits: HashMap<String, Vec<u64>> = HashMap::new();
+    // ... same exact-then-BM25-fallback loop, but collect hits keyed by lookup token ...
+    let mut out = Vec::new();
+    for (lookup, ids) in per_lookup_hits {
+        let k = effective_anchor_k(ids.len());
+        for id in ids { out.push((id, 1.0, k)); }
+    }
+    out
+}
+```
+
+Option B — precision cutoff only (simpler, coarser):
+```rust
+// Drop anchor entirely if BM25-name fallback exceeds a threshold.
+// Keeps current single-k rrf path but trades off recall for precision.
+if !had_exact_hits {
+    let hits = search.search_name(lookup, 20)?;
+    if hits.len() <= 3 {
+        // Precise — inject into anchor pool
+        for (id, _) in hits { out.push((id, 0.9)); }
+    } else {
+        // Too fuzzy — skip the fallback entirely.
+        // Keeps RRF fusion between BM25/ANN/graph clean.
+        tracing::debug!("anchor {} fuzzy-skipped ({} bm25-name hits)", lookup, hits.len());
+    }
+}
+```
+
+Recommend Option B for v1.3 (three lines, no signature change). Revisit
+Option A if the precision cutoff is too blunt.
+
+### Validation
+
+Re-run the 6-task with-arm validation after v1.3 lands. Target outcome:
+
+| Task | v1.2 walltime | v1.3 target |
+|---|---:|---|
+| sphinx-9711 | 25.3s | ≤ v1.2 (anchor still precise, 1 fallback hit) |
+| xarray-7229 | 327s | ≤ v1.2 (anchor precise, 2 exact + few fuzzy) |
+| sympy-21612 | TBD | ≤ v1.2 (anchor precise, exact-only) |
+| sympy-19040 | TBD | — |
+| sympy-21379 | TBD | — |
+| **matplotlib-26208** | **479s** | **≤ 364s (v1.0 baseline)** ← fix target |
 
 ---
 

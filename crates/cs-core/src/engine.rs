@@ -18,9 +18,9 @@ use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    resolve_adjacents, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_ROWS_PER_NAME,
-    ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K,
-    STUB_SCORE_WEIGHT,
+    resolve_adjacents, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_FUZZY_CUTOFF,
+    ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
+    MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2094,21 +2094,38 @@ impl CoreEngine {
                 }
             }
 
-            // (2) Name-field BM25 fallback — only when exact returned nothing.
-            // Unconditional fallback leaks fuzzy decoys (e.g. `where_method`,
-            // `test_where`) into the anchor pool when the user named a real
-            // symbol exactly, diluting the target's RRF contribution.
+            // (2) Name-field BM25 fallback — only when exact returned nothing,
+            // AND only when the fallback is itself precise. Unconditional
+            // fallback leaks fuzzy decoys into the anchor pool; unbounded
+            // fallback leaks *many* decoys that then get the aggressive
+            // `ANCHOR_RRF_K` boost applied uniformly, amplifying ranker bias
+            // toward public-API symbols (see matplotlib-26208 regression).
+            //
+            // Probe up to `ANCHOR_FUZZY_PROBE` hits. If the result is
+            // compact (≤ `ANCHOR_FUZZY_CUTOFF`), treat as precise and inject.
+            // If the result is bulky, drop the anchor entirely for this name
+            // — BM25/ANN/graph will still find the target via the normal
+            // pipeline without the anchor boost distorting ranks.
             if !had_exact_hits {
-                match search.search_name(lookup, ANCHOR_ROWS_PER_NAME) {
+                match search.search_name(lookup, ANCHOR_FUZZY_PROBE) {
                     Ok(hits) => {
-                        for (id, _) in hits {
-                            if seen.insert(id) {
-                                out.push((id, 0.9));
-                                resolved_bm25 += 1;
-                                if out.len() >= limit {
-                                    break 'outer;
+                        if hits.len() <= ANCHOR_FUZZY_CUTOFF {
+                            for (id, _) in hits {
+                                if seen.insert(id) {
+                                    out.push((id, 0.9));
+                                    resolved_bm25 += 1;
+                                    if out.len() >= limit {
+                                        break 'outer;
+                                    }
                                 }
                             }
+                        } else {
+                            tracing::debug!(
+                                "anchor {:?} fuzzy-skipped ({} bm25-name hits > cutoff {})",
+                                lookup,
+                                hits.len(),
+                                ANCHOR_FUZZY_CUTOFF
+                            );
                         }
                     }
                     Err(e) => {

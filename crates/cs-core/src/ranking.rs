@@ -25,6 +25,15 @@ pub(crate) const ANCHOR_CANDIDATES: usize = 20;
 /// Max rows to fetch per distinct anchor name (limits blast radius on common
 /// names like `where` or `get`).
 pub(crate) const ANCHOR_ROWS_PER_NAME: usize = 5;
+/// Hit-count threshold for the BM25-name fallback. If the name-field BM25
+/// query returns more than this many hits, the anchor is considered too
+/// fuzzy and is skipped entirely — the aggressive `ANCHOR_RRF_K` boost
+/// would otherwise amplify ranker bias toward public-API symbols (see the
+/// matplotlib-26208 regression documented in docs/explicit-symbol-anchors.md).
+pub(crate) const ANCHOR_FUZZY_CUTOFF: usize = 3;
+/// Probe depth for the BM25-name fallback. Fetch up to this many hits so we
+/// can measure fuzziness before deciding whether to inject any of them.
+pub(crate) const ANCHOR_FUZZY_PROBE: usize = 20;
 
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 
