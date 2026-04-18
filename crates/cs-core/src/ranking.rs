@@ -34,6 +34,11 @@ pub(crate) const ANCHOR_FUZZY_CUTOFF: usize = 3;
 /// Probe depth for the BM25-name fallback. Fetch up to this many hits so we
 /// can measure fuzziness before deciding whether to inject any of them.
 pub(crate) const ANCHOR_FUZZY_PROBE: usize = 20;
+/// v1.6 file-diversity pinning: max number of distinct anchor-named files
+/// pinned into the pivot set. Each pinned file contributes one pivot (the
+/// most-specific anchor hit in that file). Remaining pivot slots are filled
+/// from the BM25/ANN/graph RRF fusion. See docs/explicit-symbol-anchors.md.
+pub(crate) const ANCHOR_FILE_BUDGET: usize = 5;
 
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 

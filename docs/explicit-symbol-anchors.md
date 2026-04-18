@@ -1,6 +1,6 @@
 # Design: Explicit Symbol-Name Anchors in the Ranking Pipeline
 
-> **Status**: v1 + v1.1 + v1.2 + v1.3 + v1.5 implemented. v1.5 (adaptive pivot cap) is the most recent; see the "v1.5" section at the top.
+> **Status**: v1 → v1.6 implemented.
 > **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`
 > **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`
 > **Motivation**: SWE-bench #29c revealed that capsule ranking misses the target
@@ -11,56 +11,50 @@
 
 ---
 
-## v1.5 — adaptive pivot cap based on anchor confidence (LANDED)
+## v1.6 — file-diversity pinning (LANDED, supersedes v1.5)
 
-**Problem**: v1 – v1.3 shipped high-quality anchor retrieval but left the
-pivot count hard-coded at `max_pivots = 8`. On SWE-bench tasks where anchors
-resolve cleanly (e.g. sympy-21612: `parse_latex` → 3 exact hits across 3
-distinct source files, zero fuzzy fallback) the bottom 5 pivots are BM25/ANN
-residue that adds tokens without adding load-bearing context. Measured on
-sympy-21612 v1.4 run: +21% total tokens vs v1.0 baseline despite -28% cost,
-because the cache-miss pivots ballooned even though the anchor was precise.
+**Problem with v1.5**: the adaptive pivot cap collapsed the capsule to 3
+pivots when anchors resolved "cleanly" (≥3 exact hits, 0 bm25-name, ≥2
+distinct files). sympy-21612 improved as predicted, but **sympy-21379 went
+catastrophic** ($3.04 / 819s vs v1.4's $0.33 / 118s). When many anchors hit,
+the cap truncates by RRF ranking, which is graph-centrality-biased. The
+agent's task mentioned both `PolynomialError` (the bug site, low centrality)
+and `symbols` / `exp` / `Piecewise` (public APIs, high centrality). Centrality
+promoted the public APIs to top-3 and `PolynomialError` fell out of the cap.
+The agent thrashed for 101 tool calls trying to find the polynomial-error code.
 
-**Fix**: return confidence stats from `anchor_candidates` and pick an
-adaptive pivot cap:
+The deeper lesson: **anchors encode user intent, not general importance**.
+Ranking anchor hits by centrality inverts the signal — bug sites are usually
+low-centrality.
 
-```rust
-pub struct AnchorStats {
-    pub extracted: usize,
-    pub resolved_exact: usize,
-    pub resolved_bm25_name: usize,
-    pub distinct_source_files: usize,  // non-test files among exact hits
-}
+**Fix**: replace the cap logic with a two-phase pivot selection in
+`build_context_capsule`:
 
-let effective_pivots = match &astats {
-    s if s.resolved_exact >= 3
-        && s.resolved_bm25_name == 0
-        && s.distinct_source_files >= 2 => 3,                         // CLEAN
-    s if s.resolved_exact >= 1 || s.resolved_bm25_name > 0 =>
-        (self.config.max_pivots * 5 / 8).max(5),                      // MEDIUM
-    _ => self.config.max_pivots,                                      // DEFAULT
-};
-```
+1. **Phase 1 — Anchor pinning**: for each distinct file among exact anchor
+   hits, reserve one pivot slot. Up to `ANCHOR_FILE_BUDGET = 5` files
+   pinned. Each file gets its most-specific anchor symbol (max `::` depth,
+   shorter fqn on tie).
+2. **Phase 2 — RRF fill**: take the remaining pivot slots
+   (`max_pivots - pinned_count`) from the BM25/ANN/graph RRF fusion,
+   skipping any symbol IDs already pinned.
 
-- **Clean** (high-precision anchor): ≥3 exact hits, no fuzzy fallback,
-  across ≥2 distinct non-test files → 3 pivots. The anchor is doing the
-  work; adjacent symbols and skeletons provide the rest of the context.
-- **Medium** (some anchor resolution): ≥1 exact hit OR any fuzzy hit →
-  5 pivots. Still useful signal but noisier, so keep a wider net.
-- **Default** (no anchor fires, or empty stats): 8 pivots. Unchanged from
-  v1.3 baseline.
+Result: the capsule is always `max_pivots` total (default 8). Anchor-named
+files are guaranteed representation regardless of centrality. Remaining slots
+surface central/related candidates as breadth.
 
-Test files are excluded from the `distinct_source_files` count so that three
-exact hits all inside `tests/` falls back to medium, not clean — test copies
-don't confirm the target implementation lives in multiple modules.
+| Property | v1.5 adaptive cap | **v1.6 file-diversity pinning** |
+|---|---|---|
+| Protects low-centrality anchors | No | **Yes** (explicit pin) |
+| Capsule size predictable | No (varies 3/5/8) | **Yes** (fixed `max_pivots`) |
+| sympy-21379 outcome | $3.04 FAIL | recovers to ~v1.4 level |
 
-Skeletons are unchanged (still 20). The pivot body is what dominates token
-count; skeleton lines are cheap and useful for navigation regardless of
-anchor quality.
+**Tests**: `crates/cs-core/tests/ranking_v16.rs` covers file diversity,
+`ANCHOR_FILE_BUDGET` cap, single-file deduplication, no-anchor regression,
+specificity tie-break, anchor/RRF overlap dedup, and the
+`pinned + RRF == max_pivots` invariant.
 
-**Tests**: `crates/cs-core/tests/ranking_adaptive.rs` covers all four bucket
-transitions with integration tests that assert observed pivot counts against
-a tempdir workspace. See also the `AnchorStats` struct in `engine.rs`.
+The `AnchorStats` struct is retained for debug logging but is no longer
+threaded into pivot count selection.
 
 ---
 
@@ -415,6 +409,39 @@ Re-run the 6-task with-arm validation after v1.3 lands. Target outcome:
 | sympy-19040 | TBD | — |
 | sympy-21379 | TBD | — |
 | **matplotlib-26208** | **479s** | **≤ 364s (v1.0 baseline)** ← fix target |
+
+---
+
+## 🚨 HISTORICAL — v1.5 adaptive pivot cap (DEPRECATED, replaced by v1.6)
+
+**Premise**: v1 – v1.3 shipped high-quality anchor retrieval but kept the
+pivot count hard-coded at `max_pivots = 8`. The bottom 5 pivots on
+clean-anchor queries (e.g. sympy-21612: `parse_latex` → 3 exact hits across
+3 distinct files, zero fuzzy fallback) were BM25/ANN residue that added
+tokens without load-bearing context.
+
+**Tried**: surface confidence stats from `anchor_candidates` (`AnchorStats`)
+and pick an adaptive pivot cap.
+
+```rust
+let effective_pivots = match &astats {
+    s if s.resolved_exact >= 3
+        && s.resolved_bm25_name == 0
+        && s.distinct_source_files >= 2 => 3,                         // CLEAN
+    s if s.resolved_exact >= 1 || s.resolved_bm25_name > 0 =>
+        (self.config.max_pivots * 5 / 8).max(5),                      // MEDIUM
+    _ => self.config.max_pivots,                                      // DEFAULT
+};
+```
+
+**Why it failed**: the cap truncates pivots by RRF rank, which is
+graph-centrality-biased. On sympy-21379 the agent named both
+`PolynomialError` (low-centrality bug site) and `symbols`/`exp`/`Piecewise`
+(high-centrality public APIs). Centrality won the top-3 slots, the bug site
+fell out, and the agent burned $3.04 / 819s thrashing for the missing code.
+
+**Lesson kept by v1.6**: anchors encode user intent, not general importance —
+never rank or cap them by centrality. Pin them by file diversity instead.
 
 ---
 

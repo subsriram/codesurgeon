@@ -18,9 +18,9 @@ use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    resolve_adjacents, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_FUZZY_CUTOFF,
-    ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
-    MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
+    resolve_adjacents, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET,
+    ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST,
+    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2314,27 +2314,7 @@ impl CoreEngine {
         // when the query has no extractable identifiers, in which case the
         // RRF blend is unchanged.
         let (anchor_results, astats) = self.anchor_candidates(query, ANCHOR_CANDIDATES);
-
-        // Adaptive pivot cap: when anchors resolve cleanly we can shrink the
-        // capsule without losing load-bearing symbols. See
-        // `docs/explicit-symbol-anchors.md` "v1.5" section.
-        let effective_pivots = match &astats {
-            s if s.resolved_exact >= 3
-                && s.resolved_bm25_name == 0
-                && s.distinct_source_files >= 2 =>
-            {
-                3
-            }
-            s if s.resolved_exact >= 1 || s.resolved_bm25_name > 0 => {
-                (self.config.max_pivots * 5 / 8).max(5)
-            }
-            _ => self.config.max_pivots,
-        };
-        tracing::debug!(
-            "adaptive pivots: {} (stats: {:?})",
-            effective_pivots,
-            astats
-        );
+        tracing::debug!("anchor stats: {:?}", astats);
 
         // ANN semantic retrieval + RRF fusion across all four sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
@@ -2361,7 +2341,7 @@ impl CoreEngine {
 
         // 2. Inject high-centrality types for Structural queries (BM25 can't surface them)
         if *intent == SearchIntent::Structural {
-            inject_structural_candidates(&graph, &mut search_results, effective_pivots);
+            inject_structural_candidates(&graph, &mut search_results, self.config.max_pivots);
         }
 
         // 3. Re-rank by query proximity + centrality + optional semantic similarity
@@ -2426,16 +2406,79 @@ impl CoreEngine {
                 true
             });
         }
-        let max_pivots = max_results.unwrap_or(effective_pivots);
+        let max_pivots = max_results.unwrap_or(self.config.max_pivots);
 
-        // 6. Select pivots and adjacents
-        // Stubs are excluded from pivots — they are skeleton-only references.
-        let pivot_ids: Vec<u64> = scored
+        // 6. Select pivots — v1.6 file-diversity pinning.
+        //
+        // Phase 1: pin one pivot per distinct file among exact anchor hits
+        // (up to ANCHOR_FILE_BUDGET). Each file's slot goes to its
+        // most-specific anchor symbol (max "::" depth, shorter fqn on tie).
+        // This guarantees that anchor-named files get capsule representation
+        // regardless of centrality ranking — bug-site symbols are usually
+        // low-centrality and were getting cut by v1.5's RRF-based cap.
+        //
+        // Phase 2: fill remaining slots from the centrality-ranked RRF fusion,
+        // skipping anything already pinned. See docs/explicit-symbol-anchors.md.
+        let mut anchor_by_file: HashMap<String, Vec<u64>> = HashMap::new();
+        for (id, _) in &anchor_results {
+            if let Some(sym) = graph.get_symbol(*id) {
+                if sym.is_stub {
+                    continue;
+                }
+                anchor_by_file
+                    .entry(sym.file_path.clone())
+                    .or_default()
+                    .push(*id);
+            }
+        }
+
+        let mut pinned: Vec<u64> = Vec::new();
+        let mut pinned_files_in_order: Vec<String> = Vec::new();
+        for (id, _) in &anchor_results {
+            if pinned.len() >= ANCHOR_FILE_BUDGET.min(max_pivots) {
+                break;
+            }
+            let Some(sym) = graph.get_symbol(*id) else {
+                continue;
+            };
+            if sym.is_stub {
+                continue;
+            }
+            if pinned_files_in_order.contains(&sym.file_path) {
+                continue;
+            }
+            let mut candidates = anchor_by_file[&sym.file_path].clone();
+            candidates.sort_by_key(|cid| {
+                let s = graph.get_symbol(*cid);
+                let depth = s.map(|s| s.fqn.matches("::").count()).unwrap_or(0);
+                let fqn_len = s.map(|s| s.fqn.len()).unwrap_or(usize::MAX);
+                (std::cmp::Reverse(depth), fqn_len)
+            });
+            if let Some(&best) = candidates.first() {
+                pinned.push(best);
+                pinned_files_in_order.push(sym.file_path.clone());
+            }
+        }
+
+        let pinned_set: HashSet<u64> = pinned.iter().copied().collect();
+        let pivot_slots = max_pivots.saturating_sub(pinned.len());
+        let rrf_fill: Vec<u64> = scored
             .iter()
+            .filter(|(id, _)| !pinned_set.contains(id))
             .filter(|(id, _)| !graph.get_symbol(*id).map(|s| s.is_stub).unwrap_or(false))
-            .take(max_pivots)
+            .take(pivot_slots)
             .map(|(id, _)| *id)
             .collect();
+
+        tracing::debug!(
+            "v1.6 pivots: {} anchor-pinned ({} files), {} RRF fill, {} total",
+            pinned.len(),
+            pinned_files_in_order.len(),
+            rrf_fill.len(),
+            pinned.len() + rrf_fill.len()
+        );
+
+        let pivot_ids: Vec<u64> = pinned.into_iter().chain(rrf_fill).collect();
         let adjacent_ids = select_adjacents(&graph, &pivot_ids, intent, self.config.max_adjacent);
 
         // 7. Resolve IDs → Symbols with filtering
