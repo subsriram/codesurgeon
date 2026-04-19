@@ -8,6 +8,7 @@
 
 use crate::language::Language;
 use crate::symbol::{Edge, EdgeKind, Symbol, SymbolKind};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 // ── Shell call-graph edges ────────────────────────────────────────────────────
@@ -276,8 +277,16 @@ pub fn extract_call_edges(symbols: &[Symbol]) -> Vec<Edge> {
         if !sym.kind.is_callable() || sym.body.len() < 20 {
             continue;
         }
+        // Strip Python docstrings/triple-quoted strings so identifiers inside
+        // `>>> ...` doctest examples (and other string literals) don't become
+        // spurious call edges. See docs/doctest-edge-contamination.md.
+        let body_text: Cow<'_, str> = if sym.language == Language::Python {
+            strip_python_triple_strings(&sym.body)
+        } else {
+            Cow::Borrowed(sym.body.as_str())
+        };
         let mut seen: HashMap<u64, String> = HashMap::new();
-        for (callee_name, args_snippet) in calls_in_body(&sym.body) {
+        for (callee_name, args_snippet) in calls_in_body(&body_text) {
             if let Some(targets) = name_to_ids.get(callee_name.as_str()) {
                 for &target_id in targets {
                     if target_id != sym.id {
@@ -403,6 +412,56 @@ fn extract_imported_names(sym: &Symbol) -> Vec<String> {
             vec![]
         }
         _ => vec![],
+    }
+}
+
+/// Remove Python triple-quoted string literals (`"""..."""` / `'''...'''`)
+/// from a function body before call-edge scanning.
+///
+/// Python docstrings live as the first statement inside the function body, so
+/// they get walked by the call-site scanner. When a docstring contains a
+/// doctest example (`>>> expr.evalf(...)`), each identifier in that block
+/// becomes a spurious "call" edge — and when the name resolves to dozens of
+/// unrelated symbols (`evalf`, `dict`, `sqrt`), the graph fans out to all of
+/// them. See docs/doctest-edge-contamination.md and issue #62.
+///
+/// The scanner tracks triple-quote state only. It does not try to recognise
+/// strings-inside-strings or escape sequences — in the rare case a regular
+/// string contains an unescaped `"""`, tree-sitter would already have
+/// rejected the file, so we don't reach that code path.
+fn strip_python_triple_strings(body: &str) -> Cow<'_, str> {
+    if !body.contains("\"\"\"") && !body.contains("'''") {
+        return Cow::Borrowed(body);
+    }
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    let mut out = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        let is_triple =
+            (b == b'"' || b == b'\'') && i + 2 < len && bytes[i + 1] == b && bytes[i + 2] == b;
+        if is_triple {
+            // Skip past opening delimiter, then scan for matching close.
+            i += 3;
+            while i + 2 < len && !(bytes[i] == b && bytes[i + 1] == b && bytes[i + 2] == b) {
+                i += 1;
+            }
+            if i + 2 < len {
+                i += 3;
+            } else {
+                i = len;
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    // Stripping only removes whole byte ranges bounded by ASCII delimiters;
+    // everything that survives was already valid UTF-8 in the source.
+    match String::from_utf8(out) {
+        Ok(s) => Cow::Owned(s),
+        Err(_) => Cow::Borrowed(body),
     }
 }
 
