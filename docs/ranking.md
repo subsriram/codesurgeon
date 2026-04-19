@@ -12,10 +12,11 @@ Ranking runs in five stages every time `run_pipeline` or `get_context_capsule` i
 
 ```
 Stage 1: Candidate Retrieval
-  ├── BM25 (Tantivy)          top-50 lexical matches
+  ├── BM25 (Tantivy)           top-50 lexical matches
   ├── Graph neighbor expansion top-25 1-hop neighbors of BM25 seeds, by centrality
-  └── Semantic (flat scan)    top-25 semantic nearest neighbors  [embeddings build only]
-       └── RRF merge ──────── fused candidate pool
+  ├── Explicit anchors         up to 20 exact symbol-name matches from the query
+  └── Semantic (flat scan)     top-25 semantic nearest neighbors  [embeddings build only]
+       └── RRF merge ────────  fused candidate pool
 
 Stage 2: Structural injection   high-centrality hub types  [Structural intent only]
 
@@ -64,7 +65,68 @@ own name. These candidates would otherwise only surface as adjacents, never as p
 **Why 1 hop?** 2-hop expansion explodes combinatorially on dense call graphs (a single
 utility function called by 200 places would flood the pool with noise).
 
-### 1c. Semantic retrieval (`engine.rs:ann_candidates`) — embeddings build only
+### 1c. Explicit anchors (`engine.rs:anchor_candidates`, `anchors.rs`)
+
+- Extracts identifier-shaped tokens from the query using three sources:
+  1. **Code-block API calls** — `xr.where(...)`, `parse_latex(...)` inside fenced code blocks
+  2. **Import statements** — `from sympy.parsing.latex import parse_latex`
+  3. **Prose identifiers** — snake_case or CamelCase tokens in the problem statement (stop-list filtered)
+- For each extracted name, looks up matching symbols in two stages:
+  1. **Exact name** in SQLite (`symbols_by_exact_name`) — strongest signal, score 1.0.
+  2. **Name-field BM25** via Tantivy (`search_name`) — fallback **only when
+     exact returned zero hits AND the fallback itself is precise**. The
+     exact-hit gate (v1.2.a) keeps common symbol names like `where` from
+     dragging fuzzy decoys (`where_method`, `test_where`) into the anchor
+     pool when exact already resolved the target. The precision gate (v1.3)
+     probes up to `ANCHOR_FUZZY_PROBE = 20` name-BM25 hits per lookup and
+     drops the anchor entirely when the result exceeds
+     `ANCHOR_FUZZY_CUTOFF = 3`. Without this cap, a common identifier like
+     `update_datalim` (dozens of fuzzy matches across matplotlib's Axes
+     subclasses) gets all its decoys boosted by `ANCHOR_RRF_K`, amplifying
+     ranker bias toward public-API symbols and pushing the real target out
+     of the top pivots (matplotlib-26208 regression). Tantivy's default
+     tokenizer splits on `_`, so `needs_extensions` matches
+     `verify_needs_extensions` naturally. Scored slightly lower (0.9) so
+     exact matches rank above tokenised matches.
+- **Module-vs-method preference for dotted calls** (v1.2.c): when a name came
+  from a dotted call (`xr.where(...)` inside a code block, or inline prose
+  mentions of `xr.where`), the resolver fetches 2× rows and re-sorts by fqn
+  depth (`::` count ascending) before truncating. Module-level functions
+  (`core/computation.py::where`, 1 `::`) rank above class methods
+  (`core/common.py::DataWithCoords::where`, 2 `::`).
+- Dotted calls (`xr.where`) use their last segment (`where`) as the DB/BM25
+  lookup key. Dotted-call extraction runs both inside fenced code blocks
+  (`call_re`) and in inline prose (`dotted_prose_re`, v1.2.b).
+- Up to `ANCHOR_ROWS_PER_NAME = 5` hits per name per stage; the merged list is
+  capped at `ANCHOR_CANDIDATES = 20`.
+- Order reflects extraction priority (code blocks first, then prose) and, within
+  each name, exact matches before name-BM25 matches.
+
+**Why anchors fuse into RRF with a smaller `k` (v1.2.d):**
+the global `RRF_K = 60` gives a rank-1 hit a weight of `1/61 ≈ 0.016`, identical
+for all sources. If BM25 and ANN both wrong-answer the query (as in sphinx-9711
+where `bump_version.py::bump_version` wins both), their combined weight
+(~0.032) beats a lone anchor hit (~0.016) and the real target gets pushed out
+of the top 5. With `ANCHOR_RRF_K = 15`, a rank-1 anchor hit contributes
+`1/16 ≈ 0.063` — ~4× stronger — enough to overcome the wrong-answer combo.
+Safe to boost because anchor extraction is precision-first (stop-word filter +
+exact-match gate) and the anchor pool is capped at 20.
+
+**Why precision, not recall:** BM25 already handles fuzzy retrieval. Anchors exist to
+short-circuit the "task literally names the target function" case where BM25 tokenises
+the symbol name (`needs_extensions` → `needs` + `extensions`) and scores each subword
+independently. If a token doesn't match a symbol name exactly, the anchor source drops
+it — the other retrievers pick up fuzzy matches.
+
+**Why this beats higher BM25 scoring on symbol name:** boosting name matches in Tantivy
+would help prose-mentioned names but not code-snippet API calls (`xr.where(...)` tokenises
+to `xr`, `where`). The anchor source treats code blocks structurally — the identifier before
+`(` is a call target, regardless of surrounding BM25-relevant noise.
+
+**When this is empty:** queries with no extractable identifiers (pure prose bug reports)
+produce zero anchors, and the RRF blend degrades gracefully to its prior behaviour.
+
+### 1d. Semantic retrieval (`engine.rs:ann_candidates`) — embeddings build only
 
 - Embeds the query using NomicEmbedTextV15Q (768-dim, L2-normalised)
 - Runs a parallel flat cosine scan over the in-memory embedding cache (rayon)
@@ -86,7 +148,7 @@ only re-ranked the BM25 pool (Stage 4). Symbols with high semantic similarity bu
 lexical overlap with the query — the hardest cases — never made it into the pool.
 Semantic retrieval surfaces these symbols before any reranking occurs.
 
-### 1d. RRF merge (`engine.rs:rrf_merge`)
+### 1e. RRF merge (`engine.rs:rrf_merge`)
 
 ```
 RRF(candidate) = Σ  1 / (60 + rank_i + 1)
@@ -94,9 +156,11 @@ RRF(candidate) = Σ  1 / (60 + rank_i + 1)
 ```
 
 One term per retriever list `i` in which the candidate appears.
-`k = 60` is the standard default from the original RRF paper (Cormack et al. 2009).
-Candidates present in all three lists (strong lexical + graph + semantic signal) receive
-the highest fused scores.
+`k = 60` is the standard default from the original RRF paper (Cormack et al. 2009)
+and applies to BM25, graph, and ANN. The anchor list uses `k = 15` via
+`rrf_merge_ks` so precision-first anchor hits outweigh fuzzy rank-1 hits from
+the other sources. Candidates present in all four lists (strong lexical + graph
++ semantic + anchor signal) receive the highest fused scores.
 
 ---
 
@@ -290,10 +354,15 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 
 | Parameter | Value | Location |
 |-----------|-------|----------|
-| BM25 pool size | 50 | `engine.rs:BM25_POOL_SIZE` |
-| Graph neighbor candidates | 25 | `engine.rs:GRAPH_CANDIDATES` |
-| Semantic retrieval candidates | 25 | `engine.rs:ANN_CANDIDATES` |
-| RRF k constant | 60 | `engine.rs:RRF_K` |
+| BM25 pool size | 50 | `ranking.rs:BM25_POOL_SIZE` |
+| Graph neighbor candidates | 25 | `ranking.rs:GRAPH_CANDIDATES` |
+| Semantic retrieval candidates | 25 | `ranking.rs:ANN_CANDIDATES` |
+| Explicit anchor candidates | 20 | `ranking.rs:ANCHOR_CANDIDATES` |
+| Anchor rows per distinct name | 5 | `ranking.rs:ANCHOR_ROWS_PER_NAME` |
+| Anchor fuzzy-fallback probe depth | 20 | `ranking.rs:ANCHOR_FUZZY_PROBE` |
+| Anchor fuzzy-fallback cutoff | 3 | `ranking.rs:ANCHOR_FUZZY_CUTOFF` |
+| RRF k (BM25 / graph / ANN) | 60 | `ranking.rs:RRF_K` |
+| RRF k (explicit anchors) | 15 | `ranking.rs:ANCHOR_RRF_K` |
 | Structural injection cap | `max_pivots * 2` = 16 | `engine.rs:inject_structural_candidates` |
 | Injected candidate score | `family_in_degree * 5.0` | `engine.rs:inject_structural_candidates` |
 | Centrality boost multiplier | 3.0 | `engine.rs:apply_centrality_and_semantics` |

@@ -18,8 +18,9 @@ use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    resolve_adjacents, rrf_merge, select_adjacents, CENTRALITY_BOOST, GRAPH_CANDIDATES,
-    MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
+    resolve_adjacents, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET,
+    ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST,
+    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -272,6 +273,20 @@ pub struct FlowResult {
 }
 
 // ── ANN index ─────────────────────────────────────────────────────────────────
+
+/// Summary of how cleanly the anchor extractor resolved identifiers from the
+/// query. Used by `build_context_capsule` to pick an adaptive pivot cap — a
+/// high-confidence resolution (multiple exact hits across multiple source
+/// files, zero fuzzy fallback) means the capsule can be much smaller without
+/// losing the load-bearing symbols.
+#[derive(Debug, Default, Clone)]
+pub struct AnchorStats {
+    pub extracted: usize,
+    pub resolved_exact: usize,
+    pub resolved_bm25_name: usize,
+    /// Distinct non-test file paths among the exact-name anchor hits.
+    pub distinct_source_files: usize,
+}
 
 // ── CoreEngine ────────────────────────────────────────────────────────────────
 
@@ -926,10 +941,9 @@ impl CoreEngine {
                 let db = self.db.lock();
                 db.begin_transaction()?;
                 let mut failed_chunks = 0u32;
-                let total_chunks = (all_symbols.len() + 63) / 64;
+                let total_chunks = all_symbols.len().div_ceil(64);
                 for chunk_syms in all_symbols.chunks(64) {
-                    let chunk_texts: Vec<String> =
-                        chunk_syms.iter().map(|s| skeleton_text(s)).collect();
+                    let chunk_texts: Vec<String> = chunk_syms.iter().map(skeleton_text).collect();
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
                     match emb.embed_batch(&refs) {
                         Ok(vecs) => {
@@ -1300,7 +1314,7 @@ impl CoreEngine {
             *intent_counts.entry(row.intent.as_str()).or_insert(0) += 1;
         }
         let mut intent_vec: Vec<(&str, usize)> = intent_counts.into_iter().collect();
-        intent_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        intent_vec.sort_by_key(|x| std::cmp::Reverse(x.1));
         let intent_line = intent_vec
             .iter()
             .map(|(k, v)| format!("{} {:.0}%", k, *v as f64 / total_queries as f64 * 100.0))
@@ -1320,7 +1334,7 @@ impl CoreEngine {
         }
         let lang_total: usize = lang_counts.values().sum();
         let mut lang_vec: Vec<(String, usize)> = lang_counts.into_iter().collect();
-        lang_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        lang_vec.sort_by_key(|x| std::cmp::Reverse(x.1));
         let lang_line = if lang_total > 0 {
             lang_vec
                 .iter()
@@ -2023,6 +2037,146 @@ impl CoreEngine {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
+    /// Stage 1: explicit symbol-name anchors.
+    ///
+    /// Extracts identifier-shaped tokens from the query (prose, imports, and
+    /// code-block API calls) and looks them up by exact name in the symbol
+    /// table. Unlike BM25, this is a precision-first signal: if a task names
+    /// `parse_latex` or calls `xr.where(...)`, we want that symbol promoted
+    /// directly regardless of how many other files mention the word.
+    ///
+    /// Returns `(symbol_id, 1.0)` pairs in extraction order. RRF fusion
+    /// handles rank-based blending with BM25 / graph / ANN.
+    fn anchor_candidates(&self, query: &str, limit: usize) -> (Vec<(u64, f32)>, AnchorStats) {
+        let anchors = crate::anchors::extract(query);
+        if anchors.symbol_names.is_empty() {
+            return (vec![], AnchorStats::default());
+        }
+        let mut out: Vec<(u64, f32)> = Vec::with_capacity(limit);
+        let mut seen: HashSet<u64> = HashSet::new();
+        let db = self.db.lock();
+        let search = self.search.lock();
+        let graph = self.graph.read();
+
+        let mut resolved_exact = 0usize;
+        let mut resolved_bm25 = 0usize;
+        let mut exact_source_files: HashSet<String> = HashSet::new();
+
+        'outer: for name in &anchors.symbol_names {
+            // Dotted paths like `xr.where` don't match the `name` column directly —
+            // the last segment is the actual symbol name. For plain tokens
+            // (no dot) `rsplit` yields the token itself.
+            let lookup = name.rsplit('.').next().unwrap_or(name);
+            let prefer_module = anchors.from_dotted_call.contains(lookup)
+                || anchors.from_dotted_call.contains(name);
+
+            // (1) Exact name match — strongest signal, highest score.
+            // For names that came from a dotted call we fetch 2× rows and
+            // re-sort to prefer module-level fqns (1 `::`) over class methods
+            // (2+ `::`), since a dotted call is almost always a module-level
+            // function invocation.
+            let fetch = if prefer_module {
+                ANCHOR_ROWS_PER_NAME * 2
+            } else {
+                ANCHOR_ROWS_PER_NAME
+            };
+            let exact_ids = match db.symbols_by_exact_name(lookup, fetch) {
+                Ok(mut ids) => {
+                    if prefer_module {
+                        ids.sort_by_key(|id| {
+                            graph
+                                .get_symbol(*id)
+                                .map(|s| s.fqn.matches("::").count())
+                                .unwrap_or(usize::MAX)
+                        });
+                        ids.truncate(ANCHOR_ROWS_PER_NAME);
+                    }
+                    ids
+                }
+                Err(e) => {
+                    tracing::debug!("exact anchor lookup failed for {:?}: {}", lookup, e);
+                    vec![]
+                }
+            };
+            let had_exact_hits = !exact_ids.is_empty();
+            for id in exact_ids {
+                if seen.insert(id) {
+                    if let Some(sym) = graph.get_symbol(id) {
+                        let p = &sym.file_path;
+                        let is_test = p.contains("/test")
+                            || p.contains("_test.")
+                            || p.contains("test_")
+                            || p.contains("/spec")
+                            || p.contains("_spec.");
+                        if !is_test {
+                            exact_source_files.insert(p.clone());
+                        }
+                    }
+                    out.push((id, 1.0));
+                    resolved_exact += 1;
+                    if out.len() >= limit {
+                        break 'outer;
+                    }
+                }
+            }
+
+            // (2) Name-field BM25 fallback — only when exact returned nothing,
+            // AND only when the fallback is itself precise. Unconditional
+            // fallback leaks fuzzy decoys into the anchor pool; unbounded
+            // fallback leaks *many* decoys that then get the aggressive
+            // `ANCHOR_RRF_K` boost applied uniformly, amplifying ranker bias
+            // toward public-API symbols (see matplotlib-26208 regression).
+            //
+            // Probe up to `ANCHOR_FUZZY_PROBE` hits. If the result is
+            // compact (≤ `ANCHOR_FUZZY_CUTOFF`), treat as precise and inject.
+            // If the result is bulky, drop the anchor entirely for this name
+            // — BM25/ANN/graph will still find the target via the normal
+            // pipeline without the anchor boost distorting ranks.
+            if !had_exact_hits {
+                match search.search_name(lookup, ANCHOR_FUZZY_PROBE) {
+                    Ok(hits) => {
+                        if hits.len() <= ANCHOR_FUZZY_CUTOFF {
+                            for (id, _) in hits {
+                                if seen.insert(id) {
+                                    out.push((id, 0.9));
+                                    resolved_bm25 += 1;
+                                    if out.len() >= limit {
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                "anchor {:?} fuzzy-skipped ({} bm25-name hits > cutoff {})",
+                                lookup,
+                                hits.len(),
+                                ANCHOR_FUZZY_CUTOFF
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("name-BM25 anchor lookup failed for {:?}: {}", lookup, e)
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            "anchors: {} extracted, {} exact, {} bm25-name (total {})",
+            anchors.symbol_names.len(),
+            resolved_exact,
+            resolved_bm25,
+            out.len()
+        );
+        let stats = AnchorStats {
+            extracted: anchors.symbol_names.len(),
+            resolved_exact,
+            resolved_bm25_name: resolved_bm25,
+            distinct_source_files: exact_source_files.len(),
+        };
+        (out, stats)
+    }
+
     /// Stage 1.5: parallel flat cosine scan over the embedding cache for the top-K nearest symbols.
     /// Returns `(symbol_id, cosine_similarity)` pairs, sorted descending by similarity.
     ///
@@ -2155,14 +2309,33 @@ impl CoreEngine {
             graph_candidates(&graph, &bm25_ids, GRAPH_CANDIDATES)
         };
 
-        // ANN semantic retrieval + RRF fusion across all three sources.
+        // Explicit-anchor retrieval: exact symbol-name matches extracted from
+        // the query (prose identifiers, imports, code-block API calls). Empty
+        // when the query has no extractable identifiers, in which case the
+        // RRF blend is unchanged.
+        let (anchor_results, astats) = self.anchor_candidates(query, ANCHOR_CANDIDATES);
+        tracing::debug!("anchor stats: {:?}", astats);
+
+        // ANN semantic retrieval + RRF fusion across all four sources.
+        // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
+        // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
+        // lost the target to body-field noise.
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
-            rrf_merge(&[&bm25_results, &graph_results, &ann_results], RRF_K)
+            rrf_merge_ks(&[
+                (&bm25_results, RRF_K),
+                (&graph_results, RRF_K),
+                (&ann_results, RRF_K),
+                (&anchor_results, ANCHOR_RRF_K),
+            ])
         };
         #[cfg(not(feature = "embeddings"))]
-        let mut search_results = rrf_merge(&[&bm25_results, &graph_results], RRF_K);
+        let mut search_results = rrf_merge_ks(&[
+            (&bm25_results, RRF_K),
+            (&graph_results, RRF_K),
+            (&anchor_results, ANCHOR_RRF_K),
+        ]);
 
         let graph = self.graph.read();
 
@@ -2235,14 +2408,77 @@ impl CoreEngine {
         }
         let max_pivots = max_results.unwrap_or(self.config.max_pivots);
 
-        // 6. Select pivots and adjacents
-        // Stubs are excluded from pivots — they are skeleton-only references.
-        let pivot_ids: Vec<u64> = scored
+        // 6. Select pivots — v1.6 file-diversity pinning.
+        //
+        // Phase 1: pin one pivot per distinct file among exact anchor hits
+        // (up to ANCHOR_FILE_BUDGET). Each file's slot goes to its
+        // most-specific anchor symbol (max "::" depth, shorter fqn on tie).
+        // This guarantees that anchor-named files get capsule representation
+        // regardless of centrality ranking — bug-site symbols are usually
+        // low-centrality and were getting cut by v1.5's RRF-based cap.
+        //
+        // Phase 2: fill remaining slots from the centrality-ranked RRF fusion,
+        // skipping anything already pinned. See docs/explicit-symbol-anchors.md.
+        let mut anchor_by_file: HashMap<String, Vec<u64>> = HashMap::new();
+        for (id, _) in &anchor_results {
+            if let Some(sym) = graph.get_symbol(*id) {
+                if sym.is_stub {
+                    continue;
+                }
+                anchor_by_file
+                    .entry(sym.file_path.clone())
+                    .or_default()
+                    .push(*id);
+            }
+        }
+
+        let mut pinned: Vec<u64> = Vec::new();
+        let mut pinned_files_in_order: Vec<String> = Vec::new();
+        for (id, _) in &anchor_results {
+            if pinned.len() >= ANCHOR_FILE_BUDGET.min(max_pivots) {
+                break;
+            }
+            let Some(sym) = graph.get_symbol(*id) else {
+                continue;
+            };
+            if sym.is_stub {
+                continue;
+            }
+            if pinned_files_in_order.contains(&sym.file_path) {
+                continue;
+            }
+            let mut candidates = anchor_by_file[&sym.file_path].clone();
+            candidates.sort_by_key(|cid| {
+                let s = graph.get_symbol(*cid);
+                let depth = s.map(|s| s.fqn.matches("::").count()).unwrap_or(0);
+                let fqn_len = s.map(|s| s.fqn.len()).unwrap_or(usize::MAX);
+                (std::cmp::Reverse(depth), fqn_len)
+            });
+            if let Some(&best) = candidates.first() {
+                pinned.push(best);
+                pinned_files_in_order.push(sym.file_path.clone());
+            }
+        }
+
+        let pinned_set: HashSet<u64> = pinned.iter().copied().collect();
+        let pivot_slots = max_pivots.saturating_sub(pinned.len());
+        let rrf_fill: Vec<u64> = scored
             .iter()
+            .filter(|(id, _)| !pinned_set.contains(id))
             .filter(|(id, _)| !graph.get_symbol(*id).map(|s| s.is_stub).unwrap_or(false))
-            .take(max_pivots)
+            .take(pivot_slots)
             .map(|(id, _)| *id)
             .collect();
+
+        tracing::debug!(
+            "v1.6 pivots: {} anchor-pinned ({} files), {} RRF fill, {} total",
+            pinned.len(),
+            pinned_files_in_order.len(),
+            rrf_fill.len(),
+            pinned.len() + rrf_fill.len()
+        );
+
+        let pivot_ids: Vec<u64> = pinned.into_iter().chain(rrf_fill).collect();
         let adjacent_ids = select_adjacents(&graph, &pivot_ids, intent, self.config.max_adjacent);
 
         // 7. Resolve IDs → Symbols with filtering

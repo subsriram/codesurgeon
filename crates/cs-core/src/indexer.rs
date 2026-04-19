@@ -127,100 +127,100 @@ fn walk_python_node(
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "function_definition" | "decorated_definition" => {
-                let func_node = if child.kind() == "decorated_definition" {
-                    child.child_by_field_name("definition").unwrap_or(child)
+        // For decorated_definition, the outer node spans the decorators + def
+        // (used for line range and body text so decorators are captured), while
+        // the inner definition node is what we introspect for name/params/etc.
+        let (outer, inner) = if child.kind() == "decorated_definition" {
+            let inner = child.child_by_field_name("definition").unwrap_or(child);
+            (child, inner)
+        } else {
+            (child, child)
+        };
+
+        match inner.kind() {
+            "function_definition" => {
+                let name_node = inner.child_by_field_name("name");
+                let name = name_node
+                    .map(|n| node_text(&n, source))
+                    .unwrap_or("<anonymous>");
+
+                // Check if async
+                let is_async = inner
+                    .child(0)
+                    .map(|c| node_text(&c, source) == "async")
+                    .unwrap_or(false);
+
+                let kind = if parent_class.is_some() {
+                    if is_async {
+                        SymbolKind::AsyncMethod
+                    } else {
+                        SymbolKind::Method
+                    }
+                } else if is_async {
+                    SymbolKind::AsyncFunction
                 } else {
-                    child
+                    SymbolKind::Function
                 };
 
-                if func_node.kind() == "function_definition" {
-                    let name_node = func_node.child_by_field_name("name");
-                    let name = name_node
-                        .map(|n| node_text(&n, source))
-                        .unwrap_or("<anonymous>");
+                let (start, end) = node_lines(&outer);
+                let body = node_text(&outer, source).to_string();
 
-                    // Check if async
-                    let is_async = func_node
-                        .child(0)
-                        .map(|c| node_text(&c, source) == "async")
-                        .unwrap_or(false);
+                // Signature = everything up to the colon on the def line
+                let params = inner
+                    .child_by_field_name("parameters")
+                    .map(|p| node_text(&p, source))
+                    .unwrap_or("()");
+                let return_type = inner
+                    .child_by_field_name("return_type")
+                    .map(|r| format!(" -> {}", node_text(&r, source)))
+                    .unwrap_or_default();
+                let sig = format!("def {}{}{}:", name, params, return_type);
 
-                    let kind = if parent_class.is_some() {
-                        if is_async {
-                            SymbolKind::AsyncMethod
-                        } else {
-                            SymbolKind::Method
-                        }
-                    } else {
-                        if is_async {
-                            SymbolKind::AsyncFunction
-                        } else {
-                            SymbolKind::Function
-                        }
-                    };
+                // Docstring from body block
+                let docstring = inner
+                    .child_by_field_name("body")
+                    .and_then(|b| extract_docstring(&b, source));
 
-                    let (start, end) = node_lines(&child);
-                    let body = node_text(&child, source).to_string();
+                // Qualify name if inside a class
+                let qualified = match parent_class {
+                    Some(cls) => format!("{}::{}", cls, name),
+                    None => name.to_string(),
+                };
 
-                    // Signature = everything up to the colon on the def line
-                    let params = func_node
-                        .child_by_field_name("parameters")
-                        .map(|p| node_text(&p, source))
-                        .unwrap_or("()");
-                    let return_type = func_node
-                        .child_by_field_name("return_type")
-                        .map(|r| format!(" -> {}", node_text(&r, source)))
-                        .unwrap_or_default();
-                    let sig = format!("def {}{}{}:", name, params, return_type);
+                symbols.push(Symbol::new(
+                    file_path,
+                    &qualified,
+                    kind,
+                    start,
+                    end,
+                    sig,
+                    docstring,
+                    body,
+                    Language::Python,
+                ));
 
-                    // Docstring from body block
-                    let docstring = func_node
-                        .child_by_field_name("body")
-                        .and_then(|b| extract_docstring(&b, source));
-
-                    // Qualify name if inside a class
-                    let qualified = match parent_class {
-                        Some(cls) => format!("{}::{}", cls, name),
-                        None => name.to_string(),
-                    };
-
-                    symbols.push(Symbol::new(
-                        file_path,
-                        &qualified,
-                        kind,
-                        start,
-                        end,
-                        sig,
-                        docstring,
-                        body,
-                        Language::Python,
-                    ));
-
-                    // Recurse into function body for nested functions
-                    if let Some(body_node) = func_node.child_by_field_name("body") {
-                        walk_python_node(&body_node, source, file_path, parent_class, symbols);
-                    }
+                // Recurse into function body for nested functions
+                if let Some(body_node) = inner.child_by_field_name("body") {
+                    walk_python_node(&body_node, source, file_path, parent_class, symbols);
                 }
             }
 
             "class_definition" => {
-                let name_node = child.child_by_field_name("name");
+                let name_node = inner.child_by_field_name("name");
                 let name = name_node
                     .map(|n| node_text(&n, source))
                     .unwrap_or("<anonymous>");
-                let (start, end) = node_lines(&child);
-                let body = node_text(&child, source).to_string();
+                let (start, end) = node_lines(&outer);
+                let body = node_text(&outer, source).to_string();
 
                 // Superclasses
-                let superclasses = child
+                let superclasses = inner
                     .child_by_field_name("superclasses")
                     .map(|s| format!("({})", node_text(&s, source)))
                     .unwrap_or_default();
                 let sig = format!("class {}{}:", name, superclasses);
 
-                let docstring = child
+                let docstring = inner
                     .child_by_field_name("body")
                     .and_then(|b| extract_docstring(&b, source));
 
@@ -237,7 +237,7 @@ fn walk_python_node(
                 ));
 
                 // Recurse for methods
-                if let Some(body_node) = child.child_by_field_name("body") {
+                if let Some(body_node) = inner.child_by_field_name("body") {
                     walk_python_node(&body_node, source, file_path, Some(name), symbols);
                 }
             }
@@ -1273,6 +1273,53 @@ def greet(name: str) -> str:
             .expect("greet not found");
         assert_eq!(func.kind, SymbolKind::Function);
         assert!(func.docstring.is_some());
+    }
+
+    /// Regression: a decorated class with a dotted-path superclass used to be
+    /// silently dropped, along with all of its methods. See matplotlib's
+    /// `_AxesBase` in `lib/matplotlib/axes/_base.py` for the real-world case.
+    #[test]
+    fn indexes_decorated_python_class_and_methods() {
+        let src = r#"
+@some_decorator({"key": ["val"]})
+class Foo(pkg.BaseArtist):
+    """Decorated class."""
+
+    name = "foo"
+
+    def __init__(self):
+        self.x = 1
+
+    @property
+    def bar(self):
+        return self.x
+
+    def baz(self, n):
+        return n + 1
+"#;
+        let symbols = extract_python("decor.py", src).expect("python parse");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"Foo"),
+            "decorated class must be indexed; got: {:?}",
+            names
+        );
+        let foo = symbols.iter().find(|s| s.name == "Foo").unwrap();
+        assert_eq!(foo.kind, SymbolKind::Class);
+        assert!(
+            foo.signature.contains("pkg.BaseArtist"),
+            "class signature should include dotted superclass; got: {}",
+            foo.signature
+        );
+        for method in ["__init__", "bar", "baz"] {
+            let fqn = format!("Foo::{}", method);
+            assert!(
+                symbols.iter().any(|s| s.fqn.ends_with(&fqn)),
+                "method {} must be indexed under Foo; got fqns: {:?}",
+                method,
+                symbols.iter().map(|s| &s.fqn).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

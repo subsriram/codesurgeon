@@ -730,6 +730,7 @@ dependencies = [
  "parking_lot",
  "petgraph",
  "rayon",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

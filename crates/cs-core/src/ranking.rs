@@ -18,11 +18,38 @@ pub(crate) const BM25_POOL_SIZE: usize = 50;
 pub(crate) const ANN_CANDIDATES: usize = 25;
 /// Number of graph-neighbor candidates expanded from BM25 seeds per query.
 pub(crate) const GRAPH_CANDIDATES: usize = 25;
+/// Explicit-anchor candidate pool size. Anchors are exact symbol-name matches
+/// extracted from the query (prose identifiers, import targets, code-block API
+/// calls). Kept small because the goal is precision, not recall.
+pub(crate) const ANCHOR_CANDIDATES: usize = 20;
+/// Max rows to fetch per distinct anchor name (limits blast radius on common
+/// names like `where` or `get`).
+pub(crate) const ANCHOR_ROWS_PER_NAME: usize = 5;
+/// Hit-count threshold for the BM25-name fallback. If the name-field BM25
+/// query returns more than this many hits, the anchor is considered too
+/// fuzzy and is skipped entirely — the aggressive `ANCHOR_RRF_K` boost
+/// would otherwise amplify ranker bias toward public-API symbols (see the
+/// matplotlib-26208 regression documented in docs/explicit-symbol-anchors.md).
+pub(crate) const ANCHOR_FUZZY_CUTOFF: usize = 3;
+/// Probe depth for the BM25-name fallback. Fetch up to this many hits so we
+/// can measure fuzziness before deciding whether to inject any of them.
+pub(crate) const ANCHOR_FUZZY_PROBE: usize = 20;
+/// v1.6 file-diversity pinning: max number of distinct anchor-named files
+/// pinned into the pivot set. Each pinned file contributes one pivot (the
+/// most-specific anchor hit in that file). Remaining pivot slots are filled
+/// from the BM25/ANN/graph RRF fusion. See docs/explicit-symbol-anchors.md.
+pub(crate) const ANCHOR_FILE_BUDGET: usize = 5;
 
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 
 /// RRF rank fusion constant (k=60 from the original paper).
 pub(crate) const RRF_K: f32 = 60.0;
+/// RRF k for the explicit-anchor list only. Lower than the global `RRF_K`
+/// (k=15 vs 60) so rank-1 anchor hits contribute ~4× more than rank-1 BM25 —
+/// enough to overcome a BM25+ANN combo that both wrong-answer the query.
+/// Safe because anchor extraction is precision-first: most noise is filtered
+/// out by the stop-word list and the exact-match gate in `anchor_candidates`.
+pub(crate) const ANCHOR_RRF_K: f32 = 15.0;
 /// Structural injection: score multiplier for injected hub types.
 pub(crate) const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
 /// Centrality boost multiplier applied to BM25 score.
@@ -52,9 +79,12 @@ pub(crate) const STUB_SCORE_WEIGHT: f32 = 0.3;
 /// Reciprocal Rank Fusion over multiple ranked lists.
 /// Each list contributes `1 / (k + rank + 1)` to a candidate's score.
 /// Lists that agree on a candidate amplify its score; unique candidates are preserved.
-pub(crate) fn rrf_merge(lists: &[&[(u64, f32)]], k: f32) -> Vec<(u64, f32)> {
+/// Reciprocal Rank Fusion with a per-list `k`. Lists with smaller `k` boost
+/// their top-ranked candidates more aggressively; use this when one retriever
+/// is known to be higher-precision than the others (e.g. explicit anchors).
+pub(crate) fn rrf_merge_ks(lists: &[(&[(u64, f32)], f32)]) -> Vec<(u64, f32)> {
     let mut scores: HashMap<u64, f32> = HashMap::new();
-    for list in lists {
+    for (list, k) in lists {
         for (rank, (id, _)) in list.iter().enumerate() {
             *scores.entry(*id).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
         }

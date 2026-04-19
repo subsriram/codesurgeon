@@ -70,6 +70,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Config file parsing
 toml = { workspace = true }
 
+# Regex — anchor extraction for ranking
+regex = "1"
+
 # Optional: local embeddings for semantic search (CPU or Apple Silicon Accelerate)
 # Build with: cargo build --features embeddings
 # Build with Accelerate BLAS on Apple Silicon: cargo build --features metal
