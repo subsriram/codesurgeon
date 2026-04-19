@@ -1314,7 +1314,7 @@ impl CoreEngine {
             *intent_counts.entry(row.intent.as_str()).or_insert(0) += 1;
         }
         let mut intent_vec: Vec<(&str, usize)> = intent_counts.into_iter().collect();
-        intent_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        intent_vec.sort_by_key(|x| std::cmp::Reverse(x.1));
         let intent_line = intent_vec
             .iter()
             .map(|(k, v)| format!("{} {:.0}%", k, *v as f64 / total_queries as f64 * 100.0))
@@ -1334,7 +1334,7 @@ impl CoreEngine {
         }
         let lang_total: usize = lang_counts.values().sum();
         let mut lang_vec: Vec<(String, usize)> = lang_counts.into_iter().collect();
-        lang_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        lang_vec.sort_by_key(|x| std::cmp::Reverse(x.1));
         let lang_line = if lang_total > 0 {
             lang_vec
                 .iter()
