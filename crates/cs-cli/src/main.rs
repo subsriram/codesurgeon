@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
                 workspace.display(),
                 if force { " (force)" } else { "" }
             );
+            engine.load_embedder();
             let stats = engine.index_workspace_with_options(force)?;
             println!(
                 "Done: {} symbols | {} edges | {} files | session: {}",
