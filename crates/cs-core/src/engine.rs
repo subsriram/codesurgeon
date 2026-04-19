@@ -191,6 +191,16 @@ impl EngineConfig {
 
 // ── Manifest ──────────────────────────────────────────────────────────────────
 
+/// Bumped whenever edge-extraction semantics change in a way that would make
+/// existing incremental indexes stale. When the recorded version in a
+/// workspace's manifest doesn't match this, `index_workspace` treats the index
+/// as dirty and re-parses every file.
+///
+/// History:
+/// - 1: initial
+/// - 2: issue #62 — strip Python docstrings before call-edge extraction
+const CURRENT_GRAPH_SCHEMA_VERSION: u32 = 2;
+
 /// On-disk manifest written to `.codesurgeon/manifest.json` after each full index.
 /// Stores per-file blake3 hashes — enables incremental re-indexing and optional
 /// git-tracking for shared fast-clone workflows.
@@ -200,6 +210,11 @@ struct Manifest {
     workspace: String,
     updated_at: String,
     files: HashMap<String, String>,
+    /// Edge-extraction semantics version. Missing in pre-#62 manifests, so
+    /// `serde(default)` gives it `0` — older than `CURRENT_GRAPH_SCHEMA_VERSION`,
+    /// triggering a re-index on the next run.
+    #[serde(default)]
+    graph_schema_version: u32,
 }
 
 // ── Output types ──────────────────────────────────────────────────────────────
@@ -502,6 +517,7 @@ impl CoreEngine {
             workspace: self.config.workspace_root.to_string_lossy().to_string(),
             updated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             files: file_hashes,
+            graph_schema_version: CURRENT_GRAPH_SCHEMA_VERSION,
         };
         let json = serde_json::to_string_pretty(&manifest)?;
         std::fs::write(self.manifest_path(), json)?;
@@ -554,6 +570,22 @@ impl CoreEngine {
         if !stub_files.is_empty() {
             tracing::info!("Found {} stub files", stub_files.len());
         }
+
+        // Graph schema mismatch → treat the existing index as dirty.
+        // When edge-extraction semantics change (e.g. #62 Python docstring
+        // stripping), already-indexed files have stale edges even though
+        // their blake3 hashes still match. Force a re-parse.
+        let schema_mismatch = self
+            .read_manifest()
+            .is_some_and(|m| m.graph_schema_version != CURRENT_GRAPH_SCHEMA_VERSION);
+        if schema_mismatch && !force {
+            tracing::info!(
+                "Graph schema version changed (expected {}); forcing re-index",
+                CURRENT_GRAPH_SCHEMA_VERSION
+            );
+            eprintln!("[codesurgeon] graph schema bumped → re-indexing all files");
+        }
+        let force = force || schema_mismatch;
 
         // Load baseline hashes for incremental skip:
         // - When force is true: empty baseline → re-parse every file
@@ -926,10 +958,9 @@ impl CoreEngine {
                 let db = self.db.lock();
                 db.begin_transaction()?;
                 let mut failed_chunks = 0u32;
-                let total_chunks = (all_symbols.len() + 63) / 64;
+                let total_chunks = all_symbols.len().div_ceil(64);
                 for chunk_syms in all_symbols.chunks(64) {
-                    let chunk_texts: Vec<String> =
-                        chunk_syms.iter().map(|s| skeleton_text(s)).collect();
+                    let chunk_texts: Vec<String> = chunk_syms.iter().map(skeleton_text).collect();
                     let refs: Vec<&str> = chunk_texts.iter().map(|s| s.as_str()).collect();
                     match emb.embed_batch(&refs) {
                         Ok(vecs) => {
