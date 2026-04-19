@@ -1367,6 +1367,137 @@ fn other_fn() {}
         assert!(label.contains('('), "edge label should contain args");
     }
 
+    /// Regression for issue #62: identifiers inside a Python docstring must
+    /// not turn into `calls` edges. Before the fix, `evalf`, `dict`, and
+    /// `sqrt` in the `>>> ...` doctest block would fan out to every symbol
+    /// with those names elsewhere in the workspace.
+    #[test]
+    fn call_edges_skip_python_docstring_doctest() {
+        let src = r#"
+class SomeType:
+    def evalf(self, n):
+        pass
+
+class Something:
+    def dict(self):
+        pass
+
+def parse_latex(text):
+    r"""Parse a LaTeX string into a SymPy expression.
+
+    Examples
+    ========
+
+    >>> expr = parse_latex(r"\frac{1 + \sqrt{a}}{b}")
+    >>> expr.evalf(4, subs=dict(a=5, b=2))
+    1.618
+    """
+    result = _parse_it(text)
+    return result
+
+def _parse_it(text):
+    return text
+"#;
+        let symbols = extract_python("parser.py", src).expect("python parse");
+        let edges = extract_call_edges(&symbols);
+        let parse_latex = symbols
+            .iter()
+            .find(|s| s.name == "parse_latex")
+            .expect("parse_latex missing");
+
+        let outgoing: Vec<&crate::symbol::Edge> = edges
+            .iter()
+            .filter(|e| e.from_id == parse_latex.id)
+            .collect();
+
+        // The only real call is `_parse_it(text)`.
+        let labels: Vec<&str> = outgoing.iter().filter_map(|e| e.label.as_deref()).collect();
+        assert!(
+            labels.iter().any(|l| l.starts_with("_parse_it")),
+            "expected call edge to _parse_it, got labels: {:?}",
+            labels
+        );
+        // None of the docstring-mentioned identifiers should produce edges.
+        for name in ["evalf", "dict"] {
+            assert!(
+                !labels.iter().any(|l| l.starts_with(name)),
+                "docstring identifier '{}' should not produce a call edge (labels: {:?})",
+                name,
+                labels
+            );
+        }
+    }
+
+    /// Triple-quoted strings used as embedded SQL / HTML / templates also
+    /// contain identifier-shaped tokens that are not real calls.
+    #[test]
+    fn call_edges_skip_python_triple_quoted_non_docstring() {
+        let src = r#"
+def run_query(conn):
+    sql = """
+        SELECT * FROM users WHERE status = dict(active=True)
+    """
+    return conn.execute(sql)
+
+def dict(x):
+    return x
+
+def execute(q):
+    return q
+"#;
+        let symbols = extract_python("q.py", src).expect("python parse");
+        let edges = extract_call_edges(&symbols);
+        let run_query = symbols.iter().find(|s| s.name == "run_query").unwrap();
+        let dict_sym = symbols.iter().find(|s| s.name == "dict").unwrap();
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.from_id == run_query.id && e.to_id == dict_sym.id),
+            "`dict(...)` inside a triple-quoted string should not create a call edge"
+        );
+    }
+
+    /// Control: a real call outside any string literal still produces an edge
+    /// after docstring stripping.
+    #[test]
+    fn call_edges_python_real_call_still_resolved() {
+        let src = r#"
+def helper(x):
+    return x + 1
+
+def caller():
+    """Do some work.
+
+    >>> helper(1)
+    2
+    """
+    return helper(42)
+"#;
+        let symbols = extract_python("m.py", src).expect("python parse");
+        let edges = extract_call_edges(&symbols);
+        let caller = symbols.iter().find(|s| s.name == "caller").unwrap();
+        let helper = symbols.iter().find(|s| s.name == "helper").unwrap();
+        // Exactly one edge caller→helper (from the real `return helper(42)`,
+        // not the doctest `>>> helper(1)` — but either way, dedup'd to one).
+        let matching: Vec<_> = edges
+            .iter()
+            .filter(|e| e.from_id == caller.id && e.to_id == helper.id)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one caller→helper edge, got {}",
+            matching.len()
+        );
+        // And the label's args snippet should be from the real call, not the doctest.
+        let label = matching[0].label.as_deref().unwrap_or("");
+        assert!(
+            label.contains("42"),
+            "expected real-call args in label, got {:?}",
+            label
+        );
+    }
+
     #[test]
     fn import_edges_resolve_python_names() {
         let src = r#"

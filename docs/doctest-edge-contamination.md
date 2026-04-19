@@ -1,8 +1,13 @@
-# Design (stub): Strip docstring examples from call-edge extraction
+# Design: Strip docstring examples from call-edge extraction
 
-> **Status**: stub — no implementation yet.
-> **Target**: `crates/cs-core/src/indexer.rs` (per-language call-extraction
-> walks).
+> **Status**: implemented in #63 for Python. Rust / TS / Swift already
+> capture function bodies without adjacent doc comments (those live as
+> sibling AST nodes), so no change was required there.
+> **Code**: `strip_python_triple_strings` in `crates/cs-core/src/edges.rs`;
+> call-site in `extract_call_edges`. Tests in `crates/cs-core/src/indexer.rs`
+> under `call_edges_skip_python_*`. Graph schema bumped to `2`
+> (`CURRENT_GRAPH_SCHEMA_VERSION` in `engine.rs`) so existing workspaces
+> force a re-parse on the next `codesurgeon index`.
 > **Related**: `docs/explicit-symbol-anchors.md` (anchors), `docs/query-history-ranking.md` (memory channel).
 
 ## Motivation
