@@ -163,12 +163,68 @@ under 200ms and replaces 5–10 exploratory tool calls. Only after you
 have the capsule should you start opening files with Read.
 """
 
+TREATMENT_NUDGE_5G = """\
+
+Before you start reading files, call `mcp__cs-codesurgeon__run_pipeline`
+with two fields:
+  - `task`: a short description of the work, e.g. task="fix PolynomialError on subs with Piecewise"
+  - `context`: one symbol name or FQN per line — include both the identifiers named in the problem statement or in the error chain..
+After receiving the capsule, you can investigate further with the following codesurgeon tools: `get_impact_graph` (callers/raisers of a symbol), `get_skeleton` (file API), `search_logic_flow` (trace A→B).
+"""
+
+TREATMENT_NUDGE_5H = """\
+
+Before you start reading files, call mcp__cs-codesurgeon__run_pipeline
+with two fields:
+  - task: a short description of the work, e.g. task="fix PolynomialError on subs with Piecewise"
+  - context: one symbol name or FQN per line — include the identifiers named in the problem statement or in the error chain..
+After receiving the capsule, you can investigate further with the following: mcp__cs-codesurgeon__get_impact_graph (callers/raisers of a symbol),  mcp__cs-codesurgeon__get_skeleton (file API),  mcp__cs-codesurgeon__search_logic_flow (trace A→B).
+"""
+
+TREATMENT_NUDGE_5I = """\
+
+First, call mcp__cs-codesurgeon__run_pipeline with two fields:
+  - task: a short description of the work, e.g. task="fix PolynomialError on subs with Piecewise"
+  - context:   symbol names or FQNs named in the problem statement or in the error chain.
+With the returned capsule, you can investigate further with: mcp__cs-codesurgeon__get_impact_graph (callers/raisers of a symbol),  mcp__cs-codesurgeon__get_skeleton (file API),  mcp__cs-codesurgeon__search_logic_flow (trace A→B).
+"""
+
 NUDGES: dict[str, str] = {
     "5b": TREATMENT_NUDGE_5B,
     "5c": TREATMENT_NUDGE_5C,
     "5e": TREATMENT_NUDGE_5E,
     "5f": TREATMENT_NUDGE_5F,
+    "5g": TREATMENT_NUDGE_5G,
+    "5h": TREATMENT_NUDGE_5H,
+    "5i": TREATMENT_NUDGE_5I,
 }
+
+# Empirical results on `sympy__sympy-21379` — each variant, single run,
+# same warm workspace, same binary (f1f8157 + #65 + import filter).
+# Used to choose `5b` as the default; all other variants kept for
+# reproducibility and future re-runs.
+#
+# | Variant | Prompt ch | Wall  | Cost   | Patch  | Notes
+# |---------|----------:|------:|-------:|-------:|------
+# | 5b      |       716 | 279 s | $0.95  | 582 B  | VERBATIM-ONLY; reference baseline
+# | 5g      |       529 | 256 s | $0.99  | 582 B  | grounded inference + short tool names; Pareto-comparable
+# | 5i      |       482 | 368 s | $1.34  | 582 B  | tightest imperative + FQN tool names; correct, costlier
+# | 5e      |       568 | 474 s | $1.60  | 597 B  | speculative inference; agent guessed `trigsimp` (wrong subtree)
+# | (4g)    |       850 | 479 s | $1.73  | 887 B  | 5b + 134-char tool-advertising line (reverted)
+# | 5f      |       787 | 600 s | TIMEOUT|   0 B  | verbatim + inferred; wrong-direction inference amplified
+# | 5h      |       559 | 600 s | TIMEOUT|   0 B  | FQN tools + "include the" phrasing; agent hallucinated `ask_key`
+# | (4f)    |     3,497 | 600 s | TIMEOUT|   0 B  | 5b + full 2,781-char CLAUDE.md (reverted)
+#
+# Key signals that survive noise (single-run, n=1 per variant):
+#  - 5b and 5g occupy the same success band (~$0.95-$0.99 / ~256-279 s)
+#  - Every variant that promotes speculation OR adds tool advertising
+#    >~130 chars degraded or timed out
+#  - Agent NEVER called get_impact_graph / get_skeleton / search_logic_flow
+#    across all 7 variants, regardless of tool-name format or framing
+#
+# Conclusion: prompt-level workflow steering is closed as a lever on
+# this task class. Further gains come from server-side capsule content
+# (#69 v2: body-text embedding similarity, traceback parsing, etc.).
 
 PROMPT_SUFFIX = """
 

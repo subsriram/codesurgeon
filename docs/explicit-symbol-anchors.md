@@ -179,6 +179,62 @@ filter + `--nudge 5b`, **without** `--inject-claude-md` and **without**
 any tool-advertising prose. 279 s / $0.95 / correct 582 B patch on
 sympy-21379. Measure any new approach against this number.
 
+### Phase 5 — inference-prompt A/B (5e–5i)
+
+Tested whether asking the agent to do NER + light inference at the
+prompt level — rather than just pasting the problem verbatim — beats
+the server-side regex extraction that `5b` relies on. Seven variants
+across the dose-and-framing spectrum, all on the same warm workspace,
+same binary, same task:
+
+| Variant | Nudge ch | Wall | Cost | Patch | Context shape | Notes |
+|---|---:|---:|---:|---:|---|---|
+| **5b** | 716 | 279 s | **$0.95** | 582 B ✓ | 1,747 ch verbatim | reference baseline |
+| 5g | 529 | **256 s** | $0.99 | 582 B ✓ | 94 ch grounded identifiers | Pareto-comparable to 5b |
+| 5i | 482 | 368 s | $1.34 | 582 B ✓ | 68 ch grounded identifiers | correct, costlier |
+| 5e | 568 | 474 s | $1.60 | 597 B ✓ | 114 ch speculative | agent guessed `trigsimp` (wrong subtree) |
+| 4g | 850 | 479 s | $1.73 | 887 B ✓ | 1,747 ch + 134-ch tool line | reverted |
+| 5f | 787 | timeout | — | 0 B ✗ | 1,896 ch verbatim+inferred | wrong-direction inference amplified |
+| 5h | 559 | timeout | — | 0 B ✗ | 69 ch with hallucinations | agent hallucinated `ask_key`, `ask_assumptions` |
+| 4f | 3,497 | timeout | — | 0 B ✗ | 1,747 + 2,781-ch CLAUDE.md | reverted |
+
+### Conclusions from Phase 5 (and overall prompt-A/B session)
+
+1. **5b and 5g are in the same success band** (~$0.95–$0.99 / ~256–279 s).
+   Single-run noise (~±30% in cost, ±30 s in wall) is large enough that
+   their difference is not a signal. Keeping 5b as default; 5g stays in
+   `NUDGES` for future multi-run validation.
+
+2. **Every variant that promotes speculation or adds tool advertising
+   >~130 chars either regressed or timed out.** The Phase 4g dose-response
+   (0 / 134 / 2,781 chars → $0.95 / $1.73 / timeout) was not a one-off —
+   the pattern held across seven variants. Volume of prompt content
+   correlates with exploration overhead regardless of what the content
+   says.
+
+3. **Agents never chain MCP tools from prompt-level guidance.** Across 7
+   variants with different tool-naming formats (short names, FQN, post-
+   capsule framing, CLAUDE.md narrative, inline mention), **zero calls**
+   to `get_impact_graph` / `get_skeleton` / `search_logic_flow` were
+   observed. Agent defaults to `run_pipeline` once then Grep/Read for
+   exploration. This is robust.
+
+4. **Agent inference adds noise more often than signal on this task.**
+   When asked to infer internal symbols (5e/5f/5h), the agent pulled
+   either irrelevant adjacent territory (`trigsimp`, `_eval_rewrite_as_exp`)
+   or outright hallucinations (`ask_key`, `ask_assumptions`). None of
+   the inference variants surfaced `Mod.eval`, the actual fix site.
+   The agent doesn't have the sympy-implementation-specific knowledge
+   that `subs({1: 1.0})` routes through `Mod.eval`.
+
+**Prompt-level steering is closed as a lever on this task class.**
+Further gains come from server-side capsule content. Candidate
+directions tracked in [#69](https://github.com/subsriram/codesurgeon/issues/69)'s
+v2 recommendations: body-text embedding similarity on reverse-expand
+candidates (replaces surface-text term overlap), traceback parsing on
+`context` (high-precision signal when tracebacks are present),
+reproducer-test awareness (swebench-specific).
+
 ### Harness / measurement infrastructure — stable baseline
 
 Workflow to reproduce any of the rows in the table above:
