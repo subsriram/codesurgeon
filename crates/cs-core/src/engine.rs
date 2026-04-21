@@ -70,6 +70,12 @@ pub struct EngineConfig {
     pub max_pivots: usize,
     pub max_adjacent: usize,
     pub max_blast_radius_depth: u32,
+    /// Per-list cap on dependents returned by `get_impact_graph`.
+    /// Applies independently to direct and transitive lists; anything beyond
+    /// is dropped and reported via `ImpactResult::{direct,transitive}_truncated`.
+    /// Default 100 keeps a worst-case response under ~5k tokens for high-fan-out
+    /// symbols (e.g. exception base classes in large codebases — see issue #65).
+    pub max_impact_results: usize,
     pub session_id: String,
     /// Whether to load the embedding model on startup.
     /// Set to false for secondary (read-only) instances to avoid loading the
@@ -171,6 +177,7 @@ impl EngineConfig {
             max_pivots: 8,
             max_adjacent: 20,
             max_blast_radius_depth: 5,
+            max_impact_results: 100,
             session_id,
             load_embedder: true,
             index_stubs: true,
@@ -253,7 +260,21 @@ pub struct ImpactResult {
     pub target_fqn: String,
     pub direct_dependents: Vec<SymbolRef>,
     pub transitive_dependents: Vec<SymbolRef>,
+    /// Total dependents that survived test/depth filtering, *before* the
+    /// per-list `max_results` cap was applied. Always reflects real-world
+    /// blast radius even when the returned lists are truncated.
     pub total_affected: usize,
+    /// Number of direct dependents dropped by the `max_results` cap.
+    /// Zero when the full list fit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub direct_truncated: usize,
+    /// Number of transitive dependents dropped by the `max_results` cap.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub transitive_truncated: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1429,6 +1450,7 @@ impl CoreEngine {
         &self,
         symbol_fqn: &str,
         max_depth: Option<u32>,
+        max_results: Option<usize>,
         include_tests: bool,
     ) -> Result<ImpactResult> {
         let graph = self.graph.read();
@@ -1454,9 +1476,9 @@ impl CoreEngine {
 
         let target_id = target.id;
         let depth = max_depth.unwrap_or(self.config.max_blast_radius_depth);
+        let cap = max_results.unwrap_or(self.config.max_impact_results).max(1);
 
-        let is_test = |s: &SymbolRef| -> bool {
-            let p = &s.file_path;
+        let is_test_path = |p: &str| -> bool {
             p.contains("/test")
                 || p.contains("_test.")
                 || p.contains("test_")
@@ -1464,27 +1486,43 @@ impl CoreEngine {
                 || p.contains("_spec.")
         };
 
-        let direct: Vec<SymbolRef> = graph
+        // Rank by descending centrality so the most-depended-on dependents
+        // survive truncation; FQN ascending breaks ties for stable output.
+        // Centrality is f32 in [0, 1); scale to i64 for total ordering.
+        let rank_key = |s: &Symbol| -> (i64, String) {
+            let c = (graph.centrality_score(s.id) * 1_000_000.0) as i64;
+            (-c, s.fqn.clone())
+        };
+
+        let mut direct: Vec<&Symbol> = graph
             .dependents(target_id)
             .into_iter()
-            .map(sym_ref)
-            .filter(|s| include_tests || !is_test(s))
+            .filter(|s| include_tests || !is_test_path(&s.file_path))
             .collect();
+        direct.sort_by_cached_key(|s| rank_key(s));
+        let direct_total = direct.len();
+        let direct_truncated = direct_total.saturating_sub(cap);
+        direct.truncate(cap);
+        let direct_refs: Vec<SymbolRef> = direct.into_iter().map(sym_ref).collect();
 
-        let transitive: Vec<SymbolRef> = graph
+        let mut transitive: Vec<&Symbol> = graph
             .blast_radius(target_id, depth)
             .into_iter()
-            .map(sym_ref)
-            .filter(|s| include_tests || !is_test(s))
+            .filter(|s| include_tests || !is_test_path(&s.file_path))
             .collect();
-
-        let total = direct.len() + transitive.len();
+        transitive.sort_by_cached_key(|s| rank_key(s));
+        let transitive_total = transitive.len();
+        let transitive_truncated = transitive_total.saturating_sub(cap);
+        transitive.truncate(cap);
+        let transitive_refs: Vec<SymbolRef> = transitive.into_iter().map(sym_ref).collect();
 
         Ok(ImpactResult {
             target_fqn: symbol_fqn.to_string(),
-            direct_dependents: direct,
-            transitive_dependents: transitive,
-            total_affected: total,
+            direct_dependents: direct_refs,
+            transitive_dependents: transitive_refs,
+            total_affected: direct_total + transitive_total,
+            direct_truncated,
+            transitive_truncated,
         })
     }
 

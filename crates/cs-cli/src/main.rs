@@ -236,20 +236,42 @@ async fn main() -> Result<()> {
         }
 
         Commands::Impact { symbol_fqn } => {
-            let result = engine.get_impact_graph(&symbol_fqn, None, true)?;
+            let result = engine.get_impact_graph(&symbol_fqn, None, None, true)?;
             println!("Impact graph for: {}", result.target_fqn);
             println!("Total affected: {}\n", result.total_affected);
 
             if !result.direct_dependents.is_empty() {
-                println!("Direct dependents:");
+                println!(
+                    "Direct dependents ({} shown{}):",
+                    result.direct_dependents.len(),
+                    if result.direct_truncated > 0 {
+                        format!(", {} more truncated", result.direct_truncated)
+                    } else {
+                        String::new()
+                    }
+                );
                 for s in &result.direct_dependents {
                     println!("  {} ({}:{})", s.fqn, s.file_path, s.start_line);
                 }
+                if result.direct_truncated > 0 {
+                    println!("  … + {} more (truncated)", result.direct_truncated);
+                }
             }
             if !result.transitive_dependents.is_empty() {
-                println!("\nTransitive dependents:");
+                println!(
+                    "\nTransitive dependents ({} shown{}):",
+                    result.transitive_dependents.len(),
+                    if result.transitive_truncated > 0 {
+                        format!(", {} more truncated", result.transitive_truncated)
+                    } else {
+                        String::new()
+                    }
+                );
                 for s in &result.transitive_dependents {
                     println!("  {} ({}:{})", s.fqn, s.file_path, s.start_line);
+                }
+                if result.transitive_truncated > 0 {
+                    println!("  … + {} more (truncated)", result.transitive_truncated);
                 }
             }
         }

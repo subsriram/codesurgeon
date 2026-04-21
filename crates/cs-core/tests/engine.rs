@@ -160,10 +160,10 @@ fn get_impact_graph_exclude_tests_filters_test_files() {
     engine.index_workspace().expect("index failed");
 
     let with_tests = engine
-        .get_impact_graph("lib.rs::target", None, true)
+        .get_impact_graph("lib.rs::target", None, None, true)
         .unwrap();
     let without_tests = engine
-        .get_impact_graph("lib.rs::target", None, false)
+        .get_impact_graph("lib.rs::target", None, None, false)
         .unwrap();
     for dep in &without_tests.direct_dependents {
         assert!(
@@ -188,15 +188,60 @@ fn get_impact_graph_max_depth_limits_traversal() {
     engine.index_workspace().expect("index failed");
 
     let shallow = engine
-        .get_impact_graph("lib.rs::base", Some(1), true)
+        .get_impact_graph("lib.rs::base", Some(1), None, true)
         .unwrap();
     let deep = engine
-        .get_impact_graph("lib.rs::base", Some(5), true)
+        .get_impact_graph("lib.rs::base", Some(5), None, true)
         .unwrap();
     assert!(
         shallow.total_affected <= deep.total_affected,
         "shallow traversal should find ≤ symbols than deep"
     );
+}
+
+/// `get_impact_graph` must cap each list at `max_results` for high-fan-out
+/// symbols and report the dropped count via `direct_truncated`. Without this
+/// cap, central symbols (e.g. exception base classes) overflow agent context —
+/// see issue #65, where `PolynomialError` returned 30k+ transitive dependents.
+#[test]
+fn get_impact_graph_caps_direct_dependents_for_high_fanout() {
+    let dir = tempfile::tempdir().unwrap();
+    // 1 target + 60 distinct callers all in one file.
+    let mut src = String::from("pub fn target() {}\n");
+    for i in 0..60 {
+        src.push_str(&format!("pub fn caller_{i:02}() {{ target(); }}\n"));
+    }
+    std::fs::write(dir.path().join("lib.rs"), src).unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    let result = engine
+        .get_impact_graph("lib.rs::target", None, Some(10), true)
+        .expect("get_impact_graph failed");
+
+    assert_eq!(
+        result.direct_dependents.len(),
+        10,
+        "direct list must respect the max_results cap"
+    );
+    assert_eq!(
+        result.direct_truncated, 50,
+        "direct_truncated must report dropped count: 60 callers - 10 cap"
+    );
+    // total_affected must reflect the *real* blast radius, not the truncated view.
+    assert!(
+        result.total_affected >= 60,
+        "total_affected must be the pre-cap count, got {}",
+        result.total_affected
+    );
+
+    // Cap is stable: a second call returns the same set in the same order.
+    let again = engine
+        .get_impact_graph("lib.rs::target", None, Some(10), true)
+        .unwrap();
+    let first: Vec<_> = result.direct_dependents.iter().map(|s| &s.fqn).collect();
+    let second: Vec<_> = again.direct_dependents.iter().map(|s| &s.fqn).collect();
+    assert_eq!(first, second, "truncation order must be deterministic");
 }
 
 /// `get_skeleton` with `max_depth=1` must return only top-level symbols.

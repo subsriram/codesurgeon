@@ -16,7 +16,12 @@
 //! ```
 
 use anyhow::Result;
-use cs_core::{engine::EngineConfig, symbol::LspEdge, watcher::FileWatcher, CoreEngine};
+use cs_core::{
+    engine::{EngineConfig, ImpactResult, SymbolRef},
+    symbol::LspEdge,
+    watcher::FileWatcher,
+    CoreEngine,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -154,6 +159,10 @@ fn tool_list() -> Value {
                         "max_depth": {
                             "type": "integer",
                             "description": "Maximum traversal depth for transitive dependents (default: 5)"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Per-list cap on dependents (default: 100). High-fan-out symbols (e.g. exception base classes) can have thousands of transitive dependents — the cap keeps the response under ~5k tokens. Highest-centrality dependents are preserved when truncation fires; truncation count is reported in the response."
                         },
                         "include_tests": {
                             "type": "boolean",
@@ -862,9 +871,16 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
         "get_impact_graph" => {
             let fqn = string_arg(&args, "symbol_fqn")?;
             let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).map(|v| v as u32);
-            let include_tests = args.get("include_tests").and_then(|v| v.as_bool()).unwrap_or(true);
-            let result = engine.get_impact_graph(&fqn, max_depth, include_tests)?;
-            Ok(serde_json::to_string_pretty(&result)?)
+            let max_results = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let include_tests = args
+                .get("include_tests")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let result = engine.get_impact_graph(&fqn, max_depth, max_results, include_tests)?;
+            Ok(format_impact(&result))
         }
 
         "get_skeleton" => {
@@ -1034,6 +1050,54 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
         other => Err(anyhow::anyhow!("Unknown tool: {}", other)),
     })
     .await?
+}
+
+/// Render `ImpactResult` as a compact markdown report. Truncation is reported
+/// inline with the kept count and the dropped count so callers can see at a
+/// glance whether the cap fired and what the real blast radius is.
+fn format_impact(r: &ImpactResult) -> String {
+    let mut out = format!(
+        "## Impact graph: {}\n\nTotal affected: {}\n\n",
+        r.target_fqn, r.total_affected
+    );
+
+    let render_section = |out: &mut String, label: &str, deps: &[SymbolRef], truncated: usize| {
+        let kept = deps.len();
+        if kept == 0 && truncated == 0 {
+            return;
+        }
+        out.push_str(&format!("### {label} ({kept} shown"));
+        if truncated > 0 {
+            out.push_str(&format!(", {truncated} more truncated"));
+        }
+        out.push_str(")\n");
+        for s in deps {
+            out.push_str(&format!(
+                "- `{}` ({}:{})\n",
+                s.fqn, s.file_path, s.start_line
+            ));
+        }
+        if truncated > 0 {
+            out.push_str(&format!(
+                "- … + {truncated} more (truncated; pass higher `max_results` to see more, or filter by depth)\n"
+            ));
+        }
+        out.push('\n');
+    };
+
+    render_section(
+        &mut out,
+        "Direct dependents",
+        &r.direct_dependents,
+        r.direct_truncated,
+    );
+    render_section(
+        &mut out,
+        "Transitive dependents",
+        &r.transitive_dependents,
+        r.transitive_truncated,
+    );
+    out
 }
 
 fn string_arg(args: &Value, key: &str) -> Result<String> {

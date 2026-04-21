@@ -382,6 +382,7 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | max_pivots | 8 | `engine.rs` |
 | max_adjacent | 20 | `engine.rs` |
 | max_blast_radius_depth | 5 | `engine.rs` |
+| max_impact_results (per-list cap) | 100 | `engine.rs` |
 | family_in_degree k | 5 | `graph.rs` |
 | centrality_score k | 15 | `graph.rs` |
 | Stub score weight | × 0.3 | `ranking.rs:STUB_SCORE_WEIGHT` |
