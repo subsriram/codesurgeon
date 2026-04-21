@@ -182,6 +182,18 @@ def maybe_inject_claude_md(workdir: Path, arm: str, inject: bool) -> Path | None
     already ships a CLAUDE.md at `base_commit`, our content is prepended
     so the agent sees codesurgeon guidance first — we never silently
     overwrite upstream instructions.
+
+    NOTE (2026-04-21): `claude --print` does NOT auto-load CLAUDE.md from
+    `cwd` — that's an interactive-mode-only behavior. Writing this file
+    to disk was a no-op for every prior run: the file sat in the workdir
+    but the agent never saw its content. Verified empirically by scanning
+    the entire stream for distinctive CLAUDE.md text (0 matches across
+    121 events / 467 KB). `build_prompt` now ALSO inlines the same
+    content into the treatment-arm prompt prefix when this flag is set,
+    which is the mechanism that actually delivers the guidance.
+
+    The on-disk write is retained for audit / debug / symmetry with how
+    a human operator would use codesurgeon interactively.
     """
     if arm != "with" or not inject:
         return None
@@ -196,7 +208,12 @@ def maybe_inject_claude_md(workdir: Path, arm: str, inject: bool) -> Path | None
     return path
 
 
-def build_prompt(arm: str, problem_statement: str, nudge_variant: str = "5b") -> str:
+def build_prompt(
+    arm: str,
+    problem_statement: str,
+    nudge_variant: str = "5b",
+    inline_claude_md: bool = False,
+) -> str:
     """Assemble the per-arm prompt.
 
     Control arm (`without`) gets only the bug-fix preamble — no mention of
@@ -206,6 +223,13 @@ def build_prompt(arm: str, problem_statement: str, nudge_variant: str = "5b") ->
     Treatment arm (`with`) gets the preamble + one of the NUDGES keyed by
     `nudge_variant`. Default 5b (verbatim-forward of problem statement
     into `context`); 5c (tool-description-only) is used for A/B isolation.
+
+    When `inline_claude_md` is True (the treatment arm, `--inject-claude-md`
+    set), the full codesurgeon guidance text is appended after the nudge
+    and before the problem statement. This is how the CLAUDE.md content
+    actually reaches the agent — `claude --print` does NOT auto-load
+    workdir/CLAUDE.md, verified empirically against the 2026-04-20
+    stream logs. See `maybe_inject_claude_md` for the on-disk companion.
     """
     parts = [PROMPT_BASE]
     if arm == "with":
@@ -214,6 +238,9 @@ def build_prompt(arm: str, problem_statement: str, nudge_variant: str = "5b") ->
                 f"unknown nudge_variant {nudge_variant!r}; expected one of {list(NUDGES)}"
             )
         parts.append(NUDGES[nudge_variant])
+        if inline_claude_md:
+            parts.append("\n\n")
+            parts.append(CODESURGEON_CLAUDE_MD)
     parts.append(PROMPT_SUFFIX)
     parts.append(problem_statement)
     return "".join(parts)
@@ -593,7 +620,12 @@ def run_one(
 
         # 3. Build prompt and spawn claude. Prompt branches on arm — the
         # control arm does not see the codesurgeon nudge (see build_prompt).
-        prompt = build_prompt(arm, task["problem_statement"], nudge_variant=nudge_variant)
+        prompt = build_prompt(
+            arm,
+            task["problem_statement"],
+            nudge_variant=nudge_variant,
+            inline_claude_md=inject_claude_md,
+        )
         cmd = build_claude_cmd(
             claude_bin, mcp_config, workdir, prompt, max_budget_usd, model,
             stream_json=stream_json,
@@ -762,7 +794,13 @@ def main() -> int:
     parser.add_argument(
         "--inject-claude-md",
         action="store_true",
-        help="Phase 4: write codesurgeon tool guidance to workdir/CLAUDE.md (with arm only)",
+        help=(
+            "Phase 4: deliver codesurgeon tool guidance to the agent "
+            "(treatment arm only). Inlines the CLAUDE.md body into the "
+            "prompt prefix AND writes workdir/CLAUDE.md as an audit "
+            "artifact. `claude --print` does not auto-load CLAUDE.md; "
+            "the prompt-inline path is what actually reaches the agent."
+        ),
     )
     parser.add_argument(
         "--nudge",

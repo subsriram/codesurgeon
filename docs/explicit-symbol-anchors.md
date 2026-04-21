@@ -107,10 +107,20 @@ in order of estimated leverage:
   imports and assertions pin the fix site precisely. Narrow win for
   swebench; doesn't generalize to real-world use.
 
-Phase 4 CLAUDE.md's suggestion that the agent chain `run_pipeline` →
-`get_impact_graph` was empirically ignored in every run — agents default
-to Grep/Read regardless of prompt-level chaining guidance. Not worth more
-prompt engineering; the structural fixes above are better leverage.
+Phase 4 CLAUDE.md's chaining guidance (`run_pipeline` → `get_impact_graph`)
+was never actually delivered to the agent in any of the Phase 4 runs.
+Post-hoc stream analysis (scanning all 121 events / 467 KB of the final
+run for distinctive CLAUDE.md content) found **zero** matches: the file
+was written to `workdir/CLAUDE.md` as designed, but `claude --print`
+does not auto-load CLAUDE.md from `cwd` (that's interactive-mode-only
+behaviour). So every Phase 4 result has been measuring bare TREATMENT_NUDGE
+behaviour, not "agent + CLAUDE.md guidance." **Whether the chaining
+guidance would help remains untested.**
+
+Harness fix: the `--inject-claude-md` flag now ALSO inlines the
+CLAUDE.md body into the PROMPT_PREFIX so the agent actually receives
+the content. The on-disk write is retained as an audit artifact.
+See `benches/swebench/run.py::build_prompt` and `maybe_inject_claude_md`.
 
 ### Harness / measurement infrastructure — stable baseline
 
