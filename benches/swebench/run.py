@@ -122,7 +122,53 @@ tool calls. Only after you have the capsule should you start opening
 files with Read.
 """
 
-NUDGES: dict[str, str] = {"5b": TREATMENT_NUDGE_5B, "5c": TREATMENT_NUDGE_5C}
+# Phase 4h variants — leverage LLM inference to surface internal fix sites
+# the user didn't name. 5b's verbatim-only context delegates anchor
+# extraction to server-side regex; both 5e/5f put part of the extraction
+# back on the model. Kept minimal (~50–200 char deltas) because prior dose-
+# response showed prompt-level content monotonically increases cost across
+# 0/134/2781-char experiments. Small deltas may still net positive if the
+# model's inference adds signal the server regex can't.
+
+TREATMENT_NUDGE_5E = """\
+
+Before you start reading files, call `mcp__cs-codesurgeon__run_pipeline`
+with two fields:
+  - `task`: a short description of the work, e.g.
+    task="fix PolynomialError on subs with Piecewise"
+  - `context`: one symbol name or FQN per line — include both the
+    identifiers named in the problem statement AND internal
+    functions/classes/modules the error chain implies, even if the
+    user didn't name them (e.g. likely fix-site methods).
+
+The capsule surfaces these as anchored pivots. Only after you have
+the capsule should you start opening files with Read.
+"""
+
+TREATMENT_NUDGE_5F = """\
+
+Before you start reading files, call `mcp__cs-codesurgeon__run_pipeline`
+with two fields:
+  - `task`: a short description of the work, e.g.
+    task="fix PolynomialError on subs with Piecewise"
+  - `context`: the ENTIRE problem statement below, pasted verbatim
+    (copy-paste exactly — do not paraphrase, summarize, or omit code
+    snippets, error messages, or identifiers); then append any
+    internal symbols or FQNs the error chain implies.
+
+`context` is what anchors the search on the function names, class names,
+and API calls that appear in the raw source — identifiers you might
+otherwise paraphrase out of `task`. The capsule typically returns in
+under 200ms and replaces 5–10 exploratory tool calls. Only after you
+have the capsule should you start opening files with Read.
+"""
+
+NUDGES: dict[str, str] = {
+    "5b": TREATMENT_NUDGE_5B,
+    "5c": TREATMENT_NUDGE_5C,
+    "5e": TREATMENT_NUDGE_5E,
+    "5f": TREATMENT_NUDGE_5F,
+}
 
 PROMPT_SUFFIX = """
 
