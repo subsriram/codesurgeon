@@ -144,10 +144,40 @@ remains without CLAUDE.md injection. Recommendation: disable
 empirically helps. Real-user interactive use is unaffected (interactive
 mode does auto-load `CLAUDE.md`).
 
-**Reference baseline for future ranking work**: v1.7 + #67
-(reverse-expand) + `SymbolKind::Import` filter + `--nudge 5b`,
-**without** `--inject-claude-md`. 279 s / $0.95 / correct 582 B patch
-on sympy-21379. Measure any new approach against this number.
+### Phase 4g — minimal-dose tool mention (one 134-char line)
+
+To test whether the CLAUDE.md regression was about volume rather than
+direction, added a single 134-char line to `TREATMENT_NUDGE_5B`:
+
+> Other codesurgeon tools: `get_impact_graph` (callers/raisers of a symbol), `get_skeleton` (file API), `search_logic_flow` (trace A→B).
+
+Outcome on the same task:
+
+| Config | Wall | Cost | Tool calls | Patch | cs- tools used |
+|---|---:|---:|---:|---:|---|
+| Phase 4e (no tool mention) | 279 s | $0.95 | 40 | 582 B ✓ | `run_pipeline` |
+| **Phase 4g (134-char mention)** | **479 s** | **$1.73** | **60** | 887 B ✓ | `run_pipeline` (same) |
+| Phase 4f (2,781-char CLAUDE.md) | 600 s timeout | — | 64 | 0 B ✗ | `run_pipeline` (same) |
+
+Monotonic across doses: **more prompt-level tool advertising →
+more exploration cost → no chaining gain**. Agent used only
+`run_pipeline` at every dose; extra prose advertising the other tools
+increased Grep/Read/Bash exploration (40 → 60 → 64 calls) without ever
+triggering a chained tool use. The 134-char dose nearly doubled the
+cost for the same correct patch; the 2,781-char dose tipped into
+timeout.
+
+The mechanism is almost certainly that the MCP `tools/list` event at
+session init already surfaces all tools; prose restatement adds
+nothing the model needs and measurably distracts it. Reverted the
+134-char line; left a code comment flagging the empirical finding so
+future maintainers don't re-add it.
+
+**Reference baseline for future ranking work** (now firmly supported
+by three experiments): v1.7 + #67 (reverse-expand) + `SymbolKind::Import`
+filter + `--nudge 5b`, **without** `--inject-claude-md` and **without**
+any tool-advertising prose. 279 s / $0.95 / correct 582 B patch on
+sympy-21379. Measure any new approach against this number.
 
 ### Harness / measurement infrastructure — stable baseline
 

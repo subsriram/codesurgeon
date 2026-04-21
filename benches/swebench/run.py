@@ -100,6 +100,15 @@ otherwise paraphrase out of `task`. The capsule typically returns in
 under 200ms and replaces 5–10 exploratory tool calls. Only after you
 have the capsule should you start opening files with Read.
 """
+# NOTE (Phase 4g, 2026-04-21): a 134-char line advertising
+# `get_impact_graph` / `get_skeleton` / `search_logic_flow` was added
+# here and empirically regressed sympy-21379 from $0.95/279s/582B to
+# $1.73/479s/887B. The agent still only used `run_pipeline` (same as
+# baseline) but made 50% more exploratory Grep/Read/Bash calls. Prompt-
+# level tool advertising monotonically increased cost across doses
+# (0 chars, 134 chars, 2,781 chars from CLAUDE.md) without ever
+# triggering chained tool use. Do not add tool-advertising prose here;
+# the MCP `tools/list` init event already surfaces tool availability.
 
 TREATMENT_NUDGE_5C = """\
 
