@@ -149,14 +149,24 @@ through summarization. See `docs/explicit-symbol-anchors.md` §v1.7.
   `exp`, or `symbols` skip this stage entirely.
 - For each seed, BFS walks **incoming edges** (`CodeGraph::dependents` —
   callers, importers, raisers) up to `REVERSE_EXPAND_MAX_DEPTH = 3` hops.
-- Per-hop expansion is capped at `REVERSE_EXPAND_FAN_OUT = 5`. Within a hop,
-  callers are ranked by **query-term overlap** in name/fqn, lightly
-  penalized by centrality so utility hubs don't crowd out specific leaf
-  callers.
+- Per-hop expansion uses a **density-scaled** fan-out (issue #69):
+  `min(REVERSE_EXPAND_FAN_OUT_CAP = 25, max(REVERSE_EXPAND_FAN_OUT = 5,
+  callers / REVERSE_EXPAND_FAN_OUT_DIVISOR = 5))`. Sparse hops stay at the
+  floor of 5; dense hops (a core exception class with dozens of direct
+  raisers) widen the beam so a low-centrality target on a query-aligned
+  chain isn't lost to the top-5 filter. With divisor=5: 25 callers → 5,
+  50 → 10, 100 → 20, ≥125 → 25 (cap).
+- Within a hop, callers are ranked by **weighted query-term overlap**:
+  each term contributes once at its highest-weight field — name (1.0),
+  fqn (0.7), signature (0.5), docstring (0.3). Symbols whose name doesn't
+  match the query but whose signature or docstring semantically does
+  (common on utility callers in sympy-core, django-db) still surface.
+  Centrality is applied as a light penalty so hubs don't crowd out
+  specific leaf callers on ties.
 - Seeds with more than `REVERSE_EXPAND_SEED_MAX_CALLERS = 500` direct
   callers are skipped — their reverse set is too broad to rank usefully
   (e.g. a language-wide base exception class in a huge codebase).
-- Total candidates capped at `REVERSE_EXPAND_CANDIDATES = 20`.
+- Total candidates capped at `REVERSE_EXPAND_CANDIDATES = 40`.
 - Gated by `EngineConfig::reverse_expand_anchors` (default `true`). Set to
   `false` to restore pre-#67 behaviour for A/B measurement.
 
@@ -167,13 +177,17 @@ type. BM25, ANN, and graph-forward expansion all stop at direct neighbors
 of the error class; they never surface a fix site 3 hops upstream. See
 sympy-21379 evidence in the issue.
 
-**Why the fan-out cap is safe:** depth-3 walk with fan-out 5 explores at
-most `5 + 25 + 125 = 155` nodes — the total output is then hard-capped at
-20, so the RRF fusion never sees more than a small candidate set.
-Per-hop ranking by term overlap picks the callers most relevant to the
-task, which for the sympy-21379 case includes `parallel_poly_from_expr`
-(name contains the query term "poly") and routes the walk through the
-intended chain.
+**Why the fan-out cap is safe:** depth-3 walk at the density ceiling of 25
+explores at most `25 + 625 + 15625 ≈ 16K` graph-edge visits in the worst
+case, but the total output is hard-capped at `REVERSE_EXPAND_CANDIDATES
+= 40`, so the RRF fusion never sees more than a small candidate set.
+Per-hop ranking by weighted term overlap picks the callers most relevant
+to the task, which for the sympy-21379 case includes
+`parallel_poly_from_expr` (name contains the query term "poly") and
+routes the walk through the intended chain. Issue #69 raised the cap
+from a uniform 5 because on dense-graph targets (sympy-core, django-db)
+the beam was too narrow — the fix site was routinely outside the
+5 × 5 × 5 = 125-node walk.
 
 **Reverse-expanded candidates participate in v1.6 file-diversity pinning**
 alongside direct anchors — a walked caller in an otherwise-uncontested
@@ -426,8 +440,10 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | RRF k (explicit anchors) | 15 | `ranking.rs:ANCHOR_RRF_K` |
 | RRF k (reverse expansion) | 30 | `ranking.rs:REVERSE_EXPAND_RRF_K` |
 | Reverse-expansion max depth | 3 | `ranking.rs:REVERSE_EXPAND_MAX_DEPTH` |
-| Reverse-expansion fan-out per hop | 5 | `ranking.rs:REVERSE_EXPAND_FAN_OUT` |
-| Reverse-expansion candidate cap | 20 | `ranking.rs:REVERSE_EXPAND_CANDIDATES` |
+| Reverse-expansion fan-out floor | 5 | `ranking.rs:REVERSE_EXPAND_FAN_OUT` |
+| Reverse-expansion fan-out cap | 25 | `ranking.rs:REVERSE_EXPAND_FAN_OUT_CAP` |
+| Reverse-expansion density divisor | 5 | `ranking.rs:REVERSE_EXPAND_FAN_OUT_DIVISOR` |
+| Reverse-expansion candidate cap | 40 | `ranking.rs:REVERSE_EXPAND_CANDIDATES` |
 | Reverse-expansion seed max callers | 500 | `ranking.rs:REVERSE_EXPAND_SEED_MAX_CALLERS` |
 | Structural injection cap | `max_pivots * 2` = 16 | `engine.rs:inject_structural_candidates` |
 | Injected candidate score | `family_in_degree * 5.0` | `engine.rs:inject_structural_candidates` |
