@@ -22,9 +22,8 @@ use crate::ranking::{
     reverse_expand_from_anchors, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES,
     ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME,
     ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS,
-    REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT, REVERSE_EXPAND_FAN_OUT_CAP,
-    REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
-    STUB_SCORE_WEIGHT,
+    REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT, REVERSE_EXPAND_MAX_DEPTH,
+    REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2500,16 +2499,14 @@ impl CoreEngine {
                     &terms,
                     REVERSE_EXPAND_MAX_DEPTH,
                     REVERSE_EXPAND_FAN_OUT,
-                    REVERSE_EXPAND_FAN_OUT_CAP,
                     REVERSE_EXPAND_CANDIDATES,
                 );
                 tracing::debug!(
-                    "reverse-expand: {} seeds → {} candidates (depth={}, fan_out={}..{})",
+                    "reverse-expand: {} seeds → {} candidates (depth={}, fan_out={})",
                     seed_ids.len(),
                     out.len(),
                     REVERSE_EXPAND_MAX_DEPTH,
-                    REVERSE_EXPAND_FAN_OUT,
-                    REVERSE_EXPAND_FAN_OUT_CAP
+                    REVERSE_EXPAND_FAN_OUT
                 );
                 out
             }

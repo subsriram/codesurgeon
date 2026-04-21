@@ -52,26 +52,13 @@ pub(crate) const ANCHOR_FILE_BUDGET: usize = 5;
 /// 3 is the tightest depth that covers the motivating sympy-21379 case
 /// (`PolynomialError ← parallel_poly_from_expr ← gcd ← Mod.eval`).
 pub(crate) const REVERSE_EXPAND_MAX_DEPTH: u32 = 3;
-/// Minimum per-hop cap on the number of callers expanded. Within a hop,
-/// selection is driven by term overlap with the query; this is the floor
-/// for sparse nodes. For dense nodes the effective fan-out grows with
-/// `REVERSE_EXPAND_FAN_OUT_DIVISOR`, capped by `REVERSE_EXPAND_FAN_OUT_CAP`.
+/// Per-hop cap on the number of callers expanded. Prevents exponential blowup
+/// when walking from an exception class that's imported/raised in hundreds of
+/// sites. Selection within a hop is driven by term overlap with the query.
 pub(crate) const REVERSE_EXPAND_FAN_OUT: usize = 5;
-/// Upper bound on the per-hop fan-out after density scaling. Prevents
-/// exponential blowup on very dense nodes — walking all 500 raisers of a
-/// core exception class would flood the capsule regardless of ranking.
-pub(crate) const REVERSE_EXPAND_FAN_OUT_CAP: usize = 25;
-/// Density divisor: effective fan-out grows as `callers / divisor`, floored
-/// at `REVERSE_EXPAND_FAN_OUT` and capped at `REVERSE_EXPAND_FAN_OUT_CAP`.
-/// With divisor=5: 25 callers → 5 (floor), 50 → 10, 100 → 20, ≥125 → 25 (cap).
-/// Addresses issue #69: on dense-graph targets (sympy-core, django-db) the
-/// fix site was routinely outside a uniform-5 beam.
-pub(crate) const REVERSE_EXPAND_FAN_OUT_DIVISOR: usize = 5;
-/// Overall cap on the reverse-expansion candidate list. Doubled from the
-/// pre-#69 value of 20 so density-scaled walks can actually surface more
-/// candidates; the RRF fusion downweights them by `REVERSE_EXPAND_RRF_K`
-/// so extra candidates don't overwhelm direct-anchor hits.
-pub(crate) const REVERSE_EXPAND_CANDIDATES: usize = 40;
+/// Overall cap on the reverse-expansion candidate list. Mirrors
+/// `ANCHOR_CANDIDATES` — the walk is precision-first, not recall-first.
+pub(crate) const REVERSE_EXPAND_CANDIDATES: usize = 20;
 /// RRF k for the reverse-expansion list. Sits between `ANCHOR_RRF_K = 15`
 /// (aggressive, precision-first) and `RRF_K = 60` (default): seeds-reachable
 /// symbols contribute meaningfully without overwhelming direct-anchor hits.
@@ -163,14 +150,9 @@ pub(crate) fn is_reverse_expand_seed(sym: &Symbol) -> bool {
 /// BFS reverse walk from `seed_ids` through incoming edges (`dependents`).
 ///
 /// Returns `(id, score)` pairs where earlier hops score higher (`1 / (depth + 1)`).
-/// Within a hop, callers are ranked by query-term overlap weighted across
-/// name / fqn / signature / docstring (in decreasing weight), lightly
-/// penalized by centrality so utility hubs don't crowd out the intended
-/// fix sites. Per-hop expansion is capped at a density-scaled effective
-/// fan-out: `min(fan_out_cap, max(fan_out, callers / REVERSE_EXPAND_FAN_OUT_DIVISOR))`.
-/// On dense nodes (an exception class with dozens of direct raisers) this
-/// gives the walk a wider beam so the target chain isn't lost to the
-/// top-5 filter at every hop (issue #69).
+/// Within a hop, callers are ranked by query-term overlap in their name/fqn,
+/// lightly penalized by centrality so utility hubs don't crowd out the
+/// intended fix sites. Per-hop expansion is capped at `fan_out`.
 ///
 /// `query_terms` is the already-tokenised, lowercased list of task+context
 /// terms. An empty list still walks the graph, it just selects by centrality.
@@ -182,7 +164,6 @@ pub(crate) fn reverse_expand_from_anchors(
     query_terms: &[String],
     max_depth: u32,
     fan_out: usize,
-    fan_out_cap: usize,
     max_total: usize,
 ) -> Vec<(u64, f32)> {
     use std::collections::VecDeque;
@@ -204,39 +185,37 @@ pub(crate) fn reverse_expand_from_anchors(
             continue;
         }
 
-        // Score each caller: weighted query-term overlap across name / fqn /
-        // signature / docstring (each term contributes once at its
-        // highest-weight field), minus a small centrality penalty so top-K
-        // favours specific leaf callers over generic utility hubs on ties.
+        // Score each caller: +1 per query-term hit in name/fqn, minus a small
+        // centrality penalty so top-K favours specific leaf callers over
+        // generic utility hubs when term overlap ties.
         //
-        // Filter out `SymbolKind::Import` entries. These are indexed import
-        // statements like `from sympy.polys import (Poly, PolynomialError,
-        // gcd, …)` whose FQN / name / body all contain many query terms
-        // by coincidence of listing symbols the query also mentions. They
-        // dominate `term_overlap_score` despite having no body, no edges,
-        // and no behaviour. Promoting them into pivots (via RRF + v1.6
-        // pinning) sent the agent into unrelated files and timed out the
-        // sympy-21379 run that prior versions completed. Skip them.
+        // Filter out `SymbolKind::Import` entries (retained after the #69
+        // revert — the problem existed at #67 too, just less visible). Import
+        // statement symbols have no body, no callees beyond the imported
+        // names, and no agent-useful content; when they win pivot slots
+        // they push the agent into unrelated files.
         let mut scored: Vec<(u64, f32)> = dependents
             .iter()
             .filter(|s| !s.is_stub)
             .filter(|s| s.kind != SymbolKind::Import)
             .filter(|s| !visited.contains(&s.id))
             .map(|s| {
-                let overlap = term_overlap_score(s, query_terms);
+                let name_lower = s.name.to_lowercase();
+                let fqn_lower = s.fqn.to_lowercase();
+                let overlap = query_terms
+                    .iter()
+                    .filter(|t| {
+                        let t = t.as_str();
+                        name_lower.contains(t) || fqn_lower.contains(t)
+                    })
+                    .count() as f32;
                 let centrality = graph.centrality_score(s.id);
                 (s.id, overlap - centrality * 0.1)
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Density-aware fan-out: dense nodes get a wider beam so the target
-        // chain isn't lost to a uniform top-N filter (issue #69). Sparse
-        // nodes still use the base `fan_out` floor.
-        let effective_fan_out =
-            fan_out_cap.min(fan_out.max(dependents.len() / REVERSE_EXPAND_FAN_OUT_DIVISOR));
-
-        for (cid, _) in scored.into_iter().take(effective_fan_out) {
+        for (cid, _) in scored.into_iter().take(fan_out) {
             if visited.insert(cid) {
                 let score = 1.0 / (depth as f32 + 2.0);
                 out.push((cid, score));
@@ -248,44 +227,6 @@ pub(crate) fn reverse_expand_from_anchors(
         }
     }
     out
-}
-
-/// Weighted query-term overlap: each term contributes once at its highest-
-/// weight field (name > fqn > signature > docstring). Name hits are the
-/// strongest signal (the caller is literally named after a query concept);
-/// fqn hits cover path components; signature and docstring hits cover
-/// semantic-relevance cases where the caller's role matches the task but
-/// its name doesn't (issue #69, where `Mod.eval`-adjacent callers have
-/// query-relevant docstrings / arg names but generic function names).
-fn term_overlap_score(s: &Symbol, query_terms: &[String]) -> f32 {
-    if query_terms.is_empty() {
-        return 0.0;
-    }
-    let name_lower = s.name.to_lowercase();
-    let fqn_lower = s.fqn.to_lowercase();
-    let sig_lower = s.signature.to_lowercase();
-    let doc_lower = s
-        .docstring
-        .as_deref()
-        .map(str::to_lowercase)
-        .unwrap_or_default();
-    query_terms
-        .iter()
-        .map(|t| {
-            let t = t.as_str();
-            if name_lower.contains(t) {
-                1.0
-            } else if fqn_lower.contains(t) {
-                0.7
-            } else if sig_lower.contains(t) {
-                0.5
-            } else if doc_lower.contains(t) {
-                0.3
-            } else {
-                0.0
-            }
-        })
-        .sum()
 }
 
 /// Split a free-text query into lowercase term tokens usable by

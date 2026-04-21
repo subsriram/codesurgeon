@@ -197,92 +197,14 @@ fn feature_flag_respected() {
     );
 }
 
-/// Dense-graph regression (issue #69): on a seed with 50+ direct callers,
-/// a query-term-aligned chain reachable only via docstring / signature
-/// context (not name overlap) should still surface. Before the query-aware
-/// scoring fix, the walk ranked purely on name/fqn overlap — when the chain
-/// caller had a generic name the top-5 filter at hop 1 would usually lose
-/// it to one of the 50 distractors.
-#[test]
-fn dense_graph_reverse_expand_surfaces_target() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // Exception class with 55 generic distractor raisers (no query term
-    // match on name/fqn, no docstring).
-    std::fs::write(
-        dir.path().join("baseerr.py"),
-        "class BaseError(Exception):\n    pass\n",
-    )
-    .unwrap();
-    let mut distractors = String::from("from baseerr import BaseError\n\n");
-    for i in 0..55 {
-        distractors.push_str(&format!(
-            "def handler_{i}():\n    raise BaseError(\"x\")\n\n",
-            i = i
-        ));
-    }
-    std::fs::write(dir.path().join("distractors.py"), distractors).unwrap();
-
-    // Target chain: direct raiser has a docstring that matches the query
-    // ("serialization") but its name is generic — tests the docstring /
-    // signature arm of `term_overlap_score`. The deep target is 1 hop
-    // further up the chain.
-    std::fs::write(
-        dir.path().join("chain_raiser.py"),
-        "from baseerr import BaseError\n\n\
-         def generic_dispatch_fn():\n    \
-             \"\"\"serialization entry for the chain\"\"\"\n    \
-             raise BaseError(\"boom\")\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("chain_target.py"),
-        "from chain_raiser import generic_dispatch_fn\n\n\
-         def deep_serialization_target():\n    generic_dispatch_fn()\n",
-    )
-    .unwrap();
-
-    // Larger pivot budget so dense reverse-expand has room to surface both
-    // the hop-1 chain caller and the hop-2 deep target alongside BM25
-    // matches for the 55 distractors.
-    let e = engine_for(&dir, true, 8);
-    e.index_workspace().expect("index");
-
-    let out = e
-        .run_pipeline(
-            "fix BaseError during serialization",
-            Some(16000),
-            None,
-            None,
-        )
-        .expect("run_pipeline");
-
-    // Per issue #69 acceptance criterion: the deep target needs to be
-    // *present* in the capsule (pivot, adjacent, or skeleton) so the agent
-    // doesn't have to guess-grep. Check the whole capsule body, not just
-    // pivots — reverse-expand candidates can land in any of these slots
-    // depending on RRF fusion and file-diversity pinning.
-    assert!(
-        out.contains("deep_serialization_target"),
-        "expected dense-graph reverse-expand to surface the deep target (issue #69); pivots were {:?}\n\n{}",
-        pivot_fqns(&out),
-        out
-    );
-}
-
 /// `from ... import (ErrorType, other, ...)` statements are indexed as
-/// `SymbolKind::Import`. Under reverse-expand's query-aware ranking they
-/// were scoring highly (their FQN / name literally list the user's
-/// query terms) and leaking into the candidate pool. That regressed
-/// `sympy__sympy-21379` from a 290-s success to a 600-s timeout — the
-/// agent chased import lines into unrelated files and never found the
-/// fix site.
-///
-/// Verification strategy: toggle `reverse_expand_anchors` on/off against
-/// the same fixture. Pre-fix, reverse-expand contributed `Import` kind
-/// candidates that won pivot slots via RRF fusion. Post-fix, the two
-/// capsules should be identical in pivot set (the reverse-expand walk
-/// still runs, it just filters out Imports before scoring).
+/// `SymbolKind::Import`. Under reverse-expand's candidate scoring they
+/// score highly (their FQN / name literally list the query terms) and
+/// can leak into the pivot pool. The motivating regression was seen on
+/// `sympy__sympy-21379` where bare import lines from `sympy/__init__.py`
+/// won pivot slots and sent the agent into unrelated files until it
+/// timed out. Filter drops `SymbolKind::Import` from reverse-expand
+/// candidates and from pivot eligibility in general.
 #[test]
 fn reverse_expand_does_not_surface_import_statements() {
     let dir = tempfile::tempdir().unwrap();
