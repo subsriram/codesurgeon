@@ -208,9 +208,19 @@ pub(crate) fn reverse_expand_from_anchors(
         // signature / docstring (each term contributes once at its
         // highest-weight field), minus a small centrality penalty so top-K
         // favours specific leaf callers over generic utility hubs on ties.
+        //
+        // Filter out `SymbolKind::Import` entries. These are indexed import
+        // statements like `from sympy.polys import (Poly, PolynomialError,
+        // gcd, …)` whose FQN / name / body all contain many query terms
+        // by coincidence of listing symbols the query also mentions. They
+        // dominate `term_overlap_score` despite having no body, no edges,
+        // and no behaviour. Promoting them into pivots (via RRF + v1.6
+        // pinning) sent the agent into unrelated files and timed out the
+        // sympy-21379 run that prior versions completed. Skip them.
         let mut scored: Vec<(u64, f32)> = dependents
             .iter()
             .filter(|s| !s.is_stub)
+            .filter(|s| s.kind != SymbolKind::Import)
             .filter(|s| !visited.contains(&s.id))
             .map(|s| {
                 let overlap = term_overlap_score(s, query_terms);

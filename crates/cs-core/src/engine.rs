@@ -2628,6 +2628,25 @@ impl CoreEngine {
         //
         // Phase 2: fill remaining slots from the centrality-ranked RRF fusion,
         // skipping anything already pinned. See docs/explicit-symbol-anchors.md.
+        //
+        // `is_eligible_pivot` filters out symbols that carry no behaviour
+        // worth putting in a pivot slot:
+        //   - `is_stub`: external references, no body.
+        //   - `SymbolKind::Import`: `from X import (A, B, C)` statement
+        //     lines. Their FQN / body textually contain query terms (the
+        //     names they re-export), so BM25 and query-aware reverse-expand
+        //     score them highly — but they have no behaviour, no callees
+        //     beyond the imported names, and no agent-useful content. When
+        //     they win pivot slots they push the agent into unrelated
+        //     files. Regressed sympy-21379 from 290 s success to 600 s
+        //     timeout before this filter landed.
+        let is_eligible_pivot = |id: u64| -> bool {
+            graph
+                .get_symbol(id)
+                .map(|s| !s.is_stub && s.kind != crate::symbol::SymbolKind::Import)
+                .unwrap_or(false)
+        };
+
         let pinning_candidates: Vec<(u64, f32)> = anchor_results
             .iter()
             .copied()
@@ -2635,10 +2654,10 @@ impl CoreEngine {
             .collect();
         let mut anchor_by_file: HashMap<String, Vec<u64>> = HashMap::new();
         for (id, _) in &pinning_candidates {
+            if !is_eligible_pivot(*id) {
+                continue;
+            }
             if let Some(sym) = graph.get_symbol(*id) {
-                if sym.is_stub {
-                    continue;
-                }
                 anchor_by_file
                     .entry(sym.file_path.clone())
                     .or_default()
@@ -2652,12 +2671,12 @@ impl CoreEngine {
             if pinned.len() >= ANCHOR_FILE_BUDGET.min(max_pivots) {
                 break;
             }
+            if !is_eligible_pivot(*id) {
+                continue;
+            }
             let Some(sym) = graph.get_symbol(*id) else {
                 continue;
             };
-            if sym.is_stub {
-                continue;
-            }
             if pinned_files_in_order.contains(&sym.file_path) {
                 continue;
             }
@@ -2679,7 +2698,7 @@ impl CoreEngine {
         let rrf_fill: Vec<u64> = scored
             .iter()
             .filter(|(id, _)| !pinned_set.contains(id))
-            .filter(|(id, _)| !graph.get_symbol(*id).map(|s| s.is_stub).unwrap_or(false))
+            .filter(|(id, _)| is_eligible_pivot(*id))
             .take(pivot_slots)
             .map(|(id, _)| *id)
             .collect();

@@ -269,3 +269,78 @@ fn dense_graph_reverse_expand_surfaces_target() {
         out
     );
 }
+
+/// `from ... import (ErrorType, other, ...)` statements are indexed as
+/// `SymbolKind::Import`. Under reverse-expand's query-aware ranking they
+/// were scoring highly (their FQN / name literally list the user's
+/// query terms) and leaking into the candidate pool. That regressed
+/// `sympy__sympy-21379` from a 290-s success to a 600-s timeout — the
+/// agent chased import lines into unrelated files and never found the
+/// fix site.
+///
+/// Verification strategy: toggle `reverse_expand_anchors` on/off against
+/// the same fixture. Pre-fix, reverse-expand contributed `Import` kind
+/// candidates that won pivot slots via RRF fusion. Post-fix, the two
+/// capsules should be identical in pivot set (the reverse-expand walk
+/// still runs, it just filters out Imports before scoring).
+#[test]
+fn reverse_expand_does_not_surface_import_statements() {
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        dir.path().join("err.py"),
+        "class DeepError(Exception):\n    pass\n",
+    )
+    .unwrap();
+
+    // One behaviour-carrying caller of DeepError.
+    std::fs::write(
+        dir.path().join("fix_site.py"),
+        "from err import DeepError\n\n\
+         def run_the_pipeline():\n\
+         \x20   raise DeepError(\"boom\")\n",
+    )
+    .unwrap();
+
+    // Re-export shims: files whose only content is `from err import DeepError`.
+    // Pre-fix, reverse-expand walked from DeepError up through these imports
+    // and they won pivot slots because their FQN literally contains "DeepError".
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("shim_{i}.py")),
+            "from err import DeepError\n",
+        )
+        .unwrap();
+    }
+
+    let e = engine_for(&dir, true, 8);
+    e.index_workspace().expect("index");
+
+    let out = e
+        .run_pipeline("fix DeepError", Some(16000), None, None)
+        .expect("run_pipeline");
+    let pivots = pivot_fqns(&out);
+
+    // The real caller (reached by reverse-expand through the raise edge)
+    // must be present.
+    assert!(
+        out.contains("run_the_pipeline"),
+        "expected the behaviour-carrying caller to surface; pivots: {:?}\n\n{}",
+        pivots,
+        out
+    );
+
+    // No pivot FQN should be an import statement. Reverse-expand is the
+    // only path that could reach these (no BM25 overlap with the
+    // single-token query "fix DeepError"), so filtering `SymbolKind::Import`
+    // in reverse_expand_from_anchors is load-bearing.
+    for p in &pivots {
+        let tail = p.rsplit("::").next().unwrap_or(p);
+        assert!(
+            !tail.starts_with("from ") && !tail.starts_with("import "),
+            "import-statement symbol leaked into pivots: {:?}\n\nfull output:\n{}",
+            p,
+            out
+        );
+    }
+}
