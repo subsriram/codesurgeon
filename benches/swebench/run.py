@@ -384,7 +384,7 @@ def extract_token_stats(claude_json: dict) -> dict[str, int | float | None]:
     }
 
 
-def capture_diff(workdir: Path) -> str:
+def capture_diff(workdir: Path, exclude_claude_md: bool = False) -> str:
     """Return the uncommitted changes as a unified diff.
 
     Excludes ``.codesurgeon/`` because the pre-index step writes the
@@ -394,9 +394,18 @@ def capture_diff(workdir: Path) -> str:
     and even if it didn't, a stray cache dir in the patched repo is
     poison for test stability.
 
+    When ``exclude_claude_md`` is True (set by the harness when it
+    injected a CLAUDE.md into the workdir via ``--inject-claude-md``),
+    also excludes ``CLAUDE.md`` at the workdir root. Without this, a
+    run that times out before the agent made any real edits still
+    produces a non-empty diff (just the harness-written CLAUDE.md),
+    which is a false positive. Note this also hides agent edits to an
+    upstream-shipped CLAUDE.md, which swebench evaluation does not test
+    for, so the trade-off is acceptable.
+
     The ``git add -N .`` makes untracked files visible to ``git diff``
     so new source files the agent creates show up; the pathspec
-    exclusion keeps ``.codesurgeon/`` out regardless.
+    exclusions keep harness-owned paths out regardless.
     """
     subprocess.run(
         ["git", "add", "-N", "."],
@@ -404,8 +413,11 @@ def capture_diff(workdir: Path) -> str:
         check=False,
         capture_output=True,
     )
+    pathspecs = [".", ":(exclude).codesurgeon"]
+    if exclude_claude_md:
+        pathspecs.append(":(exclude)CLAUDE.md")
     result = subprocess.run(
-        ["git", "diff", "--no-color", "--", ".", ":(exclude).codesurgeon"],
+        ["git", "diff", "--no-color", "--", *pathspecs],
         cwd=workdir,
         check=False,
         capture_output=True,
@@ -628,10 +640,19 @@ def run_one(
             stdout = proc.stdout
             stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
             err_msg = None if exit_code == 0 else f"exit={exit_code}; stderr-tail={stderr_tail}"
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            # Preserve whatever was captured before the kill so the partial
+            # stream (stream-json mode) can be inspected post-mortem —
+            # otherwise a timed-out run is a total black box. `text=True`
+            # on subprocess.run means e.stdout/e.stderr are str or None.
             exit_code = -2
-            stdout = ""
-            err_msg = f"timeout after {timeout_s}s"
+            stdout = e.stdout or ""
+            partial_stderr = e.stderr or ""
+            stderr_tail = partial_stderr[-2000:]
+            err_msg = (
+                f"timeout after {timeout_s}s "
+                f"(captured {len(stdout)} B stdout, {len(partial_stderr)} B stderr)"
+            )
         walltime = time.monotonic() - t0
 
         # 4. Capture artifacts (diff + raw claude json) into results_dir for
@@ -650,7 +671,7 @@ def run_one(
             claude_json_path = artifact_base / artifact_name
             claude_json_path.write_text(stdout)
 
-        diff = capture_diff(workdir)
+        diff = capture_diff(workdir, exclude_claude_md=injected_claude_md is not None)
         diff_path: Path | None = None
         if diff:
             diff_path = artifact_base / "patch.diff"
