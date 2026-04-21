@@ -40,6 +40,36 @@ pub(crate) const ANCHOR_FUZZY_PROBE: usize = 20;
 /// from the BM25/ANN/graph RRF fusion. See docs/explicit-symbol-anchors.md.
 pub(crate) const ANCHOR_FILE_BUDGET: usize = 5;
 
+// ── Reverse-edge expansion (issue #67) ───────────────────────────────────────
+//
+// For symptom-anchored bug reports the user names the error class or a trigger
+// symbol, but the fix site is reached only by walking **backward** through
+// callers. Reverse expansion seeds on exception-class anchors and BFS-walks
+// their callers/raisers up to `REVERSE_EXPAND_MAX_DEPTH` hops, injecting the
+// walk results into the RRF fusion alongside the direct anchor list.
+
+/// Max hops to BFS backward through `dependents()` from each seed anchor.
+/// 3 is the tightest depth that covers the motivating sympy-21379 case
+/// (`PolynomialError ← parallel_poly_from_expr ← gcd ← Mod.eval`).
+pub(crate) const REVERSE_EXPAND_MAX_DEPTH: u32 = 3;
+/// Per-hop cap on the number of callers expanded. Prevents exponential blowup
+/// when walking from an exception class that's imported/raised in hundreds of
+/// sites. Selection within a hop is driven by term overlap with the query.
+pub(crate) const REVERSE_EXPAND_FAN_OUT: usize = 5;
+/// Overall cap on the reverse-expansion candidate list. Mirrors
+/// `ANCHOR_CANDIDATES` — the walk is precision-first, not recall-first.
+pub(crate) const REVERSE_EXPAND_CANDIDATES: usize = 20;
+/// RRF k for the reverse-expansion list. Sits between `ANCHOR_RRF_K = 15`
+/// (aggressive, precision-first) and `RRF_K = 60` (default): seeds-reachable
+/// symbols contribute meaningfully without overwhelming direct-anchor hits.
+pub(crate) const REVERSE_EXPAND_RRF_K: f32 = 30.0;
+/// Upper bound on a seed's direct-caller count. Anchors with more callers are
+/// skipped — they're hubs (e.g. `exp`, `symbols`) whose reverse set would
+/// flood the capsule. Exception classes in real codebases typically have
+/// dozens-to-low-hundreds of raisers; this caps the seed set but the per-hop
+/// `REVERSE_EXPAND_FAN_OUT` still bounds each walk.
+pub(crate) const REVERSE_EXPAND_SEED_MAX_CALLERS: usize = 500;
+
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 
 /// RRF rank fusion constant (k=60 from the original paper).
@@ -92,6 +122,115 @@ pub(crate) fn rrf_merge_ks(lists: &[(&[(u64, f32)], f32)]) -> Vec<(u64, f32)> {
     let mut merged: Vec<(u64, f32)> = scores.into_iter().collect();
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     merged
+}
+
+/// Classify a symbol as a reverse-expansion seed.
+///
+/// Seeds are anchors whose callers we want to walk backward from. The current
+/// heuristic fires on **exception/error/warning classes** — the case that
+/// motivated issue #67, where the problem statement names the exception but
+/// the fix site is reachable only through its raisers.
+///
+/// Narrower than "any type" on purpose: walking callers of a generic class
+/// like `dict` or `Config` would flood the capsule. Name-suffix classifi-
+/// cation is cheap, language-agnostic (Python / Rust / Java / Swift all use
+/// `Error`/`Exception`/`Warning` suffixes by convention), and correctly
+/// skips anchors like `exp` or `symbols` in the sympy-21379 reproducer.
+pub(crate) fn is_reverse_expand_seed(sym: &Symbol) -> bool {
+    if sym.is_stub {
+        return false;
+    }
+    if !sym.kind.is_type_definition() {
+        return false;
+    }
+    let name = sym.name.as_str();
+    name.ends_with("Error") || name.ends_with("Exception") || name.ends_with("Warning")
+}
+
+/// BFS reverse walk from `seed_ids` through incoming edges (`dependents`).
+///
+/// Returns `(id, score)` pairs where earlier hops score higher (`1 / (depth + 1)`).
+/// Within a hop, callers are ranked by query-term overlap in their name/fqn,
+/// lightly penalized by centrality so utility hubs don't crowd out the
+/// intended fix sites. Per-hop expansion is capped at `fan_out`.
+///
+/// `query_terms` is the already-tokenised, lowercased list of task+context
+/// terms. An empty list still walks the graph, it just selects by centrality.
+///
+/// The return order is BFS order (depth-ascending), preserved for RRF.
+pub(crate) fn reverse_expand_from_anchors(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    fan_out: usize,
+    max_total: usize,
+) -> Vec<(u64, f32)> {
+    use std::collections::VecDeque;
+
+    if max_depth == 0 || fan_out == 0 || max_total == 0 || seed_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
+    let mut out: Vec<(u64, f32)> = Vec::new();
+    let mut queue: VecDeque<(u64, u32)> = seed_ids.iter().map(|&id| (id, 0)).collect();
+
+    while let Some((id, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let dependents = graph.dependents(id);
+        if dependents.is_empty() {
+            continue;
+        }
+
+        // Score each caller: +1 per query-term hit in name/fqn, minus a small
+        // centrality penalty so top-K favours specific leaf callers over
+        // generic utility hubs when term overlap ties.
+        let mut scored: Vec<(u64, f32)> = dependents
+            .iter()
+            .filter(|s| !s.is_stub)
+            .filter(|s| !visited.contains(&s.id))
+            .map(|s| {
+                let name_lower = s.name.to_lowercase();
+                let fqn_lower = s.fqn.to_lowercase();
+                let overlap = query_terms
+                    .iter()
+                    .filter(|t| {
+                        let t = t.as_str();
+                        name_lower.contains(t) || fqn_lower.contains(t)
+                    })
+                    .count() as f32;
+                let centrality = graph.centrality_score(s.id);
+                (s.id, overlap - centrality * 0.1)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (cid, _) in scored.into_iter().take(fan_out) {
+            if visited.insert(cid) {
+                let score = 1.0 / (depth as f32 + 2.0);
+                out.push((cid, score));
+                if out.len() >= max_total {
+                    return out;
+                }
+                queue.push_back((cid, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// Split a free-text query into lowercase term tokens usable by
+/// `reverse_expand_from_anchors`. Mirrors the rest of the ranking pipeline:
+/// split on non-alphanumerics, drop short tokens, lowercase.
+pub(crate) fn query_terms_for_reverse_expand(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_lowercase())
+        .collect()
 }
 
 /// Expand 1-hop graph neighbors of BM25 seed IDs, ranked by centrality.

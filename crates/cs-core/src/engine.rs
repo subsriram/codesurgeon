@@ -18,9 +18,12 @@ use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    resolve_adjacents, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET,
-    ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST,
-    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
+    is_reverse_expand_seed, query_terms_for_reverse_expand, resolve_adjacents,
+    reverse_expand_from_anchors, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES,
+    ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME,
+    ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS,
+    REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT, REVERSE_EXPAND_MAX_DEPTH,
+    REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -131,6 +134,13 @@ pub struct EngineConfig {
     /// Set via `[observability] token_rate_usd = 0.000003` in `config.toml`.
     /// Default: 0.000003 (Claude Sonnet input pricing).
     pub token_rate_usd: f64,
+
+    /// When true (default), `build_context_capsule` walks callers backward
+    /// from exception-class anchors and injects the walk results into the
+    /// RRF fusion. Surfaces bug sites that are only reachable by following
+    /// the raise-chain from a user-named error class (issue #67). See
+    /// `docs/ranking.md` Stage 1f and `docs/explicit-symbol-anchors.md`.
+    pub reverse_expand_anchors: bool,
 }
 
 /// Controls adjacent-symbol body fraction in context capsules.
@@ -188,6 +198,7 @@ impl EngineConfig {
             track_manifest: false,
             skeleton_detail: SkeletonDetail::default(),
             token_rate_usd: 0.000003,
+            reverse_expand_anchors: true,
         }
     }
 
@@ -2452,10 +2463,62 @@ impl CoreEngine {
             anchor_context.map(|c| c.len()).unwrap_or(0)
         );
 
-        // ANN semantic retrieval + RRF fusion across all four sources.
+        // Stage 1e: reverse-edge expansion from exception-class anchors
+        // (issue #67). For symptom-anchored bug reports the user names the
+        // error type but the fix site is only reachable by walking backward
+        // through callers/raisers. Fires only on anchors classified as
+        // reverse-expand seeds (exception/error/warning type definitions)
+        // so generic anchors like `parse_latex` or `exp` don't trigger a
+        // blowup. Walk is depth- and fan-out-bounded — see ranking.rs
+        // REVERSE_EXPAND_* constants.
+        let reverse_results: Vec<(u64, f32)> = if self.config.reverse_expand_anchors {
+            let graph = self.graph.read();
+            let seed_ids: Vec<u64> = anchor_results
+                .iter()
+                .filter_map(|(id, _)| {
+                    let sym = graph.get_symbol(*id)?;
+                    if !is_reverse_expand_seed(sym) {
+                        return None;
+                    }
+                    // Hub guard: skip seeds with more than
+                    // REVERSE_EXPAND_SEED_MAX_CALLERS direct callers — their
+                    // reverse set is too broad to rank usefully.
+                    if graph.dependents(*id).len() > REVERSE_EXPAND_SEED_MAX_CALLERS {
+                        return None;
+                    }
+                    Some(*id)
+                })
+                .collect();
+            if seed_ids.is_empty() {
+                Vec::new()
+            } else {
+                let terms = query_terms_for_reverse_expand(&anchor_source);
+                let out = reverse_expand_from_anchors(
+                    &graph,
+                    &seed_ids,
+                    &terms,
+                    REVERSE_EXPAND_MAX_DEPTH,
+                    REVERSE_EXPAND_FAN_OUT,
+                    REVERSE_EXPAND_CANDIDATES,
+                );
+                tracing::debug!(
+                    "reverse-expand: {} seeds → {} candidates (depth={}, fan_out={})",
+                    seed_ids.len(),
+                    out.len(),
+                    REVERSE_EXPAND_MAX_DEPTH,
+                    REVERSE_EXPAND_FAN_OUT
+                );
+                out
+            }
+        } else {
+            Vec::new()
+        };
+
+        // ANN semantic retrieval + RRF fusion across all sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
         // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
-        // lost the target to body-field noise.
+        // lost the target to body-field noise. Reverse-expansion sits between
+        // anchors and the default retrievers (`REVERSE_EXPAND_RRF_K`).
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
@@ -2464,6 +2527,7 @@ impl CoreEngine {
                 (&graph_results, RRF_K),
                 (&ann_results, RRF_K),
                 (&anchor_results, ANCHOR_RRF_K),
+                (&reverse_results, REVERSE_EXPAND_RRF_K),
             ])
         };
         #[cfg(not(feature = "embeddings"))]
@@ -2471,6 +2535,7 @@ impl CoreEngine {
             (&bm25_results, RRF_K),
             (&graph_results, RRF_K),
             (&anchor_results, ANCHOR_RRF_K),
+            (&reverse_results, REVERSE_EXPAND_RRF_K),
         ]);
 
         let graph = self.graph.read();
@@ -2553,10 +2618,20 @@ impl CoreEngine {
         // regardless of centrality ranking — bug-site symbols are usually
         // low-centrality and were getting cut by v1.5's RRF-based cap.
         //
+        // Reverse-expansion results (issue #67) participate in the same
+        // file-diversity pass — they represent the same identity-of-user-
+        // intent signal as direct anchors. Direct anchors are iterated first
+        // so they claim file slots before reverse-expanded callers.
+        //
         // Phase 2: fill remaining slots from the centrality-ranked RRF fusion,
         // skipping anything already pinned. See docs/explicit-symbol-anchors.md.
+        let pinning_candidates: Vec<(u64, f32)> = anchor_results
+            .iter()
+            .copied()
+            .chain(reverse_results.iter().copied())
+            .collect();
         let mut anchor_by_file: HashMap<String, Vec<u64>> = HashMap::new();
-        for (id, _) in &anchor_results {
+        for (id, _) in &pinning_candidates {
             if let Some(sym) = graph.get_symbol(*id) {
                 if sym.is_stub {
                     continue;
@@ -2570,7 +2645,7 @@ impl CoreEngine {
 
         let mut pinned: Vec<u64> = Vec::new();
         let mut pinned_files_in_order: Vec<String> = Vec::new();
-        for (id, _) in &anchor_results {
+        for (id, _) in &pinning_candidates {
             if pinned.len() >= ANCHOR_FILE_BUDGET.min(max_pivots) {
                 break;
             }

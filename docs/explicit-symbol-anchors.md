@@ -72,14 +72,14 @@ vs bare-claude's $0.30 / 96 s on the same task.
 
 **Takeaway**: v1.7 closes the agent-paraphrase hole in the anchor
 pipeline, but does not address the "bug site is transitively reached from
-an anchor, not named in the problem" case. The structural fix is the
-out-of-scope item at the bottom of this doc — **reverse-edge expansion
-from error types / exception classes / symptomatic anchors** — which
-`get_impact_graph` already implements for callers but is not wired into
-`run_pipeline`'s capsule assembly. An agent who manually calls
-`get_impact_graph(PolynomialError)` after the first capsule finds `Mod.eval`
-immediately; this is Phase 4's working hypothesis (advertise the chain
-via injected CLAUDE.md).
+an anchor, not named in the problem" case. The structural fix landed as
+**reverse-edge expansion from exception-class anchors** (issue #67,
+`ranking.rs:reverse_expand_from_anchors`) — when an anchor resolves to an
+`Error`/`Exception`/`Warning` type, the capsule assembler now walks its
+callers backward up to 3 hops and fuses the results into RRF. This closes
+the chain automatically: an agent no longer has to manually call
+`get_impact_graph(PolynomialError)` to find `Mod.eval`. See
+`docs/ranking.md` Stage 1d for parameters.
 
 ---
 
@@ -1179,9 +1179,20 @@ Success criteria:
 
 ---
 
+## Landed follow-ups
+
+- **Reverse-edge expansion from error types** — landed via issue #67. When an
+  anchor resolves to an exception/error/warning type definition, the capsule
+  now walks its callers/raisers backward up to 3 hops (fan-out 5 per hop) and
+  fuses those candidates into RRF with `k = 30`. See `docs/ranking.md` Stage
+  1d for parameters and `ranking.rs:reverse_expand_from_anchors` for the
+  walk. Addresses symptom-anchored bug reports where the user names the
+  exception but the fix site is only reachable through the raise chain
+  (motivating case: sympy-21379, `PolynomialError ← parallel_poly_from_expr
+  ← gcd ← Mod.eval`).
+
 ## Out of scope (file follow-ups separately)
 
-- **Reverse-edge expansion from error types** (issue: walk callers/raisers of symbols in the current capsule). Addresses sphinx-9711's `VersionRequirementError → needs_extensions` case *even without anchors*. Complementary, not a substitute.
 - **Path-segment scoring for antonym segments** (`parsing/` vs `printing/`). Anchors solve sympy-21612 directly, but path-segment scoring would catch the generalized case where no API call is quoted.
 - **Short-body function floor** — a symbol whose body is < N tokens should get a bonus based on exact name match to a query token. Overlaps partly with anchors but useful when the user describes the bug without naming the function.
 

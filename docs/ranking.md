@@ -15,6 +15,8 @@ Stage 1: Candidate Retrieval
   ├── BM25 (Tantivy)           top-50 lexical matches
   ├── Graph neighbor expansion top-25 1-hop neighbors of BM25 seeds, by centrality
   ├── Explicit anchors         up to 20 exact symbol-name matches from the query
+  ├── Reverse-edge expansion   up to 20 callers/raisers walked backward (≤3 hops)
+  │                            from exception-class anchors  [issue #67]
   └── Semantic (flat scan)     top-25 semantic nearest neighbors  [embeddings build only]
        └── RRF merge ────────  fused candidate pool
 
@@ -138,7 +140,52 @@ out of the summary" hole in the anchor pipeline — deterministic extraction
 on the server side no longer depends on the agent preserving identifiers
 through summarization. See `docs/explicit-symbol-anchors.md` §v1.7.
 
-### 1d. Semantic retrieval (`engine.rs:ann_candidates`) — embeddings build only
+### 1d. Reverse-edge expansion (`ranking.rs:reverse_expand_from_anchors`) — issue #67
+
+- Fires **only** on anchors classified as reverse-expand seeds by
+  `ranking.rs:is_reverse_expand_seed` — currently exception/error/warning
+  **type definitions** (name suffix `Error` / `Exception` / `Warning`,
+  `SymbolKind::is_type_definition()`). Generic anchors like `parse_latex`,
+  `exp`, or `symbols` skip this stage entirely.
+- For each seed, BFS walks **incoming edges** (`CodeGraph::dependents` —
+  callers, importers, raisers) up to `REVERSE_EXPAND_MAX_DEPTH = 3` hops.
+- Per-hop expansion is capped at `REVERSE_EXPAND_FAN_OUT = 5`. Within a hop,
+  callers are ranked by **query-term overlap** in name/fqn, lightly
+  penalized by centrality so utility hubs don't crowd out specific leaf
+  callers.
+- Seeds with more than `REVERSE_EXPAND_SEED_MAX_CALLERS = 500` direct
+  callers are skipped — their reverse set is too broad to rank usefully
+  (e.g. a language-wide base exception class in a huge codebase).
+- Total candidates capped at `REVERSE_EXPAND_CANDIDATES = 20`.
+- Gated by `EngineConfig::reverse_expand_anchors` (default `true`). Set to
+  `false` to restore pre-#67 behaviour for A/B measurement.
+
+**Why this exists:** for symptom-anchored bug reports (`"unexpected
+PolynomialError when using simple subs()"`), the fix site is reached only
+by walking **backward** through the call graph from the user-named error
+type. BM25, ANN, and graph-forward expansion all stop at direct neighbors
+of the error class; they never surface a fix site 3 hops upstream. See
+sympy-21379 evidence in the issue.
+
+**Why the fan-out cap is safe:** depth-3 walk with fan-out 5 explores at
+most `5 + 25 + 125 = 155` nodes — the total output is then hard-capped at
+20, so the RRF fusion never sees more than a small candidate set.
+Per-hop ranking by term overlap picks the callers most relevant to the
+task, which for the sympy-21379 case includes `parallel_poly_from_expr`
+(name contains the query term "poly") and routes the walk through the
+intended chain.
+
+**Reverse-expanded candidates participate in v1.6 file-diversity pinning**
+alongside direct anchors — a walked caller in an otherwise-uncontested
+file gets the same pin treatment (`ANCHOR_FILE_BUDGET` is shared; direct
+anchors are iterated first so they claim slots before walked callers).
+
+**RRF weighting:** fuses with `REVERSE_EXPAND_RRF_K = 30`, sitting between
+the aggressive anchor k (15) and the global default k (60). Walked callers
+compete meaningfully with RRF-wide noise without overpowering direct anchor
+hits.
+
+### 1e. Semantic retrieval (`engine.rs:ann_candidates`) — embeddings build only
 
 - Embeds the query using NomicEmbedTextV15Q (768-dim, L2-normalised)
 - Runs a parallel flat cosine scan over the in-memory embedding cache (rayon)
@@ -160,7 +207,7 @@ only re-ranked the BM25 pool (Stage 4). Symbols with high semantic similarity bu
 lexical overlap with the query — the hardest cases — never made it into the pool.
 Semantic retrieval surfaces these symbols before any reranking occurs.
 
-### 1e. RRF merge (`engine.rs:rrf_merge`)
+### 1f. RRF merge (`engine.rs:rrf_merge`)
 
 ```
 RRF(candidate) = Σ  1 / (60 + rank_i + 1)
@@ -171,8 +218,10 @@ One term per retriever list `i` in which the candidate appears.
 `k = 60` is the standard default from the original RRF paper (Cormack et al. 2009)
 and applies to BM25, graph, and ANN. The anchor list uses `k = 15` via
 `rrf_merge_ks` so precision-first anchor hits outweigh fuzzy rank-1 hits from
-the other sources. Candidates present in all four lists (strong lexical + graph
-+ semantic + anchor signal) receive the highest fused scores.
+the other sources. Reverse-expansion uses `k = 30` — stronger than the default
+but weaker than direct anchors, reflecting its derived-from-anchor status.
+Candidates present in all five lists (strong lexical + graph + semantic +
+anchor + reverse-walked signal) receive the highest fused scores.
 
 ---
 
@@ -375,6 +424,11 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | Anchor fuzzy-fallback cutoff | 3 | `ranking.rs:ANCHOR_FUZZY_CUTOFF` |
 | RRF k (BM25 / graph / ANN) | 60 | `ranking.rs:RRF_K` |
 | RRF k (explicit anchors) | 15 | `ranking.rs:ANCHOR_RRF_K` |
+| RRF k (reverse expansion) | 30 | `ranking.rs:REVERSE_EXPAND_RRF_K` |
+| Reverse-expansion max depth | 3 | `ranking.rs:REVERSE_EXPAND_MAX_DEPTH` |
+| Reverse-expansion fan-out per hop | 5 | `ranking.rs:REVERSE_EXPAND_FAN_OUT` |
+| Reverse-expansion candidate cap | 20 | `ranking.rs:REVERSE_EXPAND_CANDIDATES` |
+| Reverse-expansion seed max callers | 500 | `ranking.rs:REVERSE_EXPAND_SEED_MAX_CALLERS` |
 | Structural injection cap | `max_pivots * 2` = 16 | `engine.rs:inject_structural_candidates` |
 | Injected candidate score | `family_in_degree * 5.0` | `engine.rs:inject_structural_candidates` |
 | Centrality boost multiplier | 3.0 | `engine.rs:apply_centrality_and_semantics` |
