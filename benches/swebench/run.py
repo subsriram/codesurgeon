@@ -643,11 +643,24 @@ def run_one(
         except subprocess.TimeoutExpired as e:
             # Preserve whatever was captured before the kill so the partial
             # stream (stream-json mode) can be inspected post-mortem —
-            # otherwise a timed-out run is a total black box. `text=True`
-            # on subprocess.run means e.stdout/e.stderr are str or None.
+            # otherwise a timed-out run is a total black box.
+            #
+            # `subprocess.TimeoutExpired.stdout` / `.stderr` are **bytes**
+            # on Python 3.14, regardless of `text=True` on `run()`. (A
+            # completed `proc.stdout` under `text=True` is `str`; the
+            # exception attrs are not decoded by the same path.) Decode
+            # defensively so downstream code that expects `str` (e.g.
+            # `Path.write_text`) doesn't crash.
+            def _decode(x: object) -> str:
+                if x is None:
+                    return ""
+                if isinstance(x, bytes):
+                    return x.decode("utf-8", errors="replace")
+                return x  # type: ignore[return-value]
+
             exit_code = -2
-            stdout = e.stdout or ""
-            partial_stderr = e.stderr or ""
+            stdout = _decode(e.stdout)
+            partial_stderr = _decode(e.stderr)
             stderr_tail = partial_stderr[-2000:]
             err_msg = (
                 f"timeout after {timeout_s}s "
