@@ -60,14 +60,48 @@ DEFAULT_CLAUDE_BIN = "claude"
 DEFAULT_MAX_BUDGET_USD = 1.00
 DEFAULT_TASK_TIMEOUT_S = 900  # 15 minutes
 
-# Instruction prefix injected before the task's problem_statement. Keeps the
+# Instruction preamble injected before the task's problem_statement. Keeps the
 # agent focused on producing a diff rather than asking clarifying questions.
-PROMPT_PREFIX = """\
+#
+# Split into a shared `PROMPT_BASE` (both arms see this) and an arm-specific
+# `TREATMENT_NUDGE` (only the `with` arm, which actually has cs-codesurgeon
+# mounted, is told about `run_pipeline`). Previously the nudge was shared,
+# which instructed the control arm to call a tool that didn't exist under
+# `--strict-mcp-config` — a confound that muddied the A/B.
+PROMPT_BASE = """\
 You are fixing a real GitHub issue in this repository. Read the problem
 statement carefully, inspect the code, and make the minimal change needed to
 fix the bug. Do not add new tests. Do not reformat unrelated code. When you
 are confident the fix is complete, stop — your changes will be captured as a
 git diff and evaluated automatically.
+"""
+
+# Phase 3 A/B variants. Selected per-run via `--nudge`.
+#
+# 5b — verbatim-forward: explicitly tells the agent to paste the raw
+#      problem statement into the new `context` param.
+# 5c — tool-description-only: no mention of `context` in the nudge at all
+#      (relies purely on the MCP server's tool description, which still
+#      advertises `context`). Used to measure whether tool-description
+#      alone steers the agent without an in-prompt instruction.
+TREATMENT_NUDGE_5B = """\
+
+Before you start reading files, call `mcp__cs-codesurgeon__run_pipeline`
+with two fields:
+  - `task`: a short description of the work, e.g.
+    task="fix PolynomialError on subs with Piecewise"
+  - `context`: the ENTIRE problem statement below, pasted verbatim
+    (copy-paste exactly — do not paraphrase, summarize, or omit code
+    snippets, error messages, or identifiers)
+
+`context` is what anchors the search on the function names, class names,
+and API calls that appear in the raw source — identifiers you might
+otherwise paraphrase out of `task`. The capsule typically returns in
+under 200ms and replaces 5–10 exploratory tool calls. Only after you
+have the capsule should you start opening files with Read.
+"""
+
+TREATMENT_NUDGE_5C = """\
 
 Before you start reading files, call `mcp__cs-codesurgeon__run_pipeline`
 with a short description of the task (e.g. `task="fix VLA diff bug in
@@ -77,9 +111,112 @@ the right file to edit instead of doing Grep + Read exploration. The
 capsule typically returns in under 200ms and replaces 5–10 exploratory
 tool calls. Only after you have the capsule should you start opening
 files with Read.
+"""
+
+NUDGES: dict[str, str] = {"5b": TREATMENT_NUDGE_5B, "5c": TREATMENT_NUDGE_5C}
+
+PROMPT_SUFFIX = """
 
 Problem statement:
 """
+
+
+# Phase 4: optional CLAUDE.md injected into the `with` arm's workdir to
+# advertise the codesurgeon tool surface in the location Claude Code
+# auto-loads from. Gated behind `--inject-claude-md` so it can be A/B'd
+# independently of the PROMPT_PREFIX variants.
+CODESURGEON_CLAUDE_MD = """\
+# codesurgeon MCP tools — consult before exploring
+
+This repository is indexed by codesurgeon. Before using Read or Grep to
+explore the codebase, use these MCP tools to get targeted context:
+
+| Tool | When to use |
+|------|-------------|
+| `mcp__cs-codesurgeon__run_pipeline` | **First call on any task**. Returns a budgeted capsule of relevant symbols with full source plus call-graph edges. Pass both `task` (short description) and `context` (raw problem statement, verbatim, unmodified). |
+| `mcp__cs-codesurgeon__get_impact_graph` | Walks callers / importers / raisers of a symbol. Use when the first capsule named the symptom (an exception class, a public API) but didn't include the function that needs changing. See the chaining note below. |
+| `mcp__cs-codesurgeon__get_skeleton` | File API surface without bodies. 70–90% fewer tokens than reading the full file. |
+| `mcp__cs-codesurgeon__save_observation` | Persist an insight tied to a symbol for future sessions. |
+
+## Why pass `context` on `run_pipeline`
+
+`task` is the agent's summary; `context` is the raw source the summary was
+derived from. Identifiers (function names, class names, dotted API calls)
+that you might paraphrase out of `task` are recovered from `context` via
+server-side symbol-anchor extraction. BM25, semantic search, and intent
+detection still run on `task` alone, so `context` has no effect on query
+budget — only on anchor resolution.
+
+## Chain `run_pipeline` → `get_impact_graph` when the bug site is unnamed
+
+Bug reports usually describe symptoms — *"I get `PolynomialError` when I call
+`subs()` on a `Piecewise`"* — while the actual fix site is a function that
+**raises** or **catches** the error, and that function is almost never named
+in the report. `run_pipeline` anchors on the identifiers the user DID
+mention (the exception class, the triggering API); the fix site won't be
+in the capsule because nothing textually anchors to it.
+
+**Workflow when the first capsule doesn't include an obviously-fixable
+symbol**:
+
+1. Pick the most specific identifier from the capsule — typically the
+   exception class (e.g. `PolynomialError`) or the user-facing method
+   (e.g. `Piecewise`).
+2. Call `get_impact_graph` on that symbol's FQN. It returns every function
+   that raises it, catches it, or transitively calls a raiser.
+3. Scan the dependents for a function name that matches the symptom domain
+   (for a `subs()`-related crash, look for `eval`, `doit`, `_eval_subs`, or
+   the class named in the triggering call).
+4. Open that function with Read — it will usually be the fix site.
+
+This two-call chain typically replaces 10–20 exploratory Grep/Read calls.
+If you skip it and default to Grep on the exception name, you'll walk the
+same call graph manually and burn tokens.
+"""
+
+
+def maybe_inject_claude_md(workdir: Path, arm: str, inject: bool) -> Path | None:
+    """Write (or prepend) codesurgeon guidance to `workdir/CLAUDE.md`.
+
+    Only runs in the `with` arm when `inject` is True. If the task repo
+    already ships a CLAUDE.md at `base_commit`, our content is prepended
+    so the agent sees codesurgeon guidance first — we never silently
+    overwrite upstream instructions.
+    """
+    if arm != "with" or not inject:
+        return None
+    path = workdir / "CLAUDE.md"
+    existing = path.read_text() if path.exists() else ""
+    if existing:
+        path.write_text(
+            CODESURGEON_CLAUDE_MD + "\n\n---\n\n## Upstream CLAUDE.md (preserved)\n\n" + existing
+        )
+    else:
+        path.write_text(CODESURGEON_CLAUDE_MD)
+    return path
+
+
+def build_prompt(arm: str, problem_statement: str, nudge_variant: str = "5b") -> str:
+    """Assemble the per-arm prompt.
+
+    Control arm (`without`) gets only the bug-fix preamble — no mention of
+    codesurgeon or `run_pipeline`, since the tool isn't available under
+    `--strict-mcp-config` with an empty mcpServers map.
+
+    Treatment arm (`with`) gets the preamble + one of the NUDGES keyed by
+    `nudge_variant`. Default 5b (verbatim-forward of problem statement
+    into `context`); 5c (tool-description-only) is used for A/B isolation.
+    """
+    parts = [PROMPT_BASE]
+    if arm == "with":
+        if nudge_variant not in NUDGES:
+            raise ValueError(
+                f"unknown nudge_variant {nudge_variant!r}; expected one of {list(NUDGES)}"
+            )
+        parts.append(NUDGES[nudge_variant])
+    parts.append(PROMPT_SUFFIX)
+    parts.append(problem_statement)
+    return "".join(parts)
 
 
 @dataclass
@@ -157,13 +294,27 @@ def build_claude_cmd(
     prompt: str,
     max_budget_usd: float,
     model: str | None,
+    stream_json: bool = False,
 ) -> list[str]:
-    """Assemble the ``claude --print`` command for one task run."""
+    """Assemble the ``claude --print`` command for one task run.
+
+    When ``stream_json`` is True, the output format is switched to
+    ``stream-json`` (NDJSON of per-turn events). The final line in the
+    stream carries the same ``result`` / ``usage`` / ``total_cost_usd``
+    fields as the single-object ``json`` format, so downstream token
+    extraction still works. Use stream_json when you need per-tool-call
+    visibility (e.g. to confirm an agent populated a new MCP param).
+    """
     cmd = [
         claude_bin,
         "--print",
-        "--output-format",
-        "json",
+    ]
+    if stream_json:
+        # stream-json requires --verbose per Claude Code's CLI contract.
+        cmd.extend(["--output-format", "stream-json", "--verbose"])
+    else:
+        cmd.extend(["--output-format", "json"])
+    cmd.extend([
         "--strict-mcp-config",
         "--mcp-config",
         str(mcp_config),
@@ -174,20 +325,38 @@ def build_claude_cmd(
         str(workdir),
         "--max-budget-usd",
         f"{max_budget_usd:.2f}",
-    ]
+    ])
     if model:
         cmd.extend(["--model", model])
     cmd.append(prompt)
     return cmd
 
 
-def parse_claude_json(stdout: str) -> dict:
-    """Extract the structured result from ``claude --print --output-format json``.
+def parse_claude_json(stdout: str, stream_json: bool = False) -> dict:
+    """Extract the structured result from ``claude --print`` output.
 
-    Claude Code's json output is a single top-level object; defensively
-    return an empty dict on parse failure so the caller can degrade
-    gracefully and still capture the diff.
+    ``json`` mode: stdout is a single top-level object; parse and return.
+    ``stream-json`` mode: stdout is NDJSON of per-turn events. The last
+    line of type ``result`` carries the same summary fields; return that
+    so downstream code sees the same shape as json mode.
+    Defensively returns an empty dict on parse failure so the caller can
+    degrade gracefully and still capture the diff.
     """
+    if not stdout.strip():
+        return {}
+    if stream_json:
+        # Walk lines in reverse to find the last "result" event.
+        for line in reversed(stdout.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(obj, dict) and obj.get("type") == "result":
+                return obj
+        return {}
     try:
         return json.loads(stdout)
     except (json.JSONDecodeError, ValueError):
@@ -256,13 +425,34 @@ def run_one(
     model: str | None,
     dry_run: bool,
     results_dir: Path,
+    inject_claude_md: bool = False,
+    nudge_variant: str = "5b",
+    reuse_workdir: Path | None = None,
+    stream_json: bool = False,
 ) -> RunResult:
-    """Run one (task, arm) pair and return the captured result."""
+    """Run one (task, arm) pair and return the captured result.
+
+    When `reuse_workdir` is set, skip clone + index and use that path as
+    the workdir directly. Before each run we `git reset --hard
+    <base_commit>` and `git clean -fdx -e .codesurgeon/` so the agent
+    starts from the pristine base state without re-indexing. Meant for
+    rapid iteration against a pre-indexed warm workspace.
+    """
     print(f"  [{arm:7s}] {task['instance_id']}", file=sys.stderr, end="", flush=True)
 
-    with tempfile.TemporaryDirectory(prefix=f"cs-swe-{task['instance_id']}-{arm}-") as tmp_s:
+    import contextlib
+
+    # Either a real TemporaryDirectory (normal flow) or a null context
+    # wrapping the reuse-workdir's parent (so the `tmp` Path still exists
+    # for mcp_with.json materialization).
+    _ctx: contextlib.AbstractContextManager[str] = (
+        contextlib.nullcontext(str(reuse_workdir.parent))
+        if reuse_workdir is not None
+        else tempfile.TemporaryDirectory(prefix=f"cs-swe-{task['instance_id']}-{arm}-")
+    )
+    with _ctx as tmp_s:
         tmp = Path(tmp_s)
-        workdir = tmp / "repo"
+        workdir = reuse_workdir if reuse_workdir is not None else tmp / "repo"
 
         # 1. Materialize MCP config for this arm. For the treatment arm we
         # point CS_WORKSPACE at the per-task workdir (set below, after clone),
@@ -273,7 +463,7 @@ def run_one(
         if arm == "without":
             mcp_config = MCP_WITHOUT_PATH
 
-        # 2. Clone the task repo (skipped in dry-run).
+        # 2. Clone the task repo (skipped in dry-run and reuse-workdir).
         if dry_run:
             workdir.mkdir(parents=True, exist_ok=True)
             subprocess.run(["git", "init", "--quiet"], cwd=workdir, check=True)
@@ -284,6 +474,39 @@ def run_one(
                 cwd=workdir,
                 check=True,
             )
+        elif reuse_workdir is not None:
+            # Reset the reuse workdir to `base_commit` and clean untracked
+            # files from prior runs, but preserve `.codesurgeon/` so the
+            # warm index carries over.
+            try:
+                subprocess.run(
+                    ["git", "-C", str(workdir), "reset", "--hard", task["base_commit"]],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(workdir), "clean", "-fdx", "-e", ".codesurgeon"],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"  FAIL (reuse-reset)", file=sys.stderr)
+                return RunResult(
+                    instance_id=task["instance_id"],
+                    repo=task["repo"],
+                    arm=arm,
+                    exit_code=-1,
+                    walltime_s=0.0,
+                    input_tokens=None,
+                    output_tokens=None,
+                    cache_creation_tokens=None,
+                    cache_read_tokens=None,
+                    total_cost_usd=None,
+                    diff_bytes=0,
+                    diff_path=None,
+                    claude_json_path=None,
+                    error=f"reuse-reset failed: {e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr}",
+                )
         else:
             try:
                 clone_task_repo(task, workdir)
@@ -311,7 +534,13 @@ def run_one(
         # synchronous and fast (sub-second for repos up to ~2000 files);
         # without it the first run_pipeline call blocks on cold indexing
         # and hits the task timeout.
-        if arm == "with" and not dry_run:
+        #
+        # Skipped when `reuse_workdir` is set — the `.codesurgeon/` dir
+        # inside the reuse path is assumed to be an up-to-date index from
+        # a prior run.
+        if arm == "with" and not dry_run and reuse_workdir is not None:
+            mcp_config = materialize_mcp_with(mcp_bin, workdir, tmp)
+        elif arm == "with" and not dry_run:
             t_idx = time.monotonic()
             idx_proc = subprocess.run(
                 [str(cs_bin), "index", "--workspace", str(workdir)],
@@ -345,9 +574,26 @@ def run_one(
 
         assert mcp_config is not None
 
-        # 3. Build prompt and spawn claude.
-        prompt = PROMPT_PREFIX + task["problem_statement"]
-        cmd = build_claude_cmd(claude_bin, mcp_config, workdir, prompt, max_budget_usd, model)
+        # 2b. Phase 4 — optionally seed `workdir/CLAUDE.md` with codesurgeon
+        # tool guidance so the child Claude Code session auto-loads it at
+        # startup. Gated by `inject_claude_md`. Treatment arm only.
+        injected_claude_md = maybe_inject_claude_md(workdir, arm, inject_claude_md)
+
+        # 3. Build prompt and spawn claude. Prompt branches on arm — the
+        # control arm does not see the codesurgeon nudge (see build_prompt).
+        prompt = build_prompt(arm, task["problem_statement"], nudge_variant=nudge_variant)
+        cmd = build_claude_cmd(
+            claude_bin, mcp_config, workdir, prompt, max_budget_usd, model,
+            stream_json=stream_json,
+        )
+
+        if injected_claude_md:
+            print(
+                f"  (injected CLAUDE.md: {injected_claude_md.relative_to(workdir)})",
+                file=sys.stderr,
+                end="",
+                flush=True,
+            )
 
         if dry_run:
             # Don't actually spawn — just verify the command shape.
@@ -395,7 +641,13 @@ def run_one(
 
         claude_json_path: Path | None = None
         if stdout:
-            claude_json_path = artifact_base / "claude.json"
+            # In stream-json mode we keep the raw NDJSON (one event per
+            # line) under `claude_stream.jsonl` so per-turn tool calls can
+            # be inspected later. In plain json mode, the single-object
+            # summary goes to `claude.json`. The field in RunResult keeps
+            # the plain name so downstream consumers don't branch.
+            artifact_name = "claude_stream.jsonl" if stream_json else "claude.json"
+            claude_json_path = artifact_base / artifact_name
             claude_json_path.write_text(stdout)
 
         diff = capture_diff(workdir)
@@ -405,7 +657,7 @@ def run_one(
             diff_path.write_text(diff)
 
         # 5. Parse token stats.
-        claude_json = parse_claude_json(stdout) if stdout else {}
+        claude_json = parse_claude_json(stdout, stream_json=stream_json) if stdout else {}
         tokens = extract_token_stats(claude_json)
 
         result = RunResult(
@@ -473,7 +725,45 @@ def main() -> int:
         help=f"results.jsonl output path (default: {RESULTS_PATH.relative_to(REPO_ROOT)})",
     )
     parser.add_argument("--clean", action="store_true", help="truncate results.jsonl before running")
+    parser.add_argument(
+        "--inject-claude-md",
+        action="store_true",
+        help="Phase 4: write codesurgeon tool guidance to workdir/CLAUDE.md (with arm only)",
+    )
+    parser.add_argument(
+        "--nudge",
+        choices=sorted(NUDGES.keys()),
+        default="5b",
+        help="treatment-arm PROMPT_PREFIX variant: 5b = verbatim-forward of context (default), 5c = tool-description-only",
+    )
+    parser.add_argument(
+        "--reuse-workdir",
+        type=Path,
+        default=None,
+        help="path to a pre-indexed checkout to reuse (skip clone + index; `git reset --hard <base_commit>` between runs, preserve .codesurgeon/). Only valid with a single instance_id.",
+    )
+    parser.add_argument(
+        "--stream-json",
+        action="store_true",
+        help="use claude --output-format stream-json --verbose, save raw NDJSON as claude_stream.jsonl (per-turn tool-call visibility; useful for confirming a new MCP param was populated)",
+    )
     args = parser.parse_args()
+
+    if args.reuse_workdir is not None:
+        if not args.reuse_workdir.is_dir():
+            print(f"--reuse-workdir not a directory: {args.reuse_workdir}", file=sys.stderr)
+            return 2
+        if not (args.reuse_workdir / ".codesurgeon").is_dir():
+            print(
+                f"--reuse-workdir missing .codesurgeon/ (is it indexed?): {args.reuse_workdir}",
+                file=sys.stderr,
+            )
+            return 2
+        # Resolve to absolute so mcp_with.json lands at an absolute path.
+        # Otherwise claude --print spawned with cwd=workdir would try to
+        # resolve the relative --mcp-config path against the workdir,
+        # producing a double-nested path that doesn't exist.
+        args.reuse_workdir = args.reuse_workdir.resolve()
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     for a in arms:
@@ -533,6 +823,10 @@ def main() -> int:
                 model=args.model,
                 dry_run=args.dry_run,
                 results_dir=results_dir,
+                inject_claude_md=args.inject_claude_md,
+                nudge_variant=args.nudge,
+                reuse_workdir=args.reuse_workdir,
+                stream_json=args.stream_json,
             )
             append_result(args.results, result)
 

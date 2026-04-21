@@ -5,6 +5,31 @@ All notable changes to codesurgeon are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`run_pipeline` optional `context` parameter** (anchor-extraction v1.7).
+  Callers can now pass an additional raw-text blob alongside `task` — typically
+  the full problem statement, bug report, or stack trace the task was derived
+  from. Anchor extraction runs on `task + context` with dedup by symbol name,
+  so identifiers paraphrased out of a compact task string are recovered from
+  the raw source. BM25, semantic search, graph retrieval, and intent detection
+  still run on `task` alone, so `context` has no effect on query budget or
+  intent classification. Backward-compatible: existing callers see identical
+  behavior. New `CoreEngine::run_pipeline_with_context` entrypoint; MCP tool
+  schema advertises `context` with a persuasive description so real-world
+  agents (not just the SWE-bench harness) populate the field. CLI gains
+  `codesurgeon context --context @path/to/file|-|<literal>`. Three unit tests
+  in `crates/cs-core/tests/engine.rs`. See `docs/explicit-symbol-anchors.md`
+  §v1.7 for design notes.
+- **SWE-bench harness — per-arm prompt fairness**. `benches/swebench/run.py`
+  now branches `PROMPT_PREFIX` by arm via `build_prompt(arm, problem_statement)`.
+  The control (`without`) arm no longer receives the
+  `mcp__cs-codesurgeon__run_pipeline` nudge, since the tool isn't available
+  under `--strict-mcp-config` with an empty `mcpServers` map. Removes a
+  long-standing confound from the A/B.
+
 ## [1.0.0] - 2026-04-10
 
 First stable release. codesurgeon is a local-first dependency graph and session

@@ -102,6 +102,10 @@ fn tool_list() -> Value {
                             "type": "string",
                             "description": "Describe what you want to do, e.g. 'fix JWT validation bug' or 'refactor UserService'"
                         },
+                        "context": {
+                            "type": "string",
+                            "description": "Optional. Raw verbatim text the task was derived from — the full problem statement, bug report, error output, or stack trace. Used for symbol-anchor extraction; pass the unmodified source rather than a paraphrase so function names, class names, and dotted API calls mentioned in the original text are found in the index. Has no effect on budget: BM25, semantic search, and intent detection still run against `task` alone."
+                        },
                         "budget_tokens": {
                             "type": "integer",
                             "description": "Max tokens to include in the capsule (default: 4000)",
@@ -848,13 +852,23 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
     tokio::task::spawn_blocking(move || match name.as_str() {
         "run_pipeline" => {
             let task = string_arg(&args, "task")?;
+            let context = args.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
             let budget = args
                 .get("budget_tokens")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             let language = args.get("language").and_then(|v| v.as_str()).map(|s| s.to_string());
             let file_hint = args.get("file_hint").and_then(|v| v.as_str()).map(|s| s.to_string());
-            engine.run_pipeline(&task, budget, language.as_deref(), file_hint.as_deref())
+            // Route through the context-aware entrypoint unconditionally —
+            // when `context` is None this is behaviorally identical to
+            // `engine.run_pipeline(…)`.
+            engine.run_pipeline_with_context(
+                &task,
+                context.as_deref(),
+                budget,
+                language.as_deref(),
+                file_hint.as_deref(),
+            )
         }
 
         "get_context_capsule" => {

@@ -1220,14 +1220,47 @@ impl CoreEngine {
         language: Option<&str>,
         file_hint: Option<&str>,
     ) -> Result<String> {
+        self.run_pipeline_with_context(task, None, budget, language, file_hint)
+    }
+
+    /// `run_pipeline` variant that accepts an additional raw-text `context`
+    /// blob (typically the full problem statement / bug report / error log
+    /// the agent derived `task` from). The context is used **only** for
+    /// anchor extraction — BM25, ANN, graph, and intent detection still run
+    /// against `task` alone, so a large context doesn't blow the primary
+    /// query budget or mis-classify the intent.
+    ///
+    /// Motivation: when agents paraphrase long problem statements into a
+    /// short `task` string, identifier tokens (function names, class names,
+    /// dotted API calls) often get dropped, and the anchor extractor loses
+    /// the signal. Passing the raw source as `context` makes extraction
+    /// deterministic on the server side — it no longer depends on the
+    /// agent preserving identifiers through summarization.
+    ///
+    /// Backward-compatible: `context=None` is exactly the pre-existing
+    /// `run_pipeline` behavior.
+    pub fn run_pipeline_with_context(
+        &self,
+        task: &str,
+        context: Option<&str>,
+        budget: Option<u32>,
+        language: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<String> {
         let t0 = Instant::now();
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(task);
 
-        tracing::debug!("run_pipeline: intent={:?}, task={}", intent, task);
+        tracing::debug!(
+            "run_pipeline: intent={:?}, task={}, context={} bytes",
+            intent,
+            task,
+            context.map(|c| c.len()).unwrap_or(0)
+        );
 
-        let capsule =
-            self.build_context_capsule(task, budget, &intent, language, file_hint, None, None)?;
+        let capsule = self.build_context_capsule(
+            task, budget, &intent, language, file_hint, None, None, context,
+        )?;
         let latency_ms = t0.elapsed().as_millis() as u64;
         let mut out = format_capsule(&capsule);
 
@@ -1313,8 +1346,16 @@ impl CoreEngine {
     ) -> Result<String> {
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(query);
-        let capsule =
-            self.build_context_capsule(query, budget, &intent, None, None, max_results, min_score)?;
+        let capsule = self.build_context_capsule(
+            query,
+            budget,
+            &intent,
+            None,
+            None,
+            max_results,
+            min_score,
+            None,
+        )?;
 
         // Auto-capture this tool call as an observation for cross-session memory.
         let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
@@ -2356,6 +2397,16 @@ impl CoreEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Build a ranked capsule for `query`.
+    ///
+    /// `anchor_context`, when `Some`, is a raw-text blob used *only* for
+    /// anchor extraction — anchors are extracted from `query + "\n" +
+    /// anchor_context` (extract() handles dedup). Lets callers recover
+    /// identifiers the agent may have paraphrased out of a compact `query`
+    /// but that are still visible in the raw problem statement. BM25/ANN/
+    /// graph always run on `query` alone so a large context doesn't blow
+    /// the primary query budget.
+    #[allow(clippy::too_many_arguments)]
     fn build_context_capsule(
         &self,
         query: &str,
@@ -2365,6 +2416,7 @@ impl CoreEngine {
         file_hint: Option<&str>,
         max_results: Option<usize>,
         min_score: Option<f32>,
+        anchor_context: Option<&str>,
     ) -> Result<Capsule> {
         // ── Stage 1: Candidate Retrieval (BM25 + graph neighbors + ANN) ──────────
         let bm25_results = self.search.lock().search(query, BM25_POOL_SIZE)?;
@@ -2383,8 +2435,22 @@ impl CoreEngine {
         // the query (prose identifiers, imports, code-block API calls). Empty
         // when the query has no extractable identifiers, in which case the
         // RRF blend is unchanged.
-        let (anchor_results, astats) = self.anchor_candidates(query, ANCHOR_CANDIDATES);
-        tracing::debug!("anchor stats: {:?}", astats);
+        //
+        // If `anchor_context` is provided (e.g. the raw problem statement the
+        // agent's `task` was derived from), we concatenate it with the query
+        // and run extraction on the combined blob. The underlying
+        // `extract()` dedupes on symbol name, so identifiers that appear in
+        // both are counted once.
+        let anchor_source: String = match anchor_context {
+            Some(ctx) if !ctx.is_empty() => format!("{query}\n{ctx}"),
+            _ => query.to_string(),
+        };
+        let (anchor_results, astats) = self.anchor_candidates(&anchor_source, ANCHOR_CANDIDATES);
+        tracing::debug!(
+            "anchor stats: {:?} (context bytes: {})",
+            astats,
+            anchor_context.map(|c| c.len()).unwrap_or(0)
+        );
 
         // ANN semantic retrieval + RRF fusion across all four sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a

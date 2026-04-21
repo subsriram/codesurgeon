@@ -126,6 +126,18 @@ to `xr`, `where`). The anchor source treats code blocks structurally — the ide
 **When this is empty:** queries with no extractable identifiers (pure prose bug reports)
 produce zero anchors, and the RRF blend degrades gracefully to its prior behaviour.
 
+**Optional `context` input (v1.7):** callers of `run_pipeline` can pass an
+additional raw-text blob alongside `task` — typically the full problem
+statement, bug report, or stack trace the task was paraphrased from. When
+present, anchor extraction runs on `task + "\n" + context` (the underlying
+`extract()` dedupes by symbol name). **Only** anchor extraction sees the
+context: BM25, ANN, graph retrieval, and intent detection still run against
+`task` alone, so a large context blob cannot blow the primary query budget
+or mis-classify the intent. This closes the "agent paraphrased identifiers
+out of the summary" hole in the anchor pipeline — deterministic extraction
+on the server side no longer depends on the agent preserving identifiers
+through summarization. See `docs/explicit-symbol-anchors.md` §v1.7.
+
 ### 1d. Semantic retrieval (`engine.rs:ann_candidates`) — embeddings build only
 
 - Embeds the query using NomicEmbedTextV15Q (768-dim, L2-normalised)

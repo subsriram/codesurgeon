@@ -1,6 +1,6 @@
 # Design: Explicit Symbol-Name Anchors in the Ranking Pipeline
 
-> **Status**: v1 → v1.6 implemented.
+> **Status**: v1 → v1.7 implemented.
 > **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`
 > **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`
 > **Motivation**: SWE-bench #29c revealed that capsule ranking misses the target
@@ -8,6 +8,78 @@
 > enabled. The failure mode is always the same: the task explicitly names the
 > target symbol, but the ranker treats it as bag-of-words and surfaces
 > tangentially-related files instead.
+
+---
+
+## v1.7 — optional `context` param on `run_pipeline` (LANDED)
+
+**Problem v1.6 leaves open**: anchor extraction runs on the `task` string
+the agent provides. When agents paraphrase a long problem statement into a
+short `task`, identifier tokens routinely drop out of the summary and the
+anchor extractor loses its signal — even though the raw source (the
+original problem statement, bug report, or stack trace) still names every
+relevant symbol. This is the "agent-compliance" ceiling on the pure
+prompt-level fix.
+
+**Fix**: give the MCP `run_pipeline` tool an optional `context` parameter.
+When set, anchors are extracted from `task + "\n" + context` (dedup via
+`extract()`'s existing `seen` set), so identifiers present in the raw
+source are recovered regardless of how the agent summarized them. BM25,
+ANN, graph retrieval, and intent detection still run on `task` alone — a
+large context blob can't blow the primary query budget or mis-classify
+the intent.
+
+**Shape of the change**:
+- New engine method `CoreEngine::run_pipeline_with_context(task, context, …)`.
+  `run_pipeline` itself is unchanged; it delegates to the new method with
+  `context=None`. Backward-compatible.
+- `build_context_capsule` grows an `anchor_context: Option<&str>` param
+  threaded into the anchor-extraction call.
+- MCP tool schema advertises `context` with a description that tells the
+  agent to pass the raw unmodified source, not a paraphrase. Every MCP
+  client (not just the harness) sees this.
+- 3 unit tests in `crates/cs-core/tests/engine.rs`:
+  `context_none_matches_plain_run_pipeline`,
+  `context_recovers_identifier_paraphrased_out_of_task`,
+  `context_dedupes_against_task`.
+
+**Not included** (Phase 3 of the anchor roadmap):
+- A/B measurement of tool-description alone vs. a PROMPT_PREFIX variant
+  that explicitly tells the agent to paste the problem statement into
+  `context`. Depends on v1.7 being live; tracked against the 6-task
+  regression set.
+
+### Empirical finding — v1.7 on `sympy__sympy-21379`
+
+Single-task validation with `--nudge 5b --stream-json --reuse-workdir`
+(2026-04-20). The agent complied with the verbatim-forward nudge:
+
+- **One `run_pipeline` call** at the start with both params populated:
+  - `task` = 42 chars (terse summary)
+  - `context` = 1,747 chars (verbatim problem statement)
+- All anchor identifiers from the problem (`symbols`, `exp`, `sinh`,
+  `Piecewise`, `subs`, `PolynomialError`) resolved correctly and appeared
+  as pivots. v1.6 file-diversity pinning held.
+
+**But the capsule missed the fix site.** The actual bug is in
+`sympy/core/mod.py::Mod.eval`, reached only via `PolynomialError →
+parallel_poly_from_expr → gcd → Mod.eval` (4 hops backward). The problem
+statement never names `Mod` — anchors can only fire on identifiers the
+user mentioned. Consequence: the agent solved the task correctly but
+burned 43 post-capsule tool calls (17× Read, 13× Bash, 8× Grep, 4× Edit,
+1× ToolSearch) finding the fix site on its own, ending at $1.01 / 290 s
+vs bare-claude's $0.30 / 96 s on the same task.
+
+**Takeaway**: v1.7 closes the agent-paraphrase hole in the anchor
+pipeline, but does not address the "bug site is transitively reached from
+an anchor, not named in the problem" case. The structural fix is the
+out-of-scope item at the bottom of this doc — **reverse-edge expansion
+from error types / exception classes / symptomatic anchors** — which
+`get_impact_graph` already implements for callers but is not wired into
+`run_pipeline`'s capsule assembly. An agent who manually calls
+`get_impact_graph(PolynomialError)` after the first capsule finds `Mod.eval`
+immediately; this is Phase 4's working hypothesis (advertise the chain
+via injected CLAUDE.md).
 
 ---
 
@@ -65,10 +137,27 @@ threaded into pivot count selection.
 - **v1.1** (BM25-name fallback for substring matches) — landed. Catches the
   sphinx-9711 case where user says `needs_extensions` but the symbol is
   `verify_needs_extensions`.
-- **Benchmark driver change** — `benches/swebench/run.py` `PROMPT_PREFIX` now
-  instructs the agent to preserve identifiers verbatim in the `task` field
-  (rather than paraphrasing them away). This is an *orthogonal* fix that
-  makes anchors fire reliably. Keep it.
+- **Benchmark driver change — PLANNED, NOT YET LANDED**. Earlier drafts of
+  this doc claimed `PROMPT_PREFIX` was updated to instruct the agent to
+  preserve identifiers verbatim in the `task` field. That edit was never
+  actually made — the prefix only *illustrates* identifier usage via an
+  example string. Follow-up work tracks three candidate steering mechanisms
+  that supersede the original single-prompt idea:
+  1. **Server-side tool description** on a new optional `context` param of
+     `run_pipeline` — every MCP client sees it, persuades real-world agents
+     to pass the raw problem statement.
+  2. **PROMPT_PREFIX variant (identifier preservation)** — nudge the agent
+     to keep identifiers in `task`. Agent-compliance-dependent; works on
+     the existing schema.
+  3. **PROMPT_PREFIX variant (verbatim forward)** — nudge the agent to
+     paste the full problem statement into `context`. Easier compliance
+     ask (mechanical forwarding, no summarization judgment), but still
+     depends on the new schema field landing first.
+
+  The Phase 1 prompt-split that now branches `PROMPT_PREFIX` by arm (control
+  arm no longer sees the `run_pipeline` nudge) is an orthogonal fairness
+  fix, not an anchor-reliability fix. See
+  `benches/swebench/run.py::build_prompt`.
 
 **End-to-end validation against the 3 regression case studies** (with pre-indexed
 workspaces, identifier-preserving task strings, post-v1.1 binary):

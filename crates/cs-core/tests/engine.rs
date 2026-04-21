@@ -2159,3 +2159,132 @@ fn index_workspace_prunes_stale_files() {
         .unwrap();
     assert!(kept.contains("kept_fn"), "kept symbol should survive prune");
 }
+
+// ─── run_pipeline_with_context (Phase 2 / v1.7 context param) ───────────────
+//
+// The `context` parameter is a raw-text blob used *only* for anchor
+// extraction. It exists so callers (notably the SWE-bench harness) can pass
+// the full problem statement alongside a paraphrased `task` — identifiers the
+// agent dropped from the summary are recovered from the raw source.
+//
+// These tests verify:
+//   1. `context=None` is behaviorally identical to plain `run_pipeline`.
+//   2. Identifiers present *only* in `context` (not in `task`) surface symbols
+//      that would otherwise miss.
+
+/// Helper: in a workspace with a distinctively-named Python symbol, assert
+/// whether a capsule built from `(task, context)` contains the symbol.
+fn capsule_has_symbol(
+    engine: &CoreEngine,
+    task: &str,
+    context: Option<&str>,
+    needle: &str,
+) -> bool {
+    let out = engine
+        .run_pipeline_with_context(task, context, Some(4000), None, None)
+        .expect("run_pipeline_with_context");
+    out.contains(needle)
+}
+
+#[test]
+fn context_none_matches_plain_run_pipeline() {
+    // Byte-equality of capsule output across the two entrypoints. We use
+    // two independent engine/workspace pairs so the auto-observation side
+    // effect of the first call doesn't pollute the second's session memory.
+    fn make() -> (TempDir, CoreEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mod.py"),
+            "def distinctive_anchor_zzz():\n    return 1\n",
+        )
+        .unwrap();
+        let engine = test_engine(&dir);
+        engine.index_workspace().expect("index");
+        (dir, engine)
+    }
+    let (_d1, e1) = make();
+    let a = e1
+        .run_pipeline("distinctive_anchor_zzz bug", Some(4000), None, None)
+        .unwrap();
+    let (_d2, e2) = make();
+    let b = e2
+        .run_pipeline_with_context("distinctive_anchor_zzz bug", None, Some(4000), None, None)
+        .unwrap();
+    assert_eq!(
+        a, b,
+        "run_pipeline and run_pipeline_with_context(context=None) must match"
+    );
+}
+
+#[test]
+fn context_recovers_identifier_paraphrased_out_of_task() {
+    // Simulates the SWE-bench failure mode: the agent paraphrased away the
+    // identifier into a bag-of-English `task`, but the raw problem statement
+    // still names the function. Without context, BM25 likely misses; with
+    // context, the anchor fires.
+    let dir = tempfile::tempdir().unwrap();
+    // Target symbol with a unique name unlikely to match BM25 on generic prose.
+    std::fs::write(
+        dir.path().join("target.py"),
+        "def obscurely_named_fn_q42():\n    \"\"\"short doc\"\"\"\n    return None\n",
+    )
+    .unwrap();
+    // Decoy files so the capsule isn't trivial.
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("decoy_{i}.py")),
+            format!("def decoy_{i}():\n    return {i}\n"),
+        )
+        .unwrap();
+    }
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index");
+
+    // Paraphrased task — strips the identifier.
+    let task_without_anchor = "fix bug in the obscure function";
+    // Raw context still names the symbol verbatim.
+    let raw_problem = "Error trace:\n  File 'target.py', line 3, in obscurely_named_fn_q42\nfailed";
+
+    let without = capsule_has_symbol(&engine, task_without_anchor, None, "obscurely_named_fn_q42");
+    let with = capsule_has_symbol(
+        &engine,
+        task_without_anchor,
+        Some(raw_problem),
+        "obscurely_named_fn_q42",
+    );
+
+    assert!(
+        with,
+        "context containing identifier should surface the symbol via anchor extraction"
+    );
+    // Note: `without` is not strictly required to be false — this is a smoke
+    // test of the recovery path. We assert the positive case only so the test
+    // stays stable across ranker tweaks. If it ever does surface without the
+    // context, delete this comment — no harm.
+    let _ = without;
+}
+
+#[test]
+fn context_dedupes_against_task() {
+    // Sanity: if an identifier appears in both `task` and `context`, the
+    // symbol isn't double-counted (no panic, no duplicate pivot). Pure smoke.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("m.py"),
+        "def unique_q99_fn():\n    return 1\n",
+    )
+    .unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index");
+
+    let out = engine
+        .run_pipeline_with_context(
+            "fix unique_q99_fn",
+            Some("Problem: unique_q99_fn crashes."),
+            Some(4000),
+            None,
+            None,
+        )
+        .expect("pipeline");
+    assert!(out.contains("unique_q99_fn"), "symbol should be present");
+}
