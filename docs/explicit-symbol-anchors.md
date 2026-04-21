@@ -107,20 +107,47 @@ in order of estimated leverage:
   imports and assertions pin the fix site precisely. Narrow win for
   swebench; doesn't generalize to real-world use.
 
-Phase 4 CLAUDE.md's chaining guidance (`run_pipeline` → `get_impact_graph`)
-was never actually delivered to the agent in any of the Phase 4 runs.
-Post-hoc stream analysis (scanning all 121 events / 467 KB of the final
-run for distinctive CLAUDE.md content) found **zero** matches: the file
-was written to `workdir/CLAUDE.md` as designed, but `claude --print`
-does not auto-load CLAUDE.md from `cwd` (that's interactive-mode-only
-behaviour). So every Phase 4 result has been measuring bare TREATMENT_NUDGE
-behaviour, not "agent + CLAUDE.md guidance." **Whether the chaining
-guidance would help remains untested.**
+Phase 4 CLAUDE.md delivery went through two corrections. Initially
+(`--inject-claude-md` via file write only), `claude --print` does not
+auto-load `cwd/CLAUDE.md` — interactive-mode-only behaviour — so the
+file sat on disk and the agent never saw it. Verified post-hoc: all
+121 events / 467 KB of the Phase 4e stream contain zero distinctive
+CLAUDE.md content.
 
-Harness fix: the `--inject-claude-md` flag now ALSO inlines the
-CLAUDE.md body into the PROMPT_PREFIX so the agent actually receives
-the content. The on-disk write is retained as an audit artifact.
-See `benches/swebench/run.py::build_prompt` and `maybe_inject_claude_md`.
+Fixed in commit `b122161`: `--inject-claude-md` now inlines the
+CLAUDE.md body into `PROMPT_PREFIX` after `TREATMENT_NUDGE`. The
+on-disk write is retained as an audit artifact.
+
+Reran the harness with delivery confirmed working (Phase 4f). Outcome:
+
+| Metric | Phase 4e (delivery no-op) | Phase 4f (delivery working) |
+|---|---|---|
+| Wall / cost | 279 s / $0.95 | **600 s timeout** |
+| Patch | 582 B ✓ | **0 B ✗** |
+| Tool calls | 40 | 64 |
+| `get_impact_graph` calls | 0 | **0** (unchanged) |
+| Files explored | focused, reached `mod.py` | `trigsimp.py`×9, never `mod.py` |
+
+The extra 2,781 chars of guidance **changed the agent's exploration
+path** (9 Reads on `sympy/simplify/trigsimp.py`, new behaviour) but
+did **not** trigger the specifically-recommended `run_pipeline →
+get_impact_graph` chain. It sent the agent into a different and less
+productive exploration subtree, and the 600 s budget expired without
+an edit attempt.
+
+Revised conclusion: prompt-level CLAUDE.md-style chain guidance is
+**not a reliable steering lever** — not because it isn't read, but
+because reading it doesn't change tool-selection behaviour and the
+extra content can actively distract. The best outcome on this task
+remains without CLAUDE.md injection. Recommendation: disable
+`--inject-claude-md` for automated benchmarks until a steering approach
+empirically helps. Real-user interactive use is unaffected (interactive
+mode does auto-load `CLAUDE.md`).
+
+**Reference baseline for future ranking work**: v1.7 + #67
+(reverse-expand) + `SymbolKind::Import` filter + `--nudge 5b`,
+**without** `--inject-claude-md`. 279 s / $0.95 / correct 582 B patch
+on sympy-21379. Measure any new approach against this number.
 
 ### Harness / measurement infrastructure — stable baseline
 
