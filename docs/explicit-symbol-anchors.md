@@ -1,13 +1,139 @@
 # Design: Explicit Symbol-Name Anchors in the Ranking Pipeline
 
-> **Status**: v1 → v1.7 implemented.
-> **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`
-> **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`
+> **Status**: v1 → v1.7 landed, plus #67 (reverse-edge expansion) and
+> `SymbolKind::Import` pivot filter. #69 (density+query-aware reverse-expand
+> ranking) landed and was **reverted** after empirical regression; see the
+> "Session 2026-04-21 findings" section below.
+> **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`, `crates/cs-core/src/ranking.rs`
+> **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`, `benches/swebench/WARM_WORKSPACES.md`
 > **Motivation**: SWE-bench #29c revealed that capsule ranking misses the target
 > file in 5 out of 6 regression tasks even with semantic (embedding) retrieval
 > enabled. The failure mode is always the same: the task explicitly names the
 > target symbol, but the ranker treats it as bag-of-words and surfaces
 > tangentially-related files instead.
+
+---
+
+## Session 2026-04-21 findings — `sympy__sympy-21379` deep-dive
+
+End-to-end SWE-bench harness validation on the motivating v1.6 regression
+case (`sympy__sympy-21379`: `PolynomialError` on `subs()` with `Piecewise`
+argument; fix site `sympy/core/mod.py::Mod.eval`, reached 3+ hops upstream
+via reverse edges). Full reproducer, artifacts, and stream logs captured
+in `target/swebench/with/sympy__sympy-21379/` on branch
+`claude/clever-leakey-7ab62d`.
+
+### Outcome across configurations
+
+| Config | Wall | Cost | Patch | Notes |
+|---|---:|---:|---:|---|
+| Bare claude (29c backup) | 96 s | $0.30 | 610 B ✓ | No codesurgeon, Grep → edit |
+| v1.7 + 5b nudge only | 290 s | $1.01 | 864 B ✓ | Phase 3 baseline |
+| v1.7 + #65 cap + CLAUDE.md | 296 s | $1.02 | 864 B ✓ | Phase 4a/b — identical pivots to Phase 3 |
+| + #67 reverse-expand | 296 s | $1.02 | 864 B ✓ | Walk fires, 20 candidates, none reach `Mod.eval` |
+| **+ #69 density+query-aware** | **600 s** | **—** | **0 B ✗** | Phase 4c timeout, imports won pivots |
+| + #69 + import filter | 600 s | — | 0 B ✗ | Phase 4d — non-import pivots still distract |
+| **Revert #69, keep import filter** | **279 s** | **$0.95** | **582 B ✓** | Phase 4e — restores success |
+
+### Three empirical claims this session added to the record
+
+#### 1. `Mod.eval` is not reachable via the default reverse-expand walk
+
+The chain `Mod.eval → AssocOp._from_args → ComplexRootOf.__new__ →
+PolynomialError` exists in the graph (verified via `codesurgeon flow`),
+but default `REVERSE_EXPAND_FAN_OUT = 5` explores a narrow 5×5×5 ≈ 125-node
+beam and `Mod.eval` is outside it. Doubling the pool (#69's density-aware
+fan-out 5..25) didn't change the outcome: `Mod.eval` still absent from
+pivots, adjacents, and skeletons. Tracked by #69.
+
+#### 2. Query-aware ranking has a sharp failure mode on symptom-anchored queries
+
+The core observation: **the fix site has zero query-term overlap by
+construction**. For `sympy__sympy-21379` the user names `PolynomialError`,
+`subs`, `Piecewise`, `sinh`, `exp`, `symbols` — never `Mod` (the containing
+class) or `eval` (the method). Ranking callers by term overlap with the
+query actively demotes the fix site because it has none of the words the
+query mentions.
+
+Consequences of #69's query-aware ranking observed in harness runs:
+- Bare `from X import (A, B, C)` lines scored highest (their FQN/body
+  literally list the query's named symbols) and won pivot slots. Fixed by
+  filtering `SymbolKind::Import` at pivot selection (commit `359d4ad`).
+- Even with imports filtered, the shifted pivot composition sent the agent
+  into a deeper exploration loop: 64 tool calls across 10+ files, reaching
+  `Mod.eval` but never committing to an edit before the 600 s timeout.
+  Phase 4d. Unfixed by any local tuning; root cause is the ranking criterion
+  itself.
+
+This is the anti-correlation already flagged in the v1.7 finding below:
+query-aware ranking helps queries that already name the fix site (where
+anchors alone would have fired) and hurts queries that don't (the class
+reverse-expansion was designed for). #69 has been reverted pending a
+different approach (centrality-dominated ranking with term overlap as
+tiebreaker, or semantic embedding similarity on function bodies rather
+than surface-text term match).
+
+#### 3. `SymbolKind::Import` must be excluded from pivot eligibility globally
+
+Not just reverse-expand. Import-statement symbols have a distinctive
+pathology: their FQN is literally the statement text (`from X import (A,
+B, …)`), so any retriever that scores on name/FQN/body term overlap
+promotes them when the query mentions their re-exported symbols. BM25
+does this too. Pivot-level filter (`is_eligible_pivot` in
+`build_context_capsule`, commit `359d4ad`) is load-bearing regardless of
+which retrieval source surfaced the import. Regression test:
+`reverse_expand_does_not_surface_import_statements` in
+`crates/cs-core/tests/reverse_expand.rs`.
+
+### What still doesn't work — open structural problem
+
+Capsules on symptom-anchored queries remain ~3× bare-claude cost on
+sympy-21379 ($0.95 / 279 s vs $0.30 / 96 s). Root cause: **anchor-based
+retrieval has no mechanism to reach fix sites named after internal
+primitives the user doesn't know about.** Three possible next directions,
+in order of estimated leverage:
+
+- **Traceback parsing**: when `context` contains `File "...", line N, in
+  func_name` frames, extract FQNs directly as anchors. Deterministic;
+  works on ~40% of real bug reports. Doesn't help sympy-21379 (no trace
+  in the post) but would solve the class on tasks that do have traces.
+- **Body-text embedding similarity to task+context**: rerank reverse-expand
+  candidates by semantic similarity of the function body to the query
+  rather than by surface term overlap. `Mod.eval`'s body calls `gcd(p, q)`
+  and handles numeric cases — semantically near "polynomial"/"modulo"
+  themes. Heavier engineering (per-symbol embeddings already exist for
+  ANN; the infrastructure is reusable).
+- **Reproducer-test awareness**: swebench tasks ship failing tests. Their
+  imports and assertions pin the fix site precisely. Narrow win for
+  swebench; doesn't generalize to real-world use.
+
+Phase 4 CLAUDE.md's suggestion that the agent chain `run_pipeline` →
+`get_impact_graph` was empirically ignored in every run — agents default
+to Grep/Read regardless of prompt-level chaining guidance. Not worth more
+prompt engineering; the structural fixes above are better leverage.
+
+### Harness / measurement infrastructure — stable baseline
+
+Workflow to reproduce any of the rows in the table above:
+
+```bash
+bash benches/swebench/prepare_workspace.sh sympy__sympy-21379
+
+uv run benches/swebench/run.py \
+  --instance-ids sympy__sympy-21379 \
+  --arms with \
+  --reuse-workdir target/swebench-warm/sympy__sympy-21379 \
+  --max-budget-usd 3.00 \
+  --timeout 600 \
+  --nudge 5b \
+  --inject-claude-md \
+  --stream-json \
+  --clean
+```
+
+Stream log under `target/swebench/with/<instance_id>/claude_stream.jsonl`
+is the authoritative record of tool-call behaviour. Diff log under the
+same directory is captured even on timeout (commit `07b4848`).
 
 ---
 
