@@ -150,9 +150,16 @@ through summarization. See `docs/explicit-symbol-anchors.md` §v1.7.
 - For each seed, BFS walks **incoming edges** (`CodeGraph::dependents` —
   callers, importers, raisers) up to `REVERSE_EXPAND_MAX_DEPTH = 3` hops.
 - Per-hop expansion is capped at `REVERSE_EXPAND_FAN_OUT = 5`. Within a hop,
-  callers are ranked by **query-term overlap** in name/fqn, lightly
-  penalized by centrality so utility hubs don't crowd out specific leaf
-  callers.
+  callers are ranked by a blend of **query-term overlap** in name/fqn,
+  **body-text semantic similarity** (embeddings build only — issue #69 v2),
+  and a small centrality penalty so utility hubs don't crowd out specific
+  leaf callers. Scoring:
+  `overlap + REVERSE_EXPAND_SEMANTIC_WEIGHT * cos(query, caller_body) − 0.1 * centrality`.
+  `REVERSE_EXPAND_SEMANTIC_WEIGHT = 2.0` is calibrated so one lexical term
+  match (`+1.0`) still outweighs a moderately related semantic hit
+  (`sim ≈ 0.5` → `+1.0` contribution); the semantic term's job is to
+  reorder the overlap=0 group by topical relevance instead of leaving it
+  to centrality alone.
 - Seeds with more than `REVERSE_EXPAND_SEED_MAX_CALLERS = 500` direct
   callers are skipped — their reverse set is too broad to rank usefully
   (e.g. a language-wide base exception class in a huge codebase).
@@ -174,6 +181,20 @@ Per-hop ranking by term overlap picks the callers most relevant to the
 task, which for the sympy-21379 case includes `parallel_poly_from_expr`
 (name contains the query term "poly") and routes the walk through the
 intended chain.
+
+**Why body-text semantic similarity (#69 v2):** the #67 implementation
+ranked per-hop callers by query-term overlap alone. On dense graphs, the
+actual fix site often has *no* lexical overlap with the query terms — in
+sympy-21379 the fix site is `Mod.eval`, whose name and body carry no
+"substitution" / "Piecewise" tokens even though the body is topically
+aligned (polynomial arithmetic, numeric edge cases, gcd). With a
+five-way top-K beam, such sites are systematically dropped. Adding
+`cos(query_embedding, caller_body_embedding)` as a secondary per-hop
+signal reorders the overlap=0 group by topical relevance, which recovers
+the fix site without displacing strong lexical hits (see the weight
+calibration above). Infrastructure reuse: the per-symbol embeddings
+already exist for ANN retrieval (stage 1e); reverse-expand builds a
+`HashMap<u64, &[f32]>` over the mmap'd cache once per `run_pipeline`.
 
 **Reverse-expanded candidates participate in v1.6 file-diversity pinning**
 alongside direct anchors — a walked caller in an otherwise-uncontested
@@ -429,6 +450,7 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | Reverse-expansion fan-out per hop | 5 | `ranking.rs:REVERSE_EXPAND_FAN_OUT` |
 | Reverse-expansion candidate cap | 20 | `ranking.rs:REVERSE_EXPAND_CANDIDATES` |
 | Reverse-expansion seed max callers | 500 | `ranking.rs:REVERSE_EXPAND_SEED_MAX_CALLERS` |
+| Reverse-expansion semantic weight (#69 v2) | 2.0 | `ranking.rs:REVERSE_EXPAND_SEMANTIC_WEIGHT` |
 | Structural injection cap | `max_pivots * 2` = 16 | `engine.rs:inject_structural_candidates` |
 | Injected candidate score | `family_in_degree * 5.0` | `engine.rs:inject_structural_candidates` |
 | Centrality boost multiplier | 3.0 | `engine.rs:apply_centrality_and_semantics` |

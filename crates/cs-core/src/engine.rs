@@ -2471,6 +2471,33 @@ impl CoreEngine {
         // so generic anchors like `parse_latex` or `exp` don't trigger a
         // blowup. Walk is depth- and fan-out-bounded — see ranking.rs
         // REVERSE_EXPAND_* constants.
+        //
+        // Issue #69 v2: when embeddings are available, per-caller scoring
+        // inside the BFS blends the existing query-term-overlap signal with
+        // cosine similarity between the query embedding and each caller's
+        // body embedding. This recovers fix sites like sympy-21379's
+        // `Mod.eval` whose body is topically aligned with the problem
+        // statement but has no lexical overlap with the query terms.
+        #[cfg(feature = "embeddings")]
+        let (re_query_vec, re_emb_guard) = {
+            self.ensure_embedding_cache();
+            let qv = self
+                .embedder
+                .get()
+                .and_then(|emb| match emb.embed_one(&anchor_source) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!("reverse-expand query embed failed: {}", e);
+                        None
+                    }
+                });
+            let guard = qv.as_ref().map(|_| self.embedding_cache.read());
+            (qv, guard)
+        };
+        #[cfg(feature = "embeddings")]
+        let re_emb_lookup: Option<std::collections::HashMap<u64, &[f32]>> =
+            re_emb_guard.as_ref().map(|g| g.iter().collect());
+
         let reverse_results: Vec<(u64, f32)> = if self.config.reverse_expand_anchors {
             let graph = self.graph.read();
             let seed_ids: Vec<u64> = anchor_results
@@ -2493,6 +2520,27 @@ impl CoreEngine {
                 Vec::new()
             } else {
                 let terms = query_terms_for_reverse_expand(&anchor_source);
+
+                #[cfg(feature = "embeddings")]
+                let semantic_closure = |id: u64| -> Option<f32> {
+                    let qv = re_query_vec.as_ref()?;
+                    let v = re_emb_lookup.as_ref()?.get(&id)?;
+                    Some(cosine_similarity(qv, v).clamp(0.0, 1.0))
+                };
+                #[cfg(feature = "embeddings")]
+                let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = if re_query_vec.is_some()
+                    && re_emb_lookup
+                        .as_ref()
+                        .map(|m| !m.is_empty())
+                        .unwrap_or(false)
+                {
+                    Some(&semantic_closure)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "embeddings"))]
+                let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = None;
+
                 let out = reverse_expand_from_anchors(
                     &graph,
                     &seed_ids,
@@ -2500,13 +2548,15 @@ impl CoreEngine {
                     REVERSE_EXPAND_MAX_DEPTH,
                     REVERSE_EXPAND_FAN_OUT,
                     REVERSE_EXPAND_CANDIDATES,
+                    semantic_ref,
                 );
                 tracing::debug!(
-                    "reverse-expand: {} seeds → {} candidates (depth={}, fan_out={})",
+                    "reverse-expand: {} seeds → {} candidates (depth={}, fan_out={}, semantic={})",
                     seed_ids.len(),
                     out.len(),
                     REVERSE_EXPAND_MAX_DEPTH,
-                    REVERSE_EXPAND_FAN_OUT
+                    REVERSE_EXPAND_FAN_OUT,
+                    semantic_ref.is_some()
                 );
                 out
             }
