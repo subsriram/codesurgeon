@@ -528,6 +528,157 @@ def mcp_preflight(mcp_bin: Path, workspace: Path, timeout_s: int = 5) -> tuple[b
     return True, f"verified {len(tools)} tools incl. run_pipeline", tools
 
 
+def mcp_sidecar_start(
+    mcp_bin: Path, workspace: Path, ready_timeout_s: int = 30
+) -> tuple[subprocess.Popen | None, str]:
+    """Spawn ``codesurgeon-mcp`` against ``workspace`` as a primary daemon,
+    wait for its engine to be ready, then leave it running.
+
+    When ``claude --print`` later spawns its own MCP via ``--mcp-config``,
+    the sidecar already holds the PID lock (``.codesurgeon/mcp.pid``).
+    Claude's process falls into the server's "secondary mode" branch in
+    ``cs-mcp::main`` — secondary mode runs ``CoreEngine::new`` synchronously
+    (``without_embedder()``, so it's fast) and populates ``cell`` before
+    starting the stdio loop. That eliminates the race where the first
+    ``tools/call run_pipeline`` arrives before the engine is ready and
+    returns the ``⏳ Engine still initializing`` placeholder.
+
+    Returns ``(Popen, message)``. Returns ``(None, err_msg)`` if the
+    sidecar failed to reach engine-ready within ``ready_timeout_s``; the
+    caller should abort the run in that case. On success, the caller is
+    responsible for killing the Popen in a ``finally`` block after
+    ``claude --print`` returns.
+
+    Why a primary-mode sidecar (not two secondaries):
+      - Only the primary does background indexing. A schema-mismatched
+        workspace still gets re-indexed in the background while claude's
+        secondary serves warm from SQLite — behaviour unchanged from today.
+      - Secondary mode is synchronous + embedder-skipping, so it's fast
+        exactly when we need it (during the agent's first tool call).
+    """
+    init_req = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "swebench-harness-sidecar", "version": "0"},
+        },
+    })
+    status_req = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "index_status", "arguments": {}},
+    })
+
+    proc = subprocess.Popen(
+        [str(mcp_bin)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "CS_WORKSPACE": str(workspace)},
+        text=True,
+    )
+
+    # Kick off the handshake. `initialize` always returns fast (doesn't
+    # wait for engine). We then poll `tools/call index_status` — it
+    # returns the "Engine still initializing" placeholder while the
+    # engine is loading, and the real status once `cell` is populated.
+    try:
+        proc.stdin.write(init_req + "\n")
+        proc.stdin.flush()
+    except BrokenPipeError:
+        proc.kill()
+        proc.wait(timeout=5)
+        return None, "sidecar: broken pipe writing initialize"
+
+    # Drain the initialize response (we don't need its contents — just want
+    # to move past it in the response stream).
+    init_line = proc.stdout.readline()
+    if not init_line:
+        proc.kill()
+        proc.wait(timeout=5)
+        stderr_tail = proc.stderr.read()[-500:] if proc.stderr else ""
+        return None, f"sidecar: no initialize response; stderr: {stderr_tail!r}"
+
+    import time as _time
+
+    start = _time.monotonic()
+    poll_count = 0
+    while _time.monotonic() - start < ready_timeout_s:
+        poll_count += 1
+        try:
+            proc.stdin.write(status_req + "\n")
+            proc.stdin.flush()
+        except BrokenPipeError:
+            break
+        # We send a new id=2 each round but since the server's id doesn't
+        # have to be unique from the client's side we just re-read the
+        # next line and parse. If the response is the placeholder, keep
+        # polling; if it's real, we're ready.
+        line = proc.stdout.readline()
+        if not line:
+            break
+        try:
+            obj = json.loads(line.strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        result = obj.get("result") or {}
+        content = result.get("content") or []
+        text = content[0].get("text", "") if content else ""
+        if "Engine still initializing" in text:
+            _time.sleep(0.2)
+            continue
+        # Real response — engine is ready.
+        elapsed = _time.monotonic() - start
+        return proc, f"sidecar ready after {elapsed:.1f}s, {poll_count} polls"
+
+    # Timed out. Kill and surface the error.
+    stderr_tail = ""
+    if proc.stderr:
+        try:
+            stderr_tail = proc.stderr.read(2000) or ""
+        except Exception:
+            stderr_tail = ""
+    proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    return (
+        None,
+        f"sidecar: engine not ready within {ready_timeout_s}s; stderr tail: {stderr_tail[-500:]!r}",
+    )
+
+
+def mcp_sidecar_stop(proc: subprocess.Popen) -> None:
+    """Kill the sidecar MCP started by ``mcp_sidecar_start``.
+
+    Closes stdin (lets the stdio loop exit cleanly if it can) then
+    SIGKILLs after a brief grace period to guarantee background threads
+    don't keep the process alive.
+    """
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+
+
 def git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
@@ -888,6 +1039,42 @@ def run_one(
                     error=f"mcp preflight failed: {msg}",
                 )
 
+        # 2a.6. MCP sidecar — spawn codesurgeon-mcp as a primary daemon
+        # against the real workspace BEFORE claude --print starts. The
+        # sidecar holds the pid lock and its engine is fully warmed when
+        # claude --print spawns its own MCP. Claude's MCP detects the
+        # lock and takes the secondary-mode path (synchronous engine
+        # init, no background indexing), so `cell` is populated before
+        # `run_stdio_loop` accepts the first `tools/call`. This bypasses
+        # the race where the agent's first `run_pipeline` could arrive
+        # before `CoreEngine::new` finished and receive the
+        # "⏳ Engine still initializing" placeholder.
+        #
+        # Treatment arm only. Killed in the `finally` block regardless
+        # of how the claude invocation exits.
+        sidecar: subprocess.Popen | None = None
+        if arm == "with" and not dry_run:
+            sidecar, sidecar_msg = mcp_sidecar_start(mcp_bin, workdir)
+            if sidecar is None:
+                print(f"  MCP-SIDECAR-FAIL: {sidecar_msg}", file=sys.stderr)
+                return RunResult(
+                    instance_id=task["instance_id"],
+                    repo=task["repo"],
+                    arm=arm,
+                    exit_code=-5,
+                    walltime_s=0.0,
+                    input_tokens=None,
+                    output_tokens=None,
+                    cache_creation_tokens=None,
+                    cache_read_tokens=None,
+                    total_cost_usd=None,
+                    diff_bytes=0,
+                    diff_path=None,
+                    claude_json_path=None,
+                    error=f"mcp sidecar failed: {sidecar_msg}",
+                )
+            print(f"  [sidecar: {sidecar_msg}]", file=sys.stderr, end="", flush=True)
+
         # 2b. Phase 4 — optionally seed `workdir/CLAUDE.md` with codesurgeon
         # tool guidance so the child Claude Code session auto-loads it at
         # startup. Gated by `inject_claude_md`. Treatment arm only.
@@ -936,43 +1123,51 @@ def run_one(
 
         t0 = time.monotonic()
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                cwd=workdir,
-            )
-            exit_code = proc.returncode
-            stdout = proc.stdout
-            stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
-            err_msg = None if exit_code == 0 else f"exit={exit_code}; stderr-tail={stderr_tail}"
-        except subprocess.TimeoutExpired as e:
-            # Preserve whatever was captured before the kill so the partial
-            # stream (stream-json mode) can be inspected post-mortem —
-            # otherwise a timed-out run is a total black box.
-            #
-            # `subprocess.TimeoutExpired.stdout` / `.stderr` are **bytes**
-            # on Python 3.14, regardless of `text=True` on `run()`. (A
-            # completed `proc.stdout` under `text=True` is `str`; the
-            # exception attrs are not decoded by the same path.) Decode
-            # defensively so downstream code that expects `str` (e.g.
-            # `Path.write_text`) doesn't crash.
-            def _decode(x: object) -> str:
-                if x is None:
-                    return ""
-                if isinstance(x, bytes):
-                    return x.decode("utf-8", errors="replace")
-                return x  # type: ignore[return-value]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    cwd=workdir,
+                )
+                exit_code = proc.returncode
+                stdout = proc.stdout
+                stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
+                err_msg = None if exit_code == 0 else f"exit={exit_code}; stderr-tail={stderr_tail}"
+            except subprocess.TimeoutExpired as e:
+                # Preserve whatever was captured before the kill so the partial
+                # stream (stream-json mode) can be inspected post-mortem —
+                # otherwise a timed-out run is a total black box.
+                #
+                # `subprocess.TimeoutExpired.stdout` / `.stderr` are **bytes**
+                # on Python 3.14, regardless of `text=True` on `run()`. (A
+                # completed `proc.stdout` under `text=True` is `str`; the
+                # exception attrs are not decoded by the same path.) Decode
+                # defensively so downstream code that expects `str` (e.g.
+                # `Path.write_text`) doesn't crash.
+                def _decode(x: object) -> str:
+                    if x is None:
+                        return ""
+                    if isinstance(x, bytes):
+                        return x.decode("utf-8", errors="replace")
+                    return x  # type: ignore[return-value]
 
-            exit_code = -2
-            stdout = _decode(e.stdout)
-            partial_stderr = _decode(e.stderr)
-            stderr_tail = partial_stderr[-2000:]
-            err_msg = (
-                f"timeout after {timeout_s}s "
-                f"(captured {len(stdout)} B stdout, {len(partial_stderr)} B stderr)"
-            )
+                exit_code = -2
+                stdout = _decode(e.stdout)
+                partial_stderr = _decode(e.stderr)
+                stderr_tail = partial_stderr[-2000:]
+                err_msg = (
+                    f"timeout after {timeout_s}s "
+                    f"(captured {len(stdout)} B stdout, {len(partial_stderr)} B stderr)"
+                )
+        finally:
+            # Always reap the sidecar MCP, even on timeout / exception.
+            # Leaking the sidecar would leave orphan codesurgeon-mcp
+            # processes holding the pid lock, poisoning subsequent runs.
+            if sidecar is not None:
+                mcp_sidecar_stop(sidecar)
+                sidecar = None
         walltime = time.monotonic() - t0
 
         # 4. Capture artifacts (diff + raw claude json) into results_dir for
