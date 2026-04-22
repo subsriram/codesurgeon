@@ -603,7 +603,7 @@ async fn run_stdio_loop(cell: EngineCell) {
                     continue;
                 }
 
-                let response = handle_message(&cell, &message).await;
+                let response = handle_message(cell.get(), &message).await;
 
                 if let Some(resp) = response {
                     let json = match serde_json::to_string(&resp) {
@@ -652,18 +652,7 @@ async fn run_stdio_loop(cell: EngineCell) {
     }
 }
 
-/// How long `initialize` waits for `CoreEngine::new` to finish before
-/// responding anyway. Matches Claude Code's client-side `initialize`
-/// timeout (30s per its debug logs); if we time out here, the client
-/// would time us out in the same window.
-const INITIALIZE_ENGINE_WAIT: Duration = Duration::from_secs(30);
-
-/// Poll interval while waiting for the engine to be populated. 100ms
-/// is fine — `CoreEngine::new` typically finishes in 1–3s on warm
-/// workspaces, so this loop runs 10–30 times and adds negligible CPU.
-const ENGINE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-async fn handle_message(cell: &EngineCell, line: &str) -> Option<Response> {
+async fn handle_message(engine: Option<&Arc<CoreEngine>>, line: &str) -> Option<Response> {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -676,40 +665,6 @@ async fn handle_message(cell: &EngineCell, line: &str) -> Option<Response> {
 
     match req.method.as_str() {
         "initialize" => {
-            // Block until CoreEngine::new() has populated the cell, or until
-            // a safety timeout fires. Without this wait, Claude Code's init
-            // event is captured while our engine is still loading — the
-            // agent's subsequent `tools/call run_pipeline` then arrives
-            // before the engine is ready and the handler returns a
-            // "⏳ Engine still initializing" placeholder. Agents that see
-            // the placeholder on their first call generally give up on the
-            // capsule and fall back to Grep/Read, silently degrading runs.
-            //
-            // Typical `CoreEngine::new` time: 1–3s on a warm workspace
-            // (SQLite open + graph load), 0.02s on an empty one. Schema-
-            // bump re-indexing runs later in a separate thread, so it does
-            // NOT contribute to this wait — tool calls against a schema-
-            // mismatched workspace still serve from the warm SQLite per
-            // commit 19cd12e while the background re-index runs.
-            let start = std::time::Instant::now();
-            while cell.get().is_none() {
-                tokio::time::sleep(ENGINE_WAIT_POLL_INTERVAL).await;
-                if start.elapsed() >= INITIALIZE_ENGINE_WAIT {
-                    tracing::warn!(
-                        "Engine not ready within {}s — returning `initialize: ok` \
-                         anyway; early tool calls may receive the initializing \
-                         placeholder",
-                        INITIALIZE_ENGINE_WAIT.as_secs()
-                    );
-                    break;
-                }
-            }
-            tracing::debug!(
-                "initialize: engine ready after {:?} (cell set = {})",
-                start.elapsed(),
-                cell.get().is_some()
-            );
-
             // Echo back the client's requested protocol version so any version
             // of the Claude client (old or new) sees a match and doesn't reject us.
             let protocol_version = req
@@ -761,20 +716,12 @@ async fn handle_message(cell: &EngineCell, line: &str) -> Option<Response> {
                 .unwrap_or("");
             let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
 
-            // Engine is normally ready here because `initialize` now blocks
-            // until `cell.get()` is populated. The `None` branch remains as a
-            // defensive fallback for clients that skip `initialize` or time
-            // out waiting — surfaces a retryable placeholder instead of a
-            // crash. The imperative wording tells agents to retry the same
-            // call; empirical cold-cache CoreEngine::new is < 3s.
-            let Some(engine) = cell.get() else {
+            let Some(engine) = engine else {
                 return Some(Response::ok(
                     req.id,
                     json!({ "content": [{ "type": "text", "text":
-                        "⏳ Engine still initializing. CALL THIS SAME TOOL AGAIN \
-                         with the same arguments in 5 seconds — this capsule is \
-                         required; do not proceed to Read/Grep without it. \
-                         Typical ready-time: 2–8s on a warm workspace." }] }),
+                        "⏳ Engine still initializing (loading index + embedding model). \
+                         Retry in a few seconds or call `index_status` to check." }] }),
                 ));
             };
 
