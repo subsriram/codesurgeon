@@ -69,10 +69,19 @@ utility function called by 200 places would flood the pool with noise).
 
 ### 1c. Explicit anchors (`engine.rs:anchor_candidates`, `anchors.rs`)
 
-- Extracts identifier-shaped tokens from the query using three sources:
+- Extracts identifier-shaped tokens from the query using four sources:
   1. **Code-block API calls** — `xr.where(...)`, `parse_latex(...)` inside fenced code blocks
   2. **Import statements** — `from sympy.parsing.latex import parse_latex`
-  3. **Prose identifiers** — snake_case or CamelCase tokens in the problem statement (stop-list filtered)
+  3. **Python traceback frames** (#69 v2) — `  File "path", line N, in <func>`
+     lines from a pasted traceback. Frame-name identifiers bypass the
+     snake/camel shape filter that prose tokens must pass, so plain
+     lowercase function names (`eval`, `apply`, `run`) that appear in a
+     stack frame are surfaced. Synthetic frame names (`<module>`,
+     `<listcomp>`, `<genexpr>`, `<lambda>`) and stop-words are dropped.
+     Dotted frame names like `Mod.eval` push both the full chain and the
+     tail into the anchor pool. Only fires on `context` that actually
+     contains a traceback; a stray "File" in prose does not false-match.
+  4. **Prose identifiers** — snake_case or CamelCase tokens in the problem statement (stop-list filtered)
 - For each extracted name, looks up matching symbols in two stages:
   1. **Exact name** in SQLite (`symbols_by_exact_name`) — strongest signal, score 1.0.
   2. **Name-field BM25** via Tantivy (`search_name`) — fallback **only when

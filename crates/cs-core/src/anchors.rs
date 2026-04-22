@@ -1,10 +1,11 @@
 //! Explicit symbol-name anchor extraction for ranking.
 //!
 //! Extracts identifiers from the task query that look like exact symbol names.
-//! Three sources:
+//! Four sources (in rank order):
 //!   1. Function/method calls in fenced code blocks (`foo.bar(...)`)
 //!   2. `from X.Y import Z` / `import X.Y as Z` statements
-//!   3. Prose tokens that look like identifiers (snake_case or CamelCase)
+//!   3. Python traceback frames (`File "...", line N, in <func>`) — #69 v2
+//!   4. Prose tokens that look like identifiers (snake_case or CamelCase)
 //!
 //! All matches are flat-scored — ranking within the anchor list is
 //! "extraction order" (code snippets first, then prose). RRF fusion handles
@@ -174,6 +175,20 @@ fn dotted_prose_re() -> &'static Regex {
     })
 }
 
+fn traceback_frame_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Python traceback frame: `  File "path/to/file.py", line 42, in func_name`.
+    // Captures (1) the file path and (2) the function/method identifier.
+    // Works for both Python 2- and 3-style tracebacks and tolerates leading
+    // whitespace / different quoting. `<module>`, `<genexpr>`, `<listcomp>`
+    // and similar synthetic frame names start with `<` and are filtered by
+    // the caller — we only want real symbol identifiers.
+    RE.get_or_init(|| {
+        Regex::new(r#"(?m)^\s*File\s+"([^"]+)",\s*line\s+\d+,\s*in\s+([A-Za-z_<][A-Za-z0-9_<>.]*)"#)
+            .unwrap()
+    })
+}
+
 /// Extracted anchors, in order of discovery.
 #[derive(Debug, Default, Clone)]
 pub struct Anchors {
@@ -261,7 +276,39 @@ pub fn extract(query: &str) -> Anchors {
         }
     }
 
-    // 3. Prose identifiers — lower priority, filtered by stop words + shape.
+    // 3. Python traceback frames (issue #69 v2). `File "...", line N, in <name>`
+    //    lines carry high-precision symbol identifiers from the error's stack.
+    //    These bypass the snake/camel shape filter that prose tokens need to
+    //    pass — plain lowercase function names like `eval`, `apply`, or `run`
+    //    are valid targets when they come from a traceback. Synthetic frame
+    //    names (`<module>`, `<genexpr>`, `<listcomp>`, …) are filtered out.
+    //    Inserted after imports and before prose so traceback identifiers
+    //    get rank priority over generic prose tokens.
+    for cap in traceback_frame_re().captures_iter(query) {
+        if let Some(func) = cap.get(2) {
+            let name = func.as_str();
+            if name.starts_with('<') || name.len() < 3 {
+                continue;
+            }
+            if STOP_WORDS.contains(&name.to_lowercase().as_str()) {
+                continue;
+            }
+            // Dotted frame name (e.g. `ClassName.method_name`) — push both
+            // the full chain and the tail so the resolver has options.
+            let is_dotted = name.contains('.');
+            push(&mut out, &mut seen, name);
+            if is_dotted {
+                out.from_dotted_call.insert(name.to_string());
+                if let Some(last) = name.rsplit('.').next() {
+                    if last != name && last.len() >= 3 {
+                        push(&mut out, &mut seen, last);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Prose identifiers — lower priority, filtered by stop words + shape.
     for m in identifier_re().find_iter(query) {
         let tok = m.as_str();
         let lower = tok.to_lowercase();
@@ -278,7 +325,7 @@ pub fn extract(query: &str) -> Anchors {
         push(&mut out, &mut seen, tok);
     }
 
-    // 4. Dotted-identifier chains anywhere in the query (inline prose API
+    // 5. Dotted-identifier chains anywhere in the query (inline prose API
     //    calls like `xr.where`). The prose regex above stops at `.` so it
     //    would miss these; this pass catches them and marks them as
     //    originating from a dotted call so the resolver prefers module-level
@@ -420,5 +467,104 @@ mod tests {
         let a = extract(q);
         assert!(a.from_dotted_call.contains("xr.where"));
         assert!(a.from_dotted_call.contains("where"));
+    }
+
+    // ── Traceback parsing (issue #69 v2) ─────────────────────────────────
+
+    #[test]
+    fn traceback_function_names_extracted() {
+        // Classic Python traceback — three frames, three identifiers.
+        // Note `my_func` uses snake_case (would pass prose filter too),
+        // but `apply` is plain lowercase and would be rejected by the prose
+        // shape check; the traceback pass must surface it anyway.
+        let q = "\
+Traceback (most recent call last):
+  File \"app/main.py\", line 12, in <module>
+    my_func(x)
+  File \"app/core.py\", line 42, in my_func
+    return apply(x)
+  File \"app/core.py\", line 99, in apply
+    raise ValueError(\"bad\")
+ValueError: bad
+";
+        let a = extract(q);
+        assert!(
+            a.symbol_names.contains(&"my_func".to_string()),
+            "expected my_func from traceback, got {:?}",
+            a.symbol_names
+        );
+        assert!(
+            a.symbol_names.contains(&"apply".to_string()),
+            "expected apply (plain lowercase, no shape match) to be extracted from the traceback frame; got {:?}",
+            a.symbol_names
+        );
+        // <module> is synthetic and must be skipped.
+        assert!(
+            !a.symbol_names.iter().any(|s| s == "<module>"),
+            "synthetic <module> frame leaked into symbol_names: {:?}",
+            a.symbol_names
+        );
+    }
+
+    #[test]
+    fn traceback_dotted_method_frame() {
+        // Python 3.11+ tracebacks include `ClassName.method` in the `in`
+        // field for bound methods. Push both the full name and the tail.
+        let q = "  File \"sympy/core/mod.py\", line 85, in Mod.eval\n    raise PolynomialError(x)";
+        let a = extract(q);
+        assert!(a.symbol_names.contains(&"Mod.eval".to_string()));
+        assert!(a.symbol_names.contains(&"eval".to_string()));
+        assert!(a.from_dotted_call.contains("Mod.eval"));
+    }
+
+    #[test]
+    fn traceback_short_frame_name_skipped() {
+        // `in go` — 2 chars — must be filtered. The length gate exists
+        // because 1–2 letter identifiers generate too much fuzz at the
+        // anchor-resolver stage.
+        let q = "  File \"m.py\", line 1, in go";
+        let a = extract(q);
+        assert!(!a.symbol_names.iter().any(|s| s == "go"));
+    }
+
+    #[test]
+    fn traceback_synthetic_frames_skipped() {
+        // `<module>`, `<listcomp>`, `<genexpr>`, `<lambda>` — all CPython
+        // synthetic frame names that are not real symbols.
+        let q = "\
+  File \"a.py\", line 1, in <module>
+  File \"a.py\", line 2, in <listcomp>
+  File \"a.py\", line 3, in <genexpr>
+  File \"a.py\", line 4, in <lambda>
+";
+        let a = extract(q);
+        for synth in ["<module>", "<listcomp>", "<genexpr>", "<lambda>"] {
+            assert!(
+                !a.symbol_names.iter().any(|s| s == synth),
+                "synthetic frame {:?} must not appear in symbol_names: {:?}",
+                synth,
+                a.symbol_names
+            );
+        }
+    }
+
+    #[test]
+    fn traceback_frame_stop_word_filtered() {
+        // A plain-English stop word that happens to appear as a frame name
+        // (e.g. `in call`) should still be filtered — the traceback pass
+        // bypasses the shape check but not the stop-word list.
+        let q = "  File \"x.py\", line 1, in call";
+        let a = extract(q);
+        assert!(!a.symbol_names.iter().any(|s| s == "call"));
+    }
+
+    #[test]
+    fn traceback_without_trace_shape_is_noop() {
+        // A plain mention of the word "File" in prose must not false-match.
+        let q = "Please update the File header in each module.";
+        let a = extract(q);
+        // No frame-style match — prose identifiers may still populate
+        // from the shape filter, but nothing from a traceback frame.
+        assert!(!a.symbol_names.iter().any(|s| s == "header"));
     }
 }
