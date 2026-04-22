@@ -35,6 +35,7 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import shutil
@@ -189,6 +190,15 @@ First, call mcp__cs-codesurgeon__run_pipeline with two fields:
 With the returned capsule, you can investigate further with: mcp__cs-codesurgeon__get_impact_graph (callers/raisers of a symbol),  mcp__cs-codesurgeon__get_skeleton (file API),  mcp__cs-codesurgeon__search_logic_flow (trace A→B).
 """
 
+TREATMENT_NUDGE_5J = """\
+
+Before you start reading files, call mcp__cs-codesurgeon__run_pipeline with two fields:
+1. task: a short description of the work, e.g. task="fix PolynomialError on subs with Piecewise"
+2. context: one symbol name or FQN per line — include both the identifiers named in the problem statement AND internal functions/classes/modules the error chain implies that are likely to be fix-site methods, even if the user didn't name them.
+
+After receiving the capsule, you can investigate further with the following cs-codesurgeon tools: get_impact_graph (callers/raisers of a symbol), get_skeleton (file API), search_logic_flow (trace A→B).
+"""
+
 NUDGES: dict[str, str] = {
     "5b": TREATMENT_NUDGE_5B,
     "5c": TREATMENT_NUDGE_5C,
@@ -197,6 +207,7 @@ NUDGES: dict[str, str] = {
     "5g": TREATMENT_NUDGE_5G,
     "5h": TREATMENT_NUDGE_5H,
     "5i": TREATMENT_NUDGE_5I,
+    "5j": TREATMENT_NUDGE_5J,
 }
 
 # Empirical results on `sympy__sympy-21379` — each variant, single run,
@@ -392,6 +403,79 @@ def materialize_mcp_with(mcp_bin: Path, workspace: Path, tmp: Path) -> Path:
     out = tmp / "mcp_with.json"
     out.write_text(rendered)
     return out
+
+
+def mcp_preflight(mcp_bin: Path, workspace: Path, timeout_s: int = 15) -> tuple[bool, str, list[str]]:
+    """Verify ``codesurgeon-mcp`` is launchable and advertises its tools.
+
+    Spawns the binary with NDJSON-framed ``initialize`` + ``tools/list``
+    requests, waits for responses within ``timeout_s``, and checks that
+    ``run_pipeline`` is in the returned tool set. Used as a preflight
+    before ``claude --print`` to catch the case where MCP fails to come
+    up (observed in 2026-04-21 session — run bqak7iyhx-5j had
+    ``mcp_servers: []`` in the agent's init event, meaning the agent
+    ran without any cs-codesurgeon tool access, silently invalidating
+    the whole run).
+
+    Returns ``(ok, message, tool_names)``. Fast-fail on timeout / spawn
+    error / missing tools; caller decides whether to abort or retry.
+    """
+    init_req = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "swebench-harness-preflight", "version": "0"},
+        },
+    })
+    tools_req = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    payload = f"{init_req}\n{tools_req}\n"
+    try:
+        proc = subprocess.run(
+            [str(mcp_bin)],
+            input=payload,
+            env={**os.environ, "CS_WORKSPACE": str(workspace)},
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"preflight timed out after {timeout_s}s (MCP did not respond)", []
+    except FileNotFoundError:
+        return False, f"mcp binary not found: {mcp_bin}", []
+
+    # Parse NDJSON responses — look for the tools/list result (id=2).
+    tools: list[str] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict) and obj.get("id") == 2 and "result" in obj:
+            for t in obj["result"].get("tools", []) or []:
+                name = t.get("name")
+                if isinstance(name, str):
+                    tools.append(name)
+
+    if not tools:
+        tail = (proc.stderr or "")[-500:]
+        return (
+            False,
+            f"no tools/list response from codesurgeon-mcp; stderr tail: {tail!r}",
+            [],
+        )
+    if not any("run_pipeline" in t for t in tools):
+        return (
+            False,
+            f"run_pipeline missing from tools/list (got {len(tools)}: {tools[:5]}...)",
+            tools,
+        )
+    return True, f"verified {len(tools)} tools incl. run_pipeline", tools
 
 
 def git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
@@ -724,6 +808,36 @@ def run_one(
 
         assert mcp_config is not None
 
+        # 2a.5. Preflight — verify codesurgeon-mcp comes up and advertises
+        # its tools BEFORE we spawn claude --print. Without this, runs
+        # where MCP fails to come up in time end up silently running the
+        # agent with zero cs-codesurgeon tool access (agent's init event
+        # has `mcp_servers: []`), invalidating the whole measurement.
+        # Observed 1 in 6 saved streams in the 2026-04-21 session.
+        #
+        # Only in the treatment arm with a live MCP — skip for control
+        # and dry-run. Takes < 2s when the MCP starts cleanly.
+        if arm == "with" and not dry_run:
+            ok, msg, tools = mcp_preflight(mcp_bin, workdir)
+            if not ok:
+                print(f"  MCP-PREFLIGHT-FAIL: {msg}", file=sys.stderr)
+                return RunResult(
+                    instance_id=task["instance_id"],
+                    repo=task["repo"],
+                    arm=arm,
+                    exit_code=-4,
+                    walltime_s=0.0,
+                    input_tokens=None,
+                    output_tokens=None,
+                    cache_creation_tokens=None,
+                    cache_read_tokens=None,
+                    total_cost_usd=None,
+                    diff_bytes=0,
+                    diff_path=None,
+                    claude_json_path=None,
+                    error=f"mcp preflight failed: {msg}",
+                )
+
         # 2b. Phase 4 — optionally seed `workdir/CLAUDE.md` with codesurgeon
         # tool guidance so the child Claude Code session auto-loads it at
         # startup. Gated by `inject_claude_md`. Treatment arm only.
@@ -813,8 +927,19 @@ def run_one(
 
         # 4. Capture artifacts (diff + raw claude json) into results_dir for
         # downstream evaluation. Named by (arm, instance_id).
+        #
+        # Every artifact is written twice:
+        #   - `claude.json` / `claude_stream.jsonl` / `patch.diff` — the
+        #     canonical "latest run" names used by downstream tooling and
+        #     by report scripts that don't care about history.
+        #   - `archive/<isotime>_*` — permanent per-run copies so
+        #     subsequent runs don't overwrite them. Preserves the stream
+        #     for every configuration tried on the same task.
         artifact_base = results_dir / arm / task["instance_id"]
         artifact_base.mkdir(parents=True, exist_ok=True)
+        archive_dir = artifact_base / "archive"
+        archive_dir.mkdir(exist_ok=True)
+        run_ts = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
 
         claude_json_path: Path | None = None
         if stdout:
@@ -826,12 +951,15 @@ def run_one(
             artifact_name = "claude_stream.jsonl" if stream_json else "claude.json"
             claude_json_path = artifact_base / artifact_name
             claude_json_path.write_text(stdout)
+            # Archive a timestamped copy.
+            shutil.copy2(claude_json_path, archive_dir / f"{run_ts}_{artifact_name}")
 
         diff = capture_diff(workdir, exclude_claude_md=injected_claude_md is not None)
         diff_path: Path | None = None
         if diff:
             diff_path = artifact_base / "patch.diff"
             diff_path.write_text(diff)
+            shutil.copy2(diff_path, archive_dir / f"{run_ts}_patch.diff")
 
         # 5. Parse token stats.
         claude_json = parse_claude_json(stdout, stream_json=stream_json) if stdout else {}
