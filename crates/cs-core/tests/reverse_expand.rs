@@ -266,3 +266,101 @@ fn reverse_expand_does_not_surface_import_statements() {
         );
     }
 }
+
+/// Trivial exception-class stubs (`class FooError(Base): pass`) rank highly
+/// on BM25 when the task names the exception, but their bodies are a single
+/// declaration line and carry no behaviour. Before this filter, on the
+/// sympy-21379 corpus `PolynomialError` (a 1-line `pass` stub) took pivot
+/// slot #7 and `Mod.eval` — the actual fix site, reachable via
+/// reverse-expand through the raise chain — lost the slot.
+///
+/// With the filter, the stub is dropped from pivot eligibility and the
+/// behaviour-carrying caller takes the slot instead. The stub is still
+/// available as a reverse-expand seed (we want the walk to run) — it just
+/// can't *occupy* a pivot slot on its own.
+#[test]
+fn trivial_exception_stub_is_excluded_from_pivots() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1-line exception stub — matches the `PolynomialError(BasePolynomialError): pass` shape.
+    std::fs::write(
+        dir.path().join("errors.py"),
+        "class BaseAppError(Exception):\n    pass\n\n\
+         class AppError(BaseAppError):\n    pass\n",
+    )
+    .unwrap();
+
+    // Behaviour-carrying caller that raises the stub exception.
+    std::fs::write(
+        dir.path().join("fix_site.py"),
+        "from errors import AppError\n\n\
+         def run_the_pipeline():\n\
+         \x20   raise AppError(\"boom\")\n",
+    )
+    .unwrap();
+
+    let e = engine_for(&dir, true, 8);
+    e.index_workspace().expect("index");
+
+    let out = e
+        .run_pipeline("fix AppError crash", Some(16000), None, None)
+        .expect("run_pipeline");
+    let pivots = pivot_fqns(&out);
+
+    // The stub itself must NOT occupy a pivot slot: its body is `pass`, no
+    // behaviour to show.
+    assert!(
+        !pivots.iter().any(|p| p.ends_with("::AppError")),
+        "trivial exception stub AppError should not occupy a pivot slot; pivots: {:?}\n\n{}",
+        pivots,
+        out
+    );
+
+    // The behaviour-carrying caller (reached via reverse-expand) must be
+    // present — the point is that its slot is no longer contested by the
+    // stub.
+    assert!(
+        pivots.iter().any(|p| p.contains("run_the_pipeline")),
+        "expected the raiser of AppError to surface as a pivot; pivots: {:?}\n\n{}",
+        pivots,
+        out
+    );
+}
+
+/// Exception classes with real methods (`__init__`, `__str__`, custom
+/// formatting, validation, etc.) carry behaviour worth showing as pivots.
+/// The filter must NOT drop them — only trivial `pass` stubs.
+#[test]
+fn non_trivial_exception_classes_remain_eligible_as_pivots() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Exception with real methods — > 3 non-blank body lines.
+    std::fs::write(
+        dir.path().join("errors.py"),
+        "class RichError(Exception):\n\
+         \x20   \"\"\"An error with real machinery.\"\"\"\n\
+         \x20   def __init__(self, code, msg):\n\
+         \x20       super().__init__(msg)\n\
+         \x20       self.code = code\n\
+         \x20   def __str__(self):\n\
+         \x20       return f\"[{self.code}] {self.args[0]}\"\n",
+    )
+    .unwrap();
+
+    let e = engine_for(&dir, true, 8);
+    e.index_workspace().expect("index");
+
+    let out = e
+        .run_pipeline("fix RichError crash", Some(16000), None, None)
+        .expect("run_pipeline");
+    let pivots = pivot_fqns(&out);
+
+    // The rich exception class should surface as a pivot — its __init__ and
+    // __str__ carry information the agent can use.
+    assert!(
+        pivots.iter().any(|p| p.ends_with("::RichError")),
+        "non-trivial exception class with real methods should occupy a pivot slot; pivots: {:?}\n\n{}",
+        pivots,
+        out
+    );
+}

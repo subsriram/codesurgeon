@@ -8,10 +8,27 @@ fn test_engine(dir: &TempDir) -> CoreEngine {
     CoreEngine::new(config).expect("engine init failed")
 }
 
+/// Engine with `auto_observations = true`. Use from tests that exercise the
+/// legacy auto-memory path; the production default is off (#72).
+fn test_engine_with_auto_obs(dir: &TempDir) -> CoreEngine {
+    let mut config = EngineConfig::new(dir.path()).without_embedder();
+    config.auto_observations = true;
+    CoreEngine::new(config).expect("engine init failed")
+}
+
 fn indexed_engine_with_two_langs(dir: &TempDir) -> CoreEngine {
     std::fs::write(dir.path().join("lib.rs"), "pub fn rust_fn() {}\n").unwrap();
     std::fs::write(dir.path().join("script.py"), "def py_fn(): pass\n").unwrap();
     let engine = test_engine(dir);
+    engine.index_workspace().expect("index failed");
+    engine
+}
+
+/// Like `indexed_engine_with_two_langs` but with auto-observations enabled.
+fn indexed_engine_with_two_langs_auto_obs(dir: &TempDir) -> CoreEngine {
+    std::fs::write(dir.path().join("lib.rs"), "pub fn rust_fn() {}\n").unwrap();
+    std::fs::write(dir.path().join("script.py"), "def py_fn(): pass\n").unwrap();
+    let engine = test_engine_with_auto_obs(dir);
     engine.index_workspace().expect("index failed");
     engine
 }
@@ -272,11 +289,12 @@ fn get_skeleton_max_depth_filters_nested_symbols() {
     }
 }
 
-/// `run_pipeline` must write an `auto` observation when pivots are found.
+/// `run_pipeline` must write an `auto` observation when pivots are found
+/// AND `auto_observations` is enabled in config (off by default — #72).
 #[test]
 fn run_pipeline_writes_auto_observation() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
     engine
         .run_pipeline("rust fn", Some(4000), None, None)
         .expect("run_pipeline failed");
@@ -300,11 +318,12 @@ fn run_pipeline_writes_auto_observation() {
     );
 }
 
-/// `get_context_capsule` must write an `auto` observation when pivots are found.
+/// `get_context_capsule` must write an `auto` observation when pivots are found
+/// AND `auto_observations` is enabled in config (off by default — #72).
 #[test]
 fn get_context_capsule_writes_auto_observation() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
     engine
         .get_context_capsule("py fn", Some(4000), None, None)
         .expect("get_context_capsule failed");
@@ -324,10 +343,11 @@ fn get_context_capsule_writes_auto_observation() {
 }
 
 /// Calling `run_pipeline` twice with the same task must deduplicate — only one auto observation.
+/// Exercises the auto-observation path; default is off (#72).
 #[test]
 fn run_pipeline_deduplicates_auto_observations() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
     engine
         .run_pipeline("rust fn", Some(4000), None, None)
         .expect("first call failed");
@@ -349,11 +369,13 @@ fn run_pipeline_deduplicates_auto_observations() {
     );
 }
 
-/// `run_pipeline` with no matching symbols must not write an auto observation.
+/// `run_pipeline` with no matching symbols must not write an auto observation,
+/// even when the auto-observation flag is on. Without enabling the flag this
+/// would be a tautology (#72 disables auto-obs by default).
 #[test]
 fn run_pipeline_no_pivots_skips_auto_observation() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(&dir); // empty index — no symbols
+    let engine = test_engine_with_auto_obs(&dir); // empty index — no symbols
     engine
         .run_pipeline("xyzzy no match", Some(4000), None, None)
         .expect("run_pipeline failed");
@@ -370,6 +392,57 @@ fn run_pipeline_no_pivots_skips_auto_observation() {
         auto_obs.is_empty(),
         "expected no auto observation when there are no pivots, got: {:?}",
         auto_obs.iter().map(|o| &o.content).collect::<Vec<_>>()
+    );
+}
+
+/// Default `auto_observations = false` (#72): `run_pipeline` must NOT write
+/// an auto observation on a vanilla engine, even when pivots are found.
+/// Repeatedly running with the default must keep the memory table empty of
+/// Auto-kind rows, so failed runs can't poison future runs.
+#[test]
+fn run_pipeline_does_not_auto_record_when_flag_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir); // default config: auto_observations = false
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .expect("run_pipeline failed");
+    engine
+        .run_pipeline("py fn", Some(4000), None, None)
+        .expect("run_pipeline failed");
+
+    let observations = engine
+        .get_session_context()
+        .expect("get_session_context failed")
+        .observations;
+    let auto_obs: Vec<_> = observations
+        .iter()
+        .filter(|o| o.kind.as_str() == "auto")
+        .collect();
+    assert!(
+        auto_obs.is_empty(),
+        "auto_observations=false is the default; no 'auto' rows should be written, got: {:?}",
+        auto_obs.iter().map(|o| &o.content).collect::<Vec<_>>()
+    );
+}
+
+/// `[observability] auto_observations = true` in config.toml must enable the
+/// legacy auto-memory path even though the EngineConfig default is off.
+#[test]
+fn config_toml_enables_auto_observations() {
+    use cs_core::memory::IndexingConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[observability]\nauto_observations = true\n",
+    )
+    .unwrap();
+
+    let cfg = IndexingConfig::load_from_toml(&config_dir.join("config.toml"));
+    assert!(
+        cfg.auto_observations,
+        "auto_observations should be true after loading from [observability]"
     );
 }
 
@@ -837,10 +910,11 @@ fn compress_observations_merges_symbol_observations() {
 }
 
 /// `get_session_context` wraps observations and staleness_score together.
+/// Auto-observations are only recorded when the flag is enabled (#72).
 #[test]
 fn get_session_context_returns_session_context_struct() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
     engine
         .run_pipeline("rust fn", Some(4000), None, None)
         .unwrap();
@@ -1359,11 +1433,12 @@ fn consolidate_observations_is_noop_without_embedder() {
 }
 
 /// Auto observations written by `run_pipeline` must survive `consolidate_observations`
-/// intact when the embedder is absent (no premature expiry).
+/// intact when the embedder is absent (no premature expiry). Requires the
+/// auto-observation flag since the default is off (#72).
 #[test]
 fn consolidate_does_not_expire_observations_without_embedder() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
 
     engine
         .run_pipeline("rust fn", Some(4000), None, None)

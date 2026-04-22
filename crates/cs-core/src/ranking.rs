@@ -160,6 +160,42 @@ pub(crate) fn is_reverse_expand_seed(sym: &Symbol) -> bool {
     name.ends_with("Error") || name.ends_with("Exception") || name.ends_with("Warning")
 }
 
+/// True when `sym` is a named exception class whose body is a trivial stub
+/// — e.g. `class PolynomialError(BasePolynomialError): pass`.
+///
+/// Such symbols make terrible pivots: the body carries no behaviour, so the
+/// agent sees only a 1-line declaration, yet they rank highly whenever the
+/// task mentions the exception class by name (BM25 match on the FQN). The
+/// fix is to exclude them from pivot slots — `reverse_expand_from_anchors`
+/// will have surfaced the raiser/caller chain separately, and those
+/// behaviour-carrying callers should take the pivot slot instead.
+///
+/// Gate logic:
+/// - kind is a class-like type definition (matches `is_reverse_expand_seed`)
+/// - name ends with `Error` / `Exception` / `Warning`
+/// - body has ≤ 3 non-blank lines (class header + `pass`/docstring + optional base)
+///
+/// This is a NARROW filter: exception classes with real methods
+/// (`__init__`, `__str__`, custom machinery) are retained as pivots because
+/// their bodies are informative. Regression: sympy-21379 capsule picked
+/// `PolynomialError` (a 1-line `pass` stub) as pivot #7, wasting a slot that
+/// `Mod.eval` (the actual fix site, reachable by reverse-expand) should have
+/// taken.
+pub(crate) fn is_trivial_exception_pivot(sym: &Symbol) -> bool {
+    if sym.is_stub {
+        return false;
+    }
+    if !sym.kind.is_type_definition() {
+        return false;
+    }
+    let name = sym.name.as_str();
+    if !(name.ends_with("Error") || name.ends_with("Exception") || name.ends_with("Warning")) {
+        return false;
+    }
+    let non_blank_lines = sym.body.lines().filter(|l| !l.trim().is_empty()).count();
+    non_blank_lines <= 3
+}
+
 /// BFS reverse walk from `seed_ids` through incoming edges (`dependents`).
 ///
 /// Returns `(id, score)` pairs where earlier hops score higher (`1 / (depth + 1)`).

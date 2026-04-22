@@ -18,12 +18,13 @@ use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    is_reverse_expand_seed, query_terms_for_reverse_expand, resolve_adjacents,
-    reverse_expand_from_anchors, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES,
-    ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME,
-    ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS,
-    REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT, REVERSE_EXPAND_MAX_DEPTH,
-    REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K, STUB_SCORE_WEIGHT,
+    is_reverse_expand_seed, is_trivial_exception_pivot, query_terms_for_reverse_expand,
+    resolve_adjacents, reverse_expand_from_anchors, rrf_merge_ks, select_adjacents,
+    ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE,
+    ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
+    MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT,
+    REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
+    STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -141,6 +142,20 @@ pub struct EngineConfig {
     /// the raise-chain from a user-named error class (issue #67). See
     /// `docs/ranking.md` Stage 1f and `docs/explicit-symbol-anchors.md`.
     pub reverse_expand_anchors: bool,
+
+    /// When true, each `run_pipeline` / `get_context_capsule` call auto-records
+    /// `(query, top pivot FQNs)` as an `Auto` observation. Later queries surface
+    /// consolidated versions of those tuples in their capsule.
+    ///
+    /// Default: **false** (disabled). The record-side has no success signal —
+    /// queries whose pivots missed the fix site are recorded identically to
+    /// queries that led to a correct diff, so repeated failures cement the
+    /// wrong pivots as "canonical" memory and poison future runs.
+    ///
+    /// Enable via `[observability] auto_observations = true` in `config.toml`
+    /// to opt into the pre-#72 behaviour. Explicit `save_observation` calls
+    /// (agent-attested memory) are unaffected.
+    pub auto_observations: bool,
 }
 
 /// Controls adjacent-symbol body fraction in context capsules.
@@ -199,6 +214,7 @@ impl EngineConfig {
             skeleton_detail: SkeletonDetail::default(),
             token_rate_usd: 0.000003,
             reverse_expand_anchors: true,
+            auto_observations: false,
         }
     }
 
@@ -407,6 +423,9 @@ impl CoreEngine {
         }
         if let Some(rate) = indexing_config.token_rate_usd {
             config.token_rate_usd = rate;
+        }
+        if indexing_config.auto_observations {
+            config.auto_observations = true;
         }
 
         // Write .codesurgeon/.gitignore if absent, excluding index.db always
@@ -1291,13 +1310,18 @@ impl CoreEngine {
         }
 
         // Auto-capture this tool call as an observation for cross-session memory.
-        let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
-        if let Err(e) = self
-            .memory
-            .lock()
-            .record_auto_observation(task, &pivot_fqns)
-        {
-            tracing::warn!("auto-observation failed: {}", e);
+        // Gated on `config.auto_observations` (default false). See the field doc
+        // in `EngineConfig` — recording query→pivots with no success signal
+        // caused failed runs to reinforce wrong pivots on subsequent queries.
+        if self.config.auto_observations {
+            let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
+            if let Err(e) = self
+                .memory
+                .lock()
+                .record_auto_observation(task, &pivot_fqns)
+            {
+                tracing::warn!("auto-observation failed: {}", e);
+            }
         }
 
         // Log query metrics.
@@ -1368,14 +1392,17 @@ impl CoreEngine {
             None,
         )?;
 
-        // Auto-capture this tool call as an observation for cross-session memory.
-        let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
-        if let Err(e) = self
-            .memory
-            .lock()
-            .record_auto_observation(query, &pivot_fqns)
-        {
-            tracing::warn!("auto-observation failed: {}", e);
+        // Auto-capture is gated on config.auto_observations (default false);
+        // see the field doc on EngineConfig.
+        if self.config.auto_observations {
+            let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
+            if let Err(e) = self
+                .memory
+                .lock()
+                .record_auto_observation(query, &pivot_fqns)
+            {
+                tracing::warn!("auto-observation failed: {}", e);
+            }
         }
 
         Ok(format_capsule(&capsule))
@@ -2687,10 +2714,21 @@ impl CoreEngine {
         //     they win pivot slots they push the agent into unrelated
         //     files. Regressed sympy-21379 from 290 s success to 600 s
         //     timeout before this filter landed.
+        //   - `is_trivial_exception_pivot`: `class FooError(Base): pass`
+        //     stubs. Body is a single declaration line — useless as a
+        //     pivot, yet ranks high when the task names the exception
+        //     class. Reverse-expand has already walked up from them to
+        //     behaviour-carrying callers (raisers); those callers deserve
+        //     the slot instead. See sympy-21379 where `PolynomialError`
+        //     stole a slot that `Mod.eval` should have taken.
         let is_eligible_pivot = |id: u64| -> bool {
             graph
                 .get_symbol(id)
-                .map(|s| !s.is_stub && s.kind != crate::symbol::SymbolKind::Import)
+                .map(|s| {
+                    !s.is_stub
+                        && s.kind != crate::symbol::SymbolKind::Import
+                        && !is_trivial_exception_pivot(s)
+                })
                 .unwrap_or(false)
         };
 
