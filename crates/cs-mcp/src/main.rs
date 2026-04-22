@@ -94,30 +94,30 @@ fn tool_list() -> Value {
         "tools": [
             {
                 "name": "run_pipeline",
-                "description": "Primary tool. Single-call pipeline: hybrid search + graph traversal + session memory. Auto-detects intent from your task description (debug/refactor/add/explore). Returns compressed context with full source for pivot symbols. Use this for most tasks.",
+                "description": "First call when investigating a bug, error, crash, exception, or fix task. Returns the functions, classes, and call chains related to the problem — including raisers and catchers of exceptions named in the report, and modules transitively reached from a traceback. Use before Read, Grep, or file exploration.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "task": {
                             "type": "string",
-                            "description": "Describe what you want to do, e.g. 'fix JWT validation bug' or 'refactor UserService'"
+                            "description": "Short description of the bug, error, or fix, e.g. 'fix token validation crash' or 'debug database retry'."
                         },
                         "context": {
                             "type": "string",
-                            "description": "Optional. Raw verbatim text the task was derived from — the full problem statement, bug report, error output, or stack trace. Used for symbol-anchor extraction; pass the unmodified source rather than a paraphrase so function names, class names, and dotted API calls mentioned in the original text are found in the index. Has no effect on budget: BM25, semantic search, and intent detection still run against `task` alone."
+                            "description": "Optional. Full verbatim problem statement, bug report, error message, or traceback. Used to anchor the search on exception class names and identifiers that appear in the raw text but might be paraphrased out of `task`."
                         },
                         "budget_tokens": {
                             "type": "integer",
-                            "description": "Max tokens to include in the capsule (default: 4000)",
+                            "description": "Max tokens in the capsule (default: 4000).",
                             "default": 4000
                         },
                         "language": {
                             "type": "string",
-                            "description": "Restrict results to a single language, e.g. 'rust', 'python', 'typescript'"
+                            "description": "Restrict to one language, e.g. 'rust', 'python'."
                         },
                         "file_hint": {
                             "type": "string",
-                            "description": "Seed the search with a specific file path substring, e.g. 'src/auth' — results are filtered to symbols in matching files"
+                            "description": "File path substring to scope the search, e.g. 'src/auth'."
                         }
                     },
                     "required": ["task"]
@@ -125,26 +125,26 @@ fn tool_list() -> Value {
             },
             {
                 "name": "get_context_capsule",
-                "description": "Lightweight context search. Returns only the code relevant to your query, bounded to token budget. Pivot symbols in full, adjacent symbols as skeletons.",
+                "description": "Find code matching a short query. Returns pivot functions/classes in full plus adjacent signatures as skeletons. Use for focused lookups when you already have a specific term to search for.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "What you're looking for, e.g. 'authentication middleware' or 'database connection pool'"
+                            "description": "What to find, e.g. 'authentication middleware' or 'retry backoff'."
                         },
                         "budget_tokens": {
                             "type": "integer",
-                            "description": "Max tokens (default: 4000)",
+                            "description": "Max tokens (default: 4000).",
                             "default": 4000
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Maximum number of pivot symbols to return (default: 8)"
+                            "description": "Max pivot symbols to return (default: 8)."
                         },
                         "min_score": {
                             "type": "number",
-                            "description": "Minimum relevance score threshold (0.0–1.0); symbols below this are excluded"
+                            "description": "Minimum relevance (0.0–1.0)."
                         }
                     },
                     "required": ["query"]
@@ -152,25 +152,25 @@ fn tool_list() -> Value {
             },
             {
                 "name": "get_impact_graph",
-                "description": "Show every caller, importer, and dependent that would break if this symbol changes. Use before any refactor to understand blast radius.",
+                "description": "Trace callers, raisers, catchers, and importers of a symbol. Use when an exception class or function name appears in a bug report and you need the code path that raises or invokes it. Also for blast-radius assessment before renaming or refactoring.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "symbol_fqn": {
                             "type": "string",
-                            "description": "Fully-qualified name, e.g. 'src/auth/service.py::AuthService::validate_token'"
+                            "description": "Fully-qualified name, e.g. 'src/auth/service.py::AuthService::validate_token'."
                         },
                         "max_depth": {
                             "type": "integer",
-                            "description": "Maximum traversal depth for transitive dependents (default: 5)"
+                            "description": "Max traversal depth for transitive callers (default: 5)."
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Per-list cap on dependents (default: 100). High-fan-out symbols (e.g. exception base classes) can have thousands of transitive dependents — the cap keeps the response under ~5k tokens. Highest-centrality dependents are preserved when truncation fires; truncation count is reported in the response."
+                            "description": "Per-list cap on dependents (default: 100). Highest-centrality callers preserved when truncation fires."
                         },
                         "include_tests": {
                             "type": "boolean",
-                            "description": "Include test files in the impact results (default: true). Set false to see only production impact.",
+                            "description": "Include test files (default: true).",
                             "default": true
                         }
                     },
@@ -179,17 +179,17 @@ fn tool_list() -> Value {
             },
             {
                 "name": "get_skeleton",
-                "description": "File structure without implementation bodies. Shows signatures, docstrings, return types only. 70-90% token reduction. Use to understand a file's API surface.",
+                "description": "Fast file overview for triage. Lists function signatures, class layouts, docstrings, and imports without bodies. Use to scan a suspect file's structure before deep-reading a specific method.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "Relative path to the file, e.g. 'src/auth/service.py'"
+                            "description": "Relative path to the file, e.g. 'src/auth/service.py'."
                         },
                         "max_depth": {
                             "type": "integer",
-                            "description": "Maximum nesting depth: 1 = top-level symbols only, 2 = top-level + methods, etc. (default: all depths)"
+                            "description": "Nesting depth: 1 = top-level only, 2 = + methods, etc. (default: all)."
                         }
                     },
                     "required": ["file_path"]
@@ -197,7 +197,7 @@ fn tool_list() -> Value {
             },
             {
                 "name": "search_logic_flow",
-                "description": "Trace the execution path between two functions. Debug flow issues without reading every file in between.",
+                "description": "Trace the call chain between two functions. Use when you know both an entry point and an internal function (e.g., a public API and the exception it eventually raises) and need the intermediate steps.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -223,7 +223,7 @@ fn tool_list() -> Value {
             },
             {
                 "name": "get_session_context",
-                "description": "Returns observations from current and previous sessions. Shows what was explored, decided, and learned. Stale observations are flagged.",
+                "description": "Recent debugging notes and observations from this and prior sessions — what was explored, which exceptions were chased, and what was decided. Stale notes (their symbol changed) are flagged. Use at the start of a fix task to recover prior investigation state.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -238,7 +238,7 @@ fn tool_list() -> Value {
             },
             {
                 "name": "search_memory",
-                "description": "Keyword search over saved observations. Direct query interface for past insights — complements get_session_context (which returns recent observations). Use when you need to find a specific past decision or note.",
+                "description": "Keyword search over saved debugging notes and past insights. Use early in a bug investigation to check whether the same exception, crash, or call path was diagnosed before — avoids re-deriving the root cause from scratch.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -263,17 +263,17 @@ fn tool_list() -> Value {
             },
             {
                 "name": "save_observation",
-                "description": "Persist an insight, decision, or note about the codebase. Optionally link to a symbol so it gets auto-flagged stale when that code changes.",
+                "description": "Save a debugging insight tied to a symbol. Persists across sessions; future bug-fix queries retrieve it automatically. Use after resolving a non-obvious call chain, pinning down an exception source, or discovering a tricky invariant worth caching for next time.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "The observation to save"
+                            "description": "The insight, root cause, or invariant to record, e.g. 'AuthError raised inside validate_token when token has no exp claim'."
                         },
                         "symbol_fqn": {
                             "type": "string",
-                            "description": "Optional FQN of the symbol this observation is about"
+                            "description": "Optional FQN of the function/class the insight is about. Linking lets the note auto-flag stale when that symbol changes."
                         }
                     },
                     "required": ["content"]
@@ -281,7 +281,7 @@ fn tool_list() -> Value {
             },
             {
                 "name": "get_diff_capsule",
-                "description": "Given a git diff, return a context capsule focused on changed symbols, their callers, and related test files. Use before reviewing or merging a PR.",
+                "description": "Given a git diff, return a context capsule focused on changed functions, their callers, raisers, and related test files. Use before reviewing a PR or triaging a regression introduced by a recent change.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
