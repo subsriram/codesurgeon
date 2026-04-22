@@ -291,6 +291,13 @@ cleanest wiring.
 
 ## Troubleshooting
 
+> **If every harness run in a session starts failing with `mcp_servers: []`
+> at init and the agent reporting `mcp__cs-codesurgeon__*` tools as
+> "not available"**, jump straight to the *"Agent reports tool is not
+> available in the deferred tools list"* section below — the cause is
+> almost always a stale `claude mcp add*` registration poisoning Claude
+> Code's global MCP state, **not** a harness / binary / workspace bug.
+
 ### `fatal: reference is not a tree: <base_commit>`
 `prepare_workspace.sh` defaults to a shallow fetch. Some repos disallow
 single-commit fetches. The script already falls back to `--depth 50`; if
@@ -346,6 +353,52 @@ run, so this is only needed if a run aborted before that step executed.
 rm -f $SWEBENCH_WARM_ROOT/<iid>/.codesurgeon/mcp.pid
 ```
 No data loss — the pid file is a lock, not part of the index.
+
+### Agent reports "tool is not available in the deferred tools list"
+
+Symptom: every harness run times out / fails, the saved stream's init
+event shows `mcp_servers: []` and zero `mcp__cs-codesurgeon__*` tools
+advertised. Agent explains: *"The tool `mcp__cs-codesurgeon__run_pipeline`
+is not available in this environment."*
+
+This is **not** a harness bug. Claude Code's CLI maintains a global MCP
+registry state (in `~/.claude.json`) that can be poisoned by stale /
+conflicting `claude mcp add` or `claude mcp add-json` registrations made
+outside the harness. When the registry is in a bad state, Claude Code's
+`--print` mode stops advertising **any** MCP tools to the agent — even
+from servers explicitly passed via `--mcp-config` with `--strict-mcp-config`.
+
+Diagnostic: run
+```bash
+claude mcp list
+```
+and inspect the output. Every server entry that points at a stale path
+(e.g. a binary you moved or rebuilt elsewhere), or overlaps with
+`--mcp-config` server names, is a candidate for removal. Remove with:
+```bash
+claude mcp remove <name>
+```
+then kill any orphan processes and rerun the harness:
+```bash
+pkill -f codesurgeon-mcp
+bash benches/swebench/prepare_workspace.sh <iid>   # re-warm index, clears mcp.pid
+```
+
+**Prevention**: don't use `claude mcp add*` to register per-harness MCP
+servers. The harness uses `--mcp-config <ephemeral json>` +
+`--strict-mcp-config` which is supposed to isolate, but the CLI's state
+machine can still break if global registrations collide. Keep global
+registrations for interactive use only; the harness flow should never
+mutate `~/.claude.json`.
+
+This was the root cause of a multi-hour debugging detour in the
+2026-04-21 session: an `add-json cs-worktree ...` done during
+investigation poisoned state for every subsequent `claude --print`
+invocation — the exact symptom looked like "my binary stopped working"
+(zombie MCPs, `mcp_servers: []` at init, agent timing out) but was
+really "CLI state is poisoned." Evidence saved under
+`target/swebench/with/sympy__sympy-21379/archive/2026-04-21T22-*` and
+`archive/2026-04-22T*`.
 
 ### Index size feels too large
 Full sympy at v1.7 with embeddings:
