@@ -354,6 +354,63 @@ rm -f $SWEBENCH_WARM_ROOT/<iid>/.codesurgeon/mcp.pid
 ```
 No data loss — the pid file is a lock, not part of the index.
 
+### Observation table carries poisoned consolidated memories from prior failed runs
+
+Symptom: successive harness runs on the same warm workspace produce
+identical-looking capsules, with a "Session memory" section containing
+`[consolidated from N observations] Queries: ... — pivots: ...` rows that
+cement the pivots from an earlier **failed** run. The agent keeps going to
+the same wrong files.
+
+Cause: before #72, every `run_pipeline` call wrote an `auto` observation
+recording the returned pivots, and the consolidator later merged related
+entries into `Consolidated` rows. Failed runs got recorded just like
+successful ones, so repeated failures on the same query class poisoned the
+memory for future runs.
+
+#72 disabled this by default (`auto_observations = false`), but a workspace
+that accumulated rows before the binary was rebuilt still has them on disk.
+The flag change stops new rows landing; it does not retroactively delete
+the old ones.
+
+**Fix**: wipe the poisoned rows before re-running:
+
+```bash
+sqlite3 target/swebench-warm/<iid>/.codesurgeon/index.db \
+  "DELETE FROM observations WHERE kind IN ('auto', 'consolidated');"
+```
+
+Alternatively, re-run `prepare_workspace.sh` from scratch — a fresh index
+comes with no observations.
+
+Verify the capsule no longer carries session memory by reading the next
+run's stream:
+
+```bash
+python3 -c "
+import json
+for l in open('target/swebench/with/<iid>/archive/<latest>_claude_stream.jsonl'):
+    e = json.loads(l)
+    if e.get('type') == 'user':
+        for b in e.get('message',{}).get('content',[]):
+            if b.get('type') == 'tool_result':
+                s = b.get('content','')
+                if isinstance(s, list): s = ' '.join(x.get('text','') for x in s if x.get('type')=='text')
+                if 'Session memory' in s: print('STILL POISONED'); break
+else: print('clean')
+"
+```
+
+If you actually *want* auto-observations on (the pre-#72 behaviour), opt
+back in via `.codesurgeon/config.toml`:
+
+```toml
+[observability]
+auto_observations = true
+```
+
+For benchmarks, leave it off — see `docs/memory-consolidation.md`.
+
 ### Agent reports "tool is not available in the deferred tools list"
 
 Symptom: every harness run times out / fails, the saved stream's init

@@ -398,6 +398,33 @@ give a false bonus to `PersistenceController`.
   - Others: dependents of pivots
 - Adjacents capped at `max_adjacent` (default: 20), shown as skeletons
 
+### Pivot eligibility filter (`engine.rs:is_eligible_pivot`)
+
+Candidates that pass scoring are still filtered out of the pivot pool if they
+carry no behaviour worth a full-body slot. Three classes of ineligible symbol:
+
+1. **`is_stub`** — library stubs (`.d.ts`, `.pyi`, `.swiftinterface`). External
+   references with no source body.
+2. **`SymbolKind::Import`** — `from X import (A, B, C)` statement lines. Their
+   FQN / body textually contain query terms (the names they re-export), so BM25
+   and query-aware reverse-expand score them highly — but they have no
+   behaviour, no callees beyond the imported names, and no agent-useful
+   content. Regressed sympy-21379 from 290 s success to 600 s timeout before
+   this filter landed (issue #69).
+3. **`is_trivial_exception_pivot`** — class-like definitions whose name ends
+   `Error` / `Exception` / `Warning` with ≤3 non-blank body lines. These are
+   `class PolynomialError(BasePolynomialError): pass` stubs: they BM25-match
+   any task that names the exception but the body is a single declaration
+   line — useless as a pivot. Narrow by design: exception classes with real
+   `__init__` / `__str__` / custom machinery have >3 body lines and stay
+   eligible. Stubs remain valid **reverse-expand seeds** — we still want to
+   walk up from them — they just can't occupy a pivot slot on their own
+   (issue #73).
+
+Skipping happens during pivot SELECTION only; ineligible symbols can still
+participate in RRF ranking, anchor matching, and reverse-expand seeding. See
+the commit history on `ranking.rs` for the full provenance.
+
 ---
 
 ## Key discoveries and design decisions
@@ -474,3 +501,5 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | family_in_degree k | 5 | `graph.rs` |
 | centrality_score k | 15 | `graph.rs` |
 | Stub score weight | × 0.3 | `ranking.rs:STUB_SCORE_WEIGHT` |
+| Trivial exception pivot filter max body lines | 3 | `ranking.rs:is_trivial_exception_pivot` |
+| Auto-observation recording (default) | off | `engine.rs:EngineConfig::auto_observations` |

@@ -8,9 +8,15 @@
 
 ## Overview
 
-codesurgeon keeps a persistent observation store (SQLite) that accumulates entries as agents
-query the codebase. Without housekeeping this grows unboundedly, degrades retrieval quality,
-and wastes tokens when injected into capsules.
+codesurgeon keeps a persistent observation store (SQLite) that records two
+kinds of entries:
+
+- **Agent-attested memory** — what the agent decided was worth saving via the
+  explicit `save_observation` tool. Kinds: `manual`, `insight`.
+- **Auto-observations** — `(query, top pivot FQNs)` tuples captured on every
+  `run_pipeline` / `get_context_capsule` call. **Opt-in** since #72 (see
+  [Auto-observations are opt-in](#auto-observations-are-opt-in) below). Kinds:
+  `auto`, `passive`, `file_thrash`, `dead_end`.
 
 Two complementary passes run at startup to keep the store tidy:
 
@@ -117,6 +123,51 @@ deduplicated by exact content.
 
 ---
 
+## Auto-observations are opt-in
+
+`run_pipeline` and `get_context_capsule` used to record an `auto` observation
+on every call with the content:
+
+```
+Agent queried: "task description" — pivots: fqn1, fqn2, fqn3
+```
+
+Pass 3 (semantic consolidation) then merged related entries into
+`[consolidated from N observations] Queries: X — pivots: Y` rows that
+re-surfaced in future capsules under the "Session memory" heading.
+
+**The record side has no success signal.** A run whose pivots missed the fix
+site got recorded identically to one that led to the correct diff. Repeated
+failures on the same query class therefore cemented the wrong pivots as
+"canonical memory" and reinforced the agent's wrong direction on subsequent
+attempts — observed on sympy-21379 in the SWE-bench harness, where three
+stacked consolidated memories reading *"pivots: symbols, exp, interval.exp"*
+actively steered the agent away from `Mod.eval` (the real fix site).
+
+**Default since #72: off.** `EngineConfig::auto_observations = false` skips
+the record call sites; nothing is written for `run_pipeline` /
+`get_context_capsule` queries. Pass 3 still runs, but with no new auto rows
+to consolidate it becomes a no-op on most workspaces.
+
+**Explicit `save_observation` is unaffected** — it writes `manual` / `insight`
+kinds, which are never touched by the consolidator and never dropped on
+startup. Agents that want cross-session memory should call `save_observation`
+deliberately once they know the outcome was good.
+
+**Opt back in** (restores pre-#72 behaviour) via `.codesurgeon/config.toml`:
+
+```toml
+[observability]
+auto_observations = true
+```
+
+This is the right choice if you want the consolidator to learn from query
+patterns and your workflow self-corrects quickly enough that bad patterns
+don't accumulate. For benchmarks and any workflow where failed runs are
+common, leave it off.
+
+---
+
 ## Observation kinds reference
 
 | Kind | Written by | Merged by consolidation | Merged by compression | Default TTL |
@@ -176,3 +227,5 @@ reserve in order, stopping when that sub-budget is exhausted.
 | Auto/passive/thrash/dead-end TTL | 7 days | `memory.rs::ObservationKind::default_ttl_days` |
 | Summary/consolidated TTL | 90 days | `memory.rs::ObservationKind::default_ttl_days` |
 | Embedding model | NomicEmbedTextV15Q (768-dim) | `embedder.rs::Embedder::new` |
+| Auto-observation recording (default since #72) | off | `engine.rs::EngineConfig::auto_observations` |
+| Auto-observation TOML override | `[observability] auto_observations = true` | `memory.rs::IndexingConfig::load_from_toml` |

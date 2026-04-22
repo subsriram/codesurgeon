@@ -260,6 +260,134 @@ same directory is captured even on timeout (commit `07b4848`).
 
 ---
 
+## Session 2026-04-22 findings — three fixes that together solved `sympy-21379`
+
+Continuation of the 2026-04-21 deep-dive, on claude 2.1.117 (fresh regression
+re: MCP tool registration — `init`'s `mcp_servers` reports `[]` even with the
+sidecar pre-warm; tools arrive via ToolSearch on first call). Three changes
+landed together and produced a reproducible `OK` on the warm sympy-21379
+workspace:
+
+| # | Change | Commit |
+|---|---|---|
+| 1 | Reverse-expand body-text semantic similarity (#69 v2) — cosine(query, caller body) mixes into per-hop BFS scoring so zero-overlap fix sites like `Mod.eval` aren't eliminated by pure term overlap + centrality | `8684552` (cherry-pick of `a313a76`) |
+| 2 | Auto-observation recording default off (#72) | `d50d824` |
+| 3 | Trivial exception-class pivot filter (#73) — drop `class FooError(Base): pass` stubs from pivot eligibility | `d50d824` |
+
+### Measured outcome (same workspace, same prompt, same nudge 5b)
+
+| Config | Wall | Cost | Turns | Patch | Stop reason |
+|---|---:|---:|---:|---:|---|
+| Claude 2.1.117 + sidecar only (14:09 UTC) | 389 s | $1.06 | 38 | 0 B ✗ | `error_max_budget_usd` |
+| + fixes #1/#2/#3 (14:34 UTC) | **203 s** | **$0.62** | 28 | **864 B ✓** | `success` |
+
+Diff produced matches the canonical upstream fix: wrap `gcd(p, q)` in
+`sympy/core/mod.py::Mod.eval` with a try/except on `PolynomialError` returning
+`S.One` on catch.
+
+### What the capsule looked like, before and after
+
+Eight pivot slots; only position 8 differed between runs.
+
+| Slot | Before (14:09) | After (14:34) |
+|---|---|---|
+| 1 | `sympy/core/symbol.py::symbols` | same |
+| 2 | `sympy/functions/elementary/exponential.py::exp` | same |
+| 3 | `sympy/plotting/intervalmath/lib_interval.py::exp` | same |
+| 4 | `sympy/functions/elementary/hyperbolic.py::sinh` | same |
+| 5 | `sympy/functions/elementary/piecewise.py::Piecewise` | same |
+| 6 | `sympy/strategies/tools.py::subs` | same |
+| 7 | `sympy/strategies/rl.py::subs` | same |
+| 8 | **`sympy/polys/polyerrors.py::PolynomialError`** (1-line stub) | **`sympy/matrices/common.py::MatrixOperations::subs`** |
+
+And below the pivots:
+
+| Section | Before | After |
+|---|---|---|
+| Session memory | 3 consolidated rows reading *"Queries: 'fix PolynomialError on subs with Piecewise …' — pivots: symbols, exp, interval.exp"* | _(no session memory — empty table after the Auto+Consolidated wipe)_ |
+
+### Why the fix worked despite `Mod.eval` still not being in the pivots
+
+Key nuance: even with all three fixes in place, the capsule **still did not
+surface `Mod.eval` as a pivot**. The semantic reverse-expand (#69 v2) didn't
+rank `Mod.eval` high enough to break into the top 8 — file-diversity pinning
+still held 5 of those slots for anchor-named files.
+
+The agent reached `Mod.eval` via grep exploration (`grep "gcd" sympy/core/`)
+not via the capsule. **The win came from removing misleading signal, not
+adding correct signal:**
+
+1. **Auto-observations off (#72)** — the three stale consolidated memories
+   that previously steered the agent toward `exp` / `symbols` /
+   `interval.exp` were no longer present. Without them, the agent's own
+   exploration followed `parallel_poly_from_expr` and `cancel` to
+   `polytools.py`, then traced back to the caller site via standard grep.
+2. **Trivial-exception filter (#73)** — pivot slot 8 stopped being a 1-line
+   `class PolynomialError(Base): pass` stub and became a real symbol. Not
+   decisive, but freed a slot that the agent otherwise had to read-and-
+   discard.
+3. **Reverse-expand semantic scoring (#69 v2)** — loaded for correctness
+   even though it didn't surface `Mod.eval` this run. Regressions on other
+   SWE-bench instances can use this path without the import-filter and
+   trivial-exception-filter crutches below it.
+
+Together, these moved the 38-turn / $1.06 / `error_max_budget_usd` outcome
+down to 28 turns / $0.62 / `success`. Budget headroom was the proximate
+cause of the success: the previous run ran out of money mid-exploration at
+turn 38 with the assistant text *"Now let me look at the source of the error
+message and the relevant code paths."* The new run had 10 turns of headroom
+to actually write the fix.
+
+### Pre-requisite: wipe the poisoned observations
+
+A warm workspace that accumulated Auto / Consolidated rows under the old
+default will still have them on disk. The flag change prevents NEW rows from
+landing but doesn't delete existing ones. To reproduce the clean result:
+
+```bash
+sqlite3 target/swebench-warm/<instance>/.codesurgeon/index.db \
+  "DELETE FROM observations WHERE kind IN ('auto', 'consolidated');"
+```
+
+Alternatively, re-prepare the workspace (the cold indexer creates an empty
+observations table on workspaces with no warm state).
+
+### Caveats
+
+- **n=1 on a stochastic benchmark**: claude-code exploration paths vary run
+  to run. Two consecutive runs on the same workspace can produce
+  turn-counts that differ by ±30% purely from tool-order variance. Before
+  treating any of this as robust, collect n=3 samples on the same config
+  and report the spread.
+- **MCP race still present**: `init`'s `mcp_servers: []` on 2.1.117 is
+  unchanged. The sidecar keeps the cs-codesurgeon MCP warm but claude's
+  own spawned MCP still misses the init handshake, so tools arrive via
+  ToolSearch and the nudge has to name the tool explicitly (5b does:
+  `mcp__cs-codesurgeon__run_pipeline`). Without the explicit name the
+  BM25 description rewrites (commit `8037aaf`) are the fallback.
+- **Other SWE-bench instances not retested**: this session validated only
+  sympy-21379. The #69-revert from 2026-04-21 was kept; the new
+  reverse-expand semantic path is additive to it. Broader harness run
+  (the 75-instance pilot) is a separate follow-up.
+
+### Why these fixes generalise beyond sympy-21379
+
+The three changes address failure modes that any corpus can hit — this
+task just happens to exhibit all three at once:
+
+- **Poisoning via consolidation** fires whenever the same query class is
+  run repeatedly with inconsistent outcomes. Any benchmark run, any
+  user-facing flow where the same bug report template recurs.
+- **Trivial exception stubs** exist in every mature Python / Java / Rust
+  library — they're the conventional way to define a namespaced error
+  hierarchy. BM25 always ranks them into the pivot pool when a task names
+  them by word.
+- **Reverse-expand semantic scoring** shifts which callers get promoted
+  out of the overlap=0 group. Wherever the fix site's body doesn't lift
+  query tokens but is topically aligned, this helps.
+
+---
+
 ## v1.7 — optional `context` param on `run_pipeline` (LANDED)
 
 **Problem v1.6 leaves open**: anchor extraction runs on the `task` string
