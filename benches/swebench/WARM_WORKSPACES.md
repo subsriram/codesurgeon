@@ -361,12 +361,54 @@ event shows `mcp_servers: []` and zero `mcp__cs-codesurgeon__*` tools
 advertised. Agent explains: *"The tool `mcp__cs-codesurgeon__run_pipeline`
 is not available in this environment."*
 
-This is **not** a harness bug. Claude Code's CLI maintains a global MCP
-registry state (in `~/.claude.json`) that can be poisoned by stale /
-conflicting `claude mcp add` or `claude mcp add-json` registrations made
-outside the harness. When the registry is in a bad state, Claude Code's
+There are **two independent** causes, both observed in the 2026-04-21
+session. Check both.
+
+#### Cause 1 — Claude Code version ≥ 2.1.117 defers MCP tool schemas
+
+The version bump from **2.1.114 → 2.1.117** (auto-updated on 2026-04-21
+around 18:00) changed Claude Code's dynamic-tool-loading behavior. On
+2.1.114, MCP tool schemas were **eager-loaded** at session init — the
+agent saw all 13 `mcp__cs-codesurgeon__*` tools in its initial tool set
+(42 tools total; 25 built-in + 13 cs-codesurgeon + plugin tools). On
+2.1.117, schemas are **deferred** by default — the agent sees only 25
+built-in tools at init and must explicitly call `ToolSearch
+select:<tool_name>` before invoking an MCP tool. The diagnostic signal
+is a line in the stream's init event / debug log:
+
+```
+Dynamic tool loading: 0/17 deferred tools included
+```
+
+(0 on 2.1.117, 17 on 2.1.114).
+
+Consequence: the agent is biased toward built-in tools (Bash, Read,
+Grep) that cost no prep round-trip, and away from MCP tools that do.
+Across 7+ prompt variants on 2.1.117, **zero chained `get_impact_graph`
+/ `get_skeleton` / `search_logic_flow` calls** were observed even when
+the prompt explicitly recommended them. The agent calls `run_pipeline`
+exactly once (if the nudge requires it), then defaults to Grep/Read.
+
+Diagnostic: `claude --version`. If ≥ 2.1.117, this behavior is the
+default. No flag observed to force eager-load across MCP servers. The
+older binary may still be on disk at
+`~/.local/share/claude/versions/2.1.114` — pin a specific version via
+`CLAUDE_BIN=~/.local/share/claude/versions/2.1.114 uv run …`.
+
+Fresh measurement needed: any "reference baseline" from 2.1.114 runs
+(Phase 3, 4a–4e) should be re-measured against 2.1.117 before using as
+a comparison point. 2.1.117 is what real users will hit; it's the
+realistic baseline, but comparison across versions is apples-to-oranges.
+
+#### Cause 2 — stale `claude mcp add*` registration poisons CLI state
+
+Claude Code's CLI maintains a global MCP registry state (in
+`~/.claude.json`) that can be poisoned by stale / conflicting
+`claude mcp add` or `claude mcp add-json` registrations made outside
+the harness. When the registry is in a bad state, Claude Code's
 `--print` mode stops advertising **any** MCP tools to the agent — even
-from servers explicitly passed via `--mcp-config` with `--strict-mcp-config`.
+from servers explicitly passed via `--mcp-config` with
+`--strict-mcp-config`.
 
 Diagnostic: run
 ```bash
