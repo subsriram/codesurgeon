@@ -199,6 +199,15 @@ Before you start reading files, call mcp__cs-codesurgeon__run_pipeline with two 
 After receiving the capsule, you can investigate further with the following cs-codesurgeon tools: get_impact_graph (callers/raisers of a symbol), get_skeleton (file API), search_logic_flow (trace A→B).
 """
 
+TREATMENT_NUDGE_5K = """\
+
+Before you start reading files, call mcp__cs-codesurgeon__run_pipeline with two fields:
+1. task: a summary description of the work
+2. context: one symbol name or FQN per line — include both the identifiers named in the problem statement AND internal functions/classes/modules on the error chain.
+
+After receiving the capsule, use the following cs-codesurgeon tools: get_impact_graph (callers/raisers of a symbol), get_skeleton (file API), search_logic_flow (trace A→B).
+"""
+
 NUDGES: dict[str, str] = {
     "5b": TREATMENT_NUDGE_5B,
     "5c": TREATMENT_NUDGE_5C,
@@ -208,6 +217,7 @@ NUDGES: dict[str, str] = {
     "5h": TREATMENT_NUDGE_5H,
     "5i": TREATMENT_NUDGE_5I,
     "5j": TREATMENT_NUDGE_5J,
+    "5k": TREATMENT_NUDGE_5K,
 }
 
 # Empirical results on `sympy__sympy-21379` — each variant, single run,
@@ -405,20 +415,41 @@ def materialize_mcp_with(mcp_bin: Path, workspace: Path, tmp: Path) -> Path:
     return out
 
 
-def mcp_preflight(mcp_bin: Path, workspace: Path, timeout_s: int = 15) -> tuple[bool, str, list[str]]:
+def mcp_preflight(mcp_bin: Path, workspace: Path, timeout_s: int = 5) -> tuple[bool, str, list[str]]:
     """Verify ``codesurgeon-mcp`` is launchable and advertises its tools.
 
-    Spawns the binary with NDJSON-framed ``initialize`` + ``tools/list``
-    requests, waits for responses within ``timeout_s``, and checks that
-    ``run_pipeline`` is in the returned tool set. Used as a preflight
-    before ``claude --print`` to catch the case where MCP fails to come
-    up (observed in 2026-04-21 session — run bqak7iyhx-5j had
-    ``mcp_servers: []`` in the agent's init event, meaning the agent
-    ran without any cs-codesurgeon tool access, silently invalidating
-    the whole run).
+    Spawns the binary against a **disposable empty tempdir** (not the
+    task workspace), sends NDJSON-framed ``initialize`` + ``tools/list``
+    requests, reads the response, and **SIGKILLs** the server to prevent
+    background indexing from leaving orphan processes that would
+    contend for the real workspace's pid lock.
+
+    Critical design choice — why the disposable workspace:
+      A previous version pointed preflight at the actual task workspace
+      and let the server exit naturally when stdin EOF'd. In practice:
+        - The server's main stdio loop exits on EOF
+        - The server's background-indexing thread does not — it keeps
+          parsing + re-embedding the (~1,500-file sympy) workspace
+        - Process remains alive at 100% CPU for minutes after
+          subprocess.run returns
+        - Subsequent ``claude --print`` launches a second MCP against
+          the same workspace, which contends with the zombie over SQLite
+          and falls into secondary mode where tools aren't eagerly
+          advertised at init
+        - Agent's init event shows ``mcp_servers: []`` — the exact
+          failure preflight was supposed to prevent
+      Preflighting against an empty tempdir means the indexer finds no
+      source files, finishes immediately, and the subprocess exits
+      cleanly. We belt-and-suspenders with ``Popen + communicate +
+      kill`` to guarantee no zombie survives preflight.
+
+    ``tools/list`` responses are workspace-independent — the server
+    advertises the same tool set regardless of which workspace it
+    points at — so the disposable tempdir is a valid test of binary
+    health and schema availability.
 
     Returns ``(ok, message, tool_names)``. Fast-fail on timeout / spawn
-    error / missing tools; caller decides whether to abort or retry.
+    error / missing tools.
     """
     init_req = json.dumps({
         "jsonrpc": "2.0",
@@ -432,23 +463,42 @@ def mcp_preflight(mcp_bin: Path, workspace: Path, timeout_s: int = 15) -> tuple[
     })
     tools_req = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     payload = f"{init_req}\n{tools_req}\n"
-    try:
-        proc = subprocess.run(
+    # `workspace` arg kept for API symmetry — we ignore it and use an
+    # empty tempdir instead. The two lints below stop formatters from
+    # collapsing the unused-arg guard.
+    _ = workspace  # noqa: F841
+
+    with tempfile.TemporaryDirectory(prefix="cs-preflight-") as td:
+        proc = subprocess.Popen(
             [str(mcp_bin)],
-            input=payload,
-            env={**os.environ, "CS_WORKSPACE": str(workspace)},
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "CS_WORKSPACE": td},
             text=True,
-            timeout=timeout_s,
         )
-    except subprocess.TimeoutExpired:
-        return False, f"preflight timed out after {timeout_s}s (MCP did not respond)", []
-    except FileNotFoundError:
-        return False, f"mcp binary not found: {mcp_bin}", []
+        try:
+            stdout, stderr = proc.communicate(input=payload, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            return False, f"preflight timed out after {timeout_s}s", []
+        except FileNotFoundError:
+            return False, f"mcp binary not found: {mcp_bin}", []
+        finally:
+            # Guarantee no orphan even on happy path — the server's
+            # background threads may outlive stdio loop exit. We have
+            # the NDJSON response we need; kill aggressively.
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
 
     # Parse NDJSON responses — look for the tools/list result (id=2).
     tools: list[str] = []
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -463,7 +513,7 @@ def mcp_preflight(mcp_bin: Path, workspace: Path, timeout_s: int = 15) -> tuple[
                     tools.append(name)
 
     if not tools:
-        tail = (proc.stderr or "")[-500:]
+        tail = (stderr or "")[-500:]
         return (
             False,
             f"no tools/list response from codesurgeon-mcp; stderr tail: {tail!r}",
