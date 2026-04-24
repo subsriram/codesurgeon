@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Reverse-edge expansion from exception anchors** (#67). When the task names
+  an exception/error/warning type, BFS walks **incoming** edges up to 3 hops
+  to surface callers and raisers that BM25 + graph-forward expansion miss.
+  Gated by `EngineConfig::reverse_expand_anchors` (default `true`). Per-hop
+  fan-out is capped at 5; total candidates at 20. Six regression tests in
+  `crates/cs-core/tests/reverse_expand.rs` cover the feature flag, generic-
+  anchor suppression, and pivot eligibility. See `docs/ranking.md` §1d.
+- **Body-text semantic similarity in reverse-expand** (#69 v2). When the
+  `embeddings` feature is active, per-hop caller scoring blends
+  `cos(query_embedding, caller_body_embedding)` into the selection beam so
+  zero-overlap fix sites (e.g. sympy-21379's `Mod.eval`) surface by topical
+  relevance instead of losing the slot to centrality. Weight = 2.0, calibrated
+  so one lexical term match still outweighs a moderately related semantic hit.
+  Four unit tests in `crates/cs-core/src/ranking.rs` cover the scorer
+  branches. See `docs/ranking.md` §1d "Why body-text semantic similarity".
 - **`run_pipeline` optional `context` parameter** (anchor-extraction v1.7).
   Callers can now pass an additional raw-text blob alongside `task` — typically
   the full problem statement, bug report, or stack trace the task was derived
@@ -29,6 +44,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mcp__cs-codesurgeon__run_pipeline` nudge, since the tool isn't available
   under `--strict-mcp-config` with an empty `mcpServers` map. Removes a
   long-standing confound from the A/B.
+- **`get_impact_graph` response size cap** (#65). Hard-caps the number of
+  dependents/dependencies serialized into the response so a query against a
+  high-fan-in utility doesn't produce a multi-MB payload that blows the
+  client's context window.
+- **MCP tool descriptions rewritten for BM25 ranking**. Tool descriptions
+  now include bug-fix / refactor / exception-handling keywords the agent's
+  internal tool selector scores against, so `run_pipeline` gets picked for
+  symptom-anchored tasks instead of a generic search tool.
+
+### Fixed
+
+- **Reverse-expand no longer surfaces `SymbolKind::Import` statements as
+  pivots.** Re-export shims (`from err import DeepError`) were winning pivot
+  slots because their FQN literally contained the query term. Filter applied
+  in both `reverse_expand_from_anchors` and pivot eligibility. Regression
+  test in `reverse_expand.rs`.
+- **Trivial exception-class stubs excluded from pivot slots.** A 1-line
+  `class FooError(Base): pass` has no body to show; before the filter, it
+  would beat behaviour-carrying callers on BM25 when the task named the
+  exception. Stubs remain available as reverse-expand *seeds*; they just
+  can't occupy a pivot slot on their own. Regression tests cover both the
+  stub exclusion and the preservation of non-trivial exception classes with
+  real methods.
+- **Auto-observation feedback loop disabled by default** (`auto_observations`
+  config key). Writing every `run_pipeline` call back into the observation
+  store poisoned session memory across runs: the consolidator merged query
+  pivots into `Consolidated` rows that re-surfaced as hints in future
+  capsules, biasing pivot selection toward prior choices regardless of their
+  correctness. Opt-in for users who actively curate observations.
 
 ## [1.0.0] - 2026-04-10
 
