@@ -24,6 +24,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so one lexical term match still outweighs a moderately related semantic hit.
   Four unit tests in `crates/cs-core/src/ranking.rs` cover the scorer
   branches. See `docs/ranking.md` §1d "Why body-text semantic similarity".
+- **Python traceback frame extraction in anchors** (#69 v2, traceback half).
+  `anchors::extract` now pulls function/method identifiers out of pasted
+  Python tracebacks (`File "...", line N, in <name>`) as a new step 3,
+  inserted between imports and prose. Frame-name identifiers bypass the
+  snake/camel shape filter that prose tokens require, so plain lowercase
+  names (`eval`, `apply`, `frobnicate`) become anchors when they appear in
+  a stack frame. Synthetic frames (`<module>`, `<listcomp>`, `<genexpr>`,
+  `<lambda>`), stop-words, and names <3 chars are filtered. Dotted frames
+  (`Mod.eval`) push both the full chain (flagged `from_dotted_call`) and
+  the tail. Six unit tests in `anchors.rs` plus an integration test in
+  `tests/engine.rs` (`context_traceback_frame_surfaces_plain_lowercase_function`)
+  that proves the engine-layer wiring routes a pasted traceback through
+  the new extractor and surfaces the frame's function as a pivot when the
+  prose shape filter alone would reject it. Pairs with the semantic
+  reverse-expand above to cover both halves of the #69 v2 design — the
+  ~40% of Python bug reports that include a traceback (anchor path) and
+  the ~60% that don't (semantic reverse-expand path).
 - **`run_pipeline` optional `context` parameter** (anchor-extraction v1.7).
   Callers can now pass an additional raw-text blob alongside `task` — typically
   the full problem statement, bug report, or stack trace the task was derived

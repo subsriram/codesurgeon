@@ -2363,3 +2363,66 @@ fn context_dedupes_against_task() {
         .expect("pipeline");
     assert!(out.contains("unique_q99_fn"), "symbol should be present");
 }
+
+/// Issue #69 v2 (traceback half): a Python traceback pasted into `context`
+/// must surface its frame-name function as an anchor *even when the name
+/// fails the prose shape filter* (plain lowercase, no underscore, no internal
+/// caps). The traceback pass in `anchors::extract` bypasses the shape filter
+/// for names that come from a `File "...", line N, in <name>` frame.
+///
+/// We prove the wiring by:
+///   1. Indexing a function whose name (`frobnicate`) is plain lowercase —
+///      the prose-shape filter rejects it as plain English.
+///   2. Running with a paraphrased task and a real-shape traceback in
+///      `context`. The symbol must surface.
+///   3. Running with the same task and a `context` that mentions
+///      `frobnicate` only in prose (no `File "..."` shape). The prose-only
+///      mention must NOT route through the traceback pass — this is the
+///      specificity check that proves the previous run actually used the
+///      traceback path and not the existing prose path.
+#[test]
+fn context_traceback_frame_surfaces_plain_lowercase_function() {
+    let dir = tempfile::tempdir().unwrap();
+    // Plain lowercase name — fails prose shape filter (no `_`, no internal caps).
+    std::fs::write(
+        dir.path().join("target.py"),
+        "def frobnicate(x):\n    \"\"\"transform x in place\"\"\"\n    return x\n",
+    )
+    .unwrap();
+    // Decoys so the capsule isn't trivial and BM25 has competition.
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("decoy_{i}.py")),
+            format!("def decoy_func_{i}():\n    return {i}\n"),
+        )
+        .unwrap();
+    }
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index");
+
+    let task = "investigate the reported crash";
+    let traceback_ctx = "\
+Traceback (most recent call last):
+  File \"app/main.py\", line 12, in <module>
+    target.frobnicate(value)
+  File \"target.py\", line 3, in frobnicate
+    raise RuntimeError(\"boom\")
+RuntimeError: boom
+";
+    let prose_only_ctx = "The crash report mentions frobnicate but no traceback was attached.";
+
+    let with_traceback = capsule_has_symbol(&engine, task, Some(traceback_ctx), "frobnicate");
+    let with_prose_only = capsule_has_symbol(&engine, task, Some(prose_only_ctx), "frobnicate");
+
+    assert!(
+        with_traceback,
+        "traceback frame `in frobnicate` must extract the identifier and surface the symbol; \
+         this validates the engine-layer wiring of the #69 v2 traceback anchor pass"
+    );
+    assert!(
+        !with_prose_only,
+        "plain prose mention of `frobnicate` (no `File \"...\", in frobnicate` shape) must NOT \
+         surface — the prose shape filter rejects plain lowercase tokens. This is the specificity \
+         check: it proves the traceback case above used the new traceback path, not the prose path."
+    );
+}
