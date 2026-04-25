@@ -388,6 +388,116 @@ task just happens to exhibit all three at once:
 
 ---
 
+## Session 2026-04-24 findings — re-validation on `sympy-21379` after cherry-picking e1568fa + populating embeddings
+
+Re-ran the same warm sympy-21379 workspace with both halves of #69 v2 in
+place: `8684552` (semantic reverse-expand, already on the branch) plus
+`e1568fa` (Python traceback frame extraction, cherry-picked from
+`quizzical-mahavira`). Re-indexed sympy with the embeddings-enabled
+release binary so the per-symbol embedding cache is populated for the
+first time on this workspace (55,709 symbols → 171 MB `embeddings.bin`,
+prior runs had a 9 KB stub from a no-features build).
+
+### Measured outcome (n=1 each, three configurations)
+
+| Config | Claude | Wall | Cost | Diff | Canonical fix? | cs-codesurgeon used? |
+|---|---|---:|---:|---:|---|---|
+| `without` (control) | 2.1.117 | 225.9 s | $0.77 | 611 B | ✓ | n/a |
+| `with` v1 (broken MCP) | 2.1.117 | 139.8 s | $0.42 | 582 B | ✓ | ✗ — `mcp_servers: []` at init |
+| `with` v2 (working MCP) | **2.1.114** | 487.9 s | $1.61 | 582 B | ✓ | ✓ — 1× `run_pipeline` |
+
+All three runs produced the canonical upstream patch in
+`sympy/core/mod.py::Mod.eval` (try/except `PolynomialError` around
+`gcd(p, q)`). Variance dominates: same workspace, same task — wall
+times spread across **3.4×** (139 s → 488 s).
+
+### `Mod.eval` still does not surface as a pivot — even with embeddings
+
+The `with v2` run's `run_pipeline` capsule (`task` paraphrased,
+`context` = full problem statement verbatim per v1.7) returned 8
+pivots: `symbols`, `exp`, `exp` (interval), `sinh`, `Piecewise`,
+`subs` (strategies/tools), `subs` (strategies/rl), `MatrixOperations.subs`.
+
+**Zero matches for `Mod.eval` in the capsule.** Same symptom as the
+2026-04-22 session, but now with embeddings populated and the v2
+semantic scorer actively running. The agent reached `Mod.eval` through
+**26 Read + 16 Grep** calls, not via the capsule. This confirms the
+2026-04-22 caveat — the win on that session came from *removing
+misleading signal* (auto-obs off, trivial-stub filter), not from the
+semantic reverse-expand surfacing the fix site directly. The
+unit-tested algorithm works on synthetic graphs; on the real sympy-core
+graph the fix site stays outside the top-`fan_out` beam from
+`PolynomialError`.
+
+Open structural problem (carried over from 2026-04-22): symptom-anchored
+queries where the fix site is N hops upstream through a dense raiser
+graph, and the fix site's body has no lexical overlap with the query.
+The 2.0× semantic weight is calibrated against unit fixtures with
+narrow per-hop fan-out; on a real high-fan-in node like
+`PolynomialError` the top-5 beam still drops the relevant hop. The
+follow-up direction noted in the 2026-04-22 section ("density-aware
+fan-out, but with centrality dominating instead of query-aware") is
+unchanged.
+
+### Two operational findings
+
+**1. `claude 2.1.117` broke `--mcp-config` in `--print` mode entirely**
+— this extends the prior Cause 1 / Cause 2 documented in
+`benches/swebench/WARM_WORKSPACES.md`. Even after:
+
+- removing every `cs-*` and `perplexity` registration from
+  `~/.claude.json` (clean global state, `claude mcp list` empty);
+- pointing `--mcp-config` at a freshly-written, syntactically valid
+  per-task config; passing `--strict-mcp-config`;
+- confirming the binary path is correct and the binary responds to a
+  manual `initialize` JSON-RPC handshake;
+
+the session's `init` event still showed `mcp_servers: []` and the
+agent's `ToolSearch select:mcp__cs-codesurgeon__index_status` returned
+"No matching deferred tools found." Pinning
+`CLAUDE_BIN=~/.local/share/claude/versions/2.1.114` restored the
+expected behaviour: `mcp_servers: [{name: cs-codesurgeon, status:
+connected}]`, 42 tools (25 built-in + 17 deferred MCP), agent invokes
+`run_pipeline` successfully.
+
+**Implication for harness runs**: pin `CLAUDE_BIN=2.1.114` for any
+SWE-bench A/B until upstream fixes 2.1.117's `--print`-mode MCP
+loading. Without it the `with` arm degrades silently to a
+codesurgeon-absent run (visible only by inspecting the `init` event in
+`claude_stream.jsonl`). The first `with` run this session
+(walltime=139.8 s, cost=$0.42) is exactly this failure mode — fastest
+of the three runs because no MCP overhead was incurred, but
+codesurgeon was never actually exercised.
+
+**2. The `with` arm with working MCP was the slowest and most
+expensive of the three.** Same canonical fix produced, but wall time
+went from 226 s (without) to 488 s (with), and cost from $0.77 to
+$1.61. The agent called `run_pipeline` exactly once at the start, then
+fell back to 26 Reads + 16 Greps + 10 Bash + 1 Edit. The capsule
+provided context but no decisive routing — the fix-site discovery
+happened through standard exploration tools. n=1 on a stochastic
+benchmark, but consistent with the 2026-04-22 observation that the
+agent calls MCP tools sparingly on 2.1.114+ (deferred-tool prep
+round-trip biases toward built-ins).
+
+### Caveats
+
+- **n=1 across all three arms.** Variance on this benchmark routinely
+  exceeds 30%, and these three runs span 3.4× walltime. Treat the
+  numbers as anecdotes, not measurements.
+- **`e1568fa` (traceback frame extraction) was not exercised here.**
+  sympy-21379's problem statement is pure prose with no Python
+  traceback (verified: zero `File "...", line N, in <name>` matches).
+  Validating that commit empirically requires picking a task with
+  tracebacks (9 of 100 tasks in `tasks.json` qualify; top candidates
+  by frame count: `psf__requests-1724` 33, `sympy__sympy-17630` 15,
+  `django__django-16938` 13).
+- **Compute cost**: full validation cycle (build + cold sympy index
+  with embeddings + 3 harness runs + restore) was ~75 min wall and
+  ~$3 in Anthropic credits.
+
+---
+
 ## v1.7 — optional `context` param on `run_pipeline` (LANDED)
 
 **Problem v1.6 leaves open**: anchor extraction runs on the `task` string

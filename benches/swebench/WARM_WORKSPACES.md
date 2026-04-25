@@ -457,6 +457,49 @@ Fresh measurement needed: any "reference baseline" from 2.1.114 runs
 a comparison point. 2.1.117 is what real users will hit; it's the
 realistic baseline, but comparison across versions is apples-to-oranges.
 
+##### 2026-04-24 follow-up: 2.1.117 breaks `--mcp-config` entirely in `--print` mode
+
+Re-validating sympy-21379 on 2026-04-24 surfaced a strictly worse
+behaviour than the original 2.1.117 deferred-loading regression: on
+2.1.117, `--print` mode does **not load MCP servers at all** when
+configured via `--mcp-config` — even after eliminating the Cause 2
+poisoning below. The session's `init` event reports
+`mcp_servers: []` and ToolSearch returns "No matching deferred tools
+found" for any `mcp__cs-codesurgeon__*` lookup. Verified with all of
+the following in place:
+
+- `~/.claude.json` had every `cs-*` and `perplexity` registration
+  removed via `claude mcp remove` (`claude mcp list` reports "No MCP
+  servers configured");
+- `--strict-mcp-config` passed alongside `--mcp-config <path>`;
+- the `--mcp-config` JSON is syntactically valid and points at a
+  binary whose manual `initialize` JSON-RPC handshake responds
+  correctly;
+- `--debug` flag passed — no MCP-load errors emitted to stderr.
+
+The harness silently degrades to a codesurgeon-absent run; the
+visible signal is `mcp_servers: []` in the saved `claude_stream.jsonl`
+init event. **Diagnostic check after every `with`-arm run on 2.1.117**:
+
+```bash
+jq -r 'select(.type=="system" and .subtype=="init") | .mcp_servers' \
+  target/swebench/with/<iid>/claude_stream.jsonl
+```
+
+If this returns `[]`, the run did not exercise codesurgeon — the
+treatment-arm result is invalid for A/B purposes regardless of
+walltime / cost / diff outcome. **Workaround**: pin
+`CLAUDE_BIN=~/.local/share/claude/versions/2.1.114`. Verified working
+on 2.1.114 on the same workspace, same `--mcp-config`, with `init`
+showing `mcp_servers: [{name: cs-codesurgeon, status: connected}]`
+and 42 tools advertised.
+
+Until upstream fixes this, every `with`-arm run on 2.1.117 produces
+sham data. Treat the 2026-04-22 session findings as authoritative for
+the affirmative-claim portion (canonical fix produced, capsule
+contents) and discount any walltime/cost claims that didn't include
+this `mcp_servers: []` check.
+
 #### Cause 2 — stale `claude mcp add*` registration poisons CLI state
 
 Claude Code's CLI maintains a global MCP registry state (in
