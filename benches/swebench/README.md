@@ -13,6 +13,8 @@ and `#29a` / `#29b` / `#29c` for the three-stage rollout.
 ```
 benches/swebench/
 ├── README.md              # this file
+├── WARM_WORKSPACES.md     # how to run iterations against persistent indexes
+├── prepare_workspace.sh   # helper: clone + index one task (warm-workspace setup)
 ├── tasks.json             # 100 stratified Verified tasks (seed=17)
 ├── select_tasks.py        # regenerates tasks.json from HF API
 ├── mcp_with.json          # treatment-arm MCP config (template)
@@ -26,6 +28,33 @@ scripts/
 ├── swebench_pilot.sh      # one-shot detached pilot launcher (#29b)
 └── swebench_report.py     # markdown renderer
 ```
+
+> **For iterative single-task runs** (e.g. testing a ranking change against one
+> sympy regression), use the persistent warm-workspace workflow documented in
+> [`WARM_WORKSPACES.md`](WARM_WORKSPACES.md). It separates cloning + indexing
+> from harness runs so you don't re-index on every iteration. The pilot flow
+> below is for the full 100-task run where cold clones are acceptable.
+
+### Harness flags added for A/B work
+
+- `--reuse-workdir <path>` — skip clone+index, use a warm workspace
+- `--stream-json` — save per-turn NDJSON as `claude_stream.jsonl` (lets you
+  verify which MCP tool calls the agent made and with what args)
+- `--inject-claude-md` — drop a codesurgeon tool-guidance `CLAUDE.md` into
+  the workdir; treatment arm only (Phase 4)
+- `--nudge {5b,5c}` — PROMPT_PREFIX variant; `5b` = "paste problem
+  statement as `context`", `5c` = no context mention (tool-description-only)
+
+See [`WARM_WORKSPACES.md`](WARM_WORKSPACES.md) for flag combinations and
+the typical A/B workflow.
+
+### Prior-run reference data
+
+- [`pilot_results/results.jsonl`](pilot_results/results.jsonl) — the
+  10-task #29b pilot (20 rows)
+- [`../../target/swebench/results_29c_backup.jsonl`](../../target/swebench/results_29c_backup.jsonl)
+  — the 83-task #29c run (166 rows), includes without-arm baselines for
+  all regression sympy tasks
 
 ## Prerequisites
 

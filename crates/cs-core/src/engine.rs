@@ -18,9 +18,13 @@ use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    resolve_adjacents, rrf_merge_ks, select_adjacents, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET,
-    ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST,
-    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT,
+    is_reverse_expand_seed, is_trivial_exception_pivot, query_terms_for_reverse_expand,
+    resolve_adjacents, reverse_expand_from_anchors, rrf_merge_ks, select_adjacents,
+    ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE,
+    ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
+    MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT,
+    REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
+    STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -70,6 +74,12 @@ pub struct EngineConfig {
     pub max_pivots: usize,
     pub max_adjacent: usize,
     pub max_blast_radius_depth: u32,
+    /// Per-list cap on dependents returned by `get_impact_graph`.
+    /// Applies independently to direct and transitive lists; anything beyond
+    /// is dropped and reported via `ImpactResult::{direct,transitive}_truncated`.
+    /// Default 100 keeps a worst-case response under ~5k tokens for high-fan-out
+    /// symbols (e.g. exception base classes in large codebases — see issue #65).
+    pub max_impact_results: usize,
     pub session_id: String,
     /// Whether to load the embedding model on startup.
     /// Set to false for secondary (read-only) instances to avoid loading the
@@ -125,6 +135,27 @@ pub struct EngineConfig {
     /// Set via `[observability] token_rate_usd = 0.000003` in `config.toml`.
     /// Default: 0.000003 (Claude Sonnet input pricing).
     pub token_rate_usd: f64,
+
+    /// When true (default), `build_context_capsule` walks callers backward
+    /// from exception-class anchors and injects the walk results into the
+    /// RRF fusion. Surfaces bug sites that are only reachable by following
+    /// the raise-chain from a user-named error class (issue #67). See
+    /// `docs/ranking.md` Stage 1f and `docs/explicit-symbol-anchors.md`.
+    pub reverse_expand_anchors: bool,
+
+    /// When true, each `run_pipeline` / `get_context_capsule` call auto-records
+    /// `(query, top pivot FQNs)` as an `Auto` observation. Later queries surface
+    /// consolidated versions of those tuples in their capsule.
+    ///
+    /// Default: **false** (disabled). The record-side has no success signal —
+    /// queries whose pivots missed the fix site are recorded identically to
+    /// queries that led to a correct diff, so repeated failures cement the
+    /// wrong pivots as "canonical" memory and poison future runs.
+    ///
+    /// Enable via `[observability] auto_observations = true` in `config.toml`
+    /// to opt into the pre-#72 behaviour. Explicit `save_observation` calls
+    /// (agent-attested memory) are unaffected.
+    pub auto_observations: bool,
 }
 
 /// Controls adjacent-symbol body fraction in context capsules.
@@ -171,6 +202,7 @@ impl EngineConfig {
             max_pivots: 8,
             max_adjacent: 20,
             max_blast_radius_depth: 5,
+            max_impact_results: 100,
             session_id,
             load_embedder: true,
             index_stubs: true,
@@ -181,6 +213,8 @@ impl EngineConfig {
             track_manifest: false,
             skeleton_detail: SkeletonDetail::default(),
             token_rate_usd: 0.000003,
+            reverse_expand_anchors: true,
+            auto_observations: false,
         }
     }
 
@@ -253,7 +287,21 @@ pub struct ImpactResult {
     pub target_fqn: String,
     pub direct_dependents: Vec<SymbolRef>,
     pub transitive_dependents: Vec<SymbolRef>,
+    /// Total dependents that survived test/depth filtering, *before* the
+    /// per-list `max_results` cap was applied. Always reflects real-world
+    /// blast radius even when the returned lists are truncated.
     pub total_affected: usize,
+    /// Number of direct dependents dropped by the `max_results` cap.
+    /// Zero when the full list fit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub direct_truncated: usize,
+    /// Number of transitive dependents dropped by the `max_results` cap.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub transitive_truncated: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -375,6 +423,9 @@ impl CoreEngine {
         }
         if let Some(rate) = indexing_config.token_rate_usd {
             config.token_rate_usd = rate;
+        }
+        if indexing_config.auto_observations {
+            config.auto_observations = true;
         }
 
         // Write .codesurgeon/.gitignore if absent, excluding index.db always
@@ -1199,14 +1250,47 @@ impl CoreEngine {
         language: Option<&str>,
         file_hint: Option<&str>,
     ) -> Result<String> {
+        self.run_pipeline_with_context(task, None, budget, language, file_hint)
+    }
+
+    /// `run_pipeline` variant that accepts an additional raw-text `context`
+    /// blob (typically the full problem statement / bug report / error log
+    /// the agent derived `task` from). The context is used **only** for
+    /// anchor extraction — BM25, ANN, graph, and intent detection still run
+    /// against `task` alone, so a large context doesn't blow the primary
+    /// query budget or mis-classify the intent.
+    ///
+    /// Motivation: when agents paraphrase long problem statements into a
+    /// short `task` string, identifier tokens (function names, class names,
+    /// dotted API calls) often get dropped, and the anchor extractor loses
+    /// the signal. Passing the raw source as `context` makes extraction
+    /// deterministic on the server side — it no longer depends on the
+    /// agent preserving identifiers through summarization.
+    ///
+    /// Backward-compatible: `context=None` is exactly the pre-existing
+    /// `run_pipeline` behavior.
+    pub fn run_pipeline_with_context(
+        &self,
+        task: &str,
+        context: Option<&str>,
+        budget: Option<u32>,
+        language: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<String> {
         let t0 = Instant::now();
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(task);
 
-        tracing::debug!("run_pipeline: intent={:?}, task={}", intent, task);
+        tracing::debug!(
+            "run_pipeline: intent={:?}, task={}, context={} bytes",
+            intent,
+            task,
+            context.map(|c| c.len()).unwrap_or(0)
+        );
 
-        let capsule =
-            self.build_context_capsule(task, budget, &intent, language, file_hint, None, None)?;
+        let capsule = self.build_context_capsule(
+            task, budget, &intent, language, file_hint, None, None, context,
+        )?;
         let latency_ms = t0.elapsed().as_millis() as u64;
         let mut out = format_capsule(&capsule);
 
@@ -1226,13 +1310,18 @@ impl CoreEngine {
         }
 
         // Auto-capture this tool call as an observation for cross-session memory.
-        let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
-        if let Err(e) = self
-            .memory
-            .lock()
-            .record_auto_observation(task, &pivot_fqns)
-        {
-            tracing::warn!("auto-observation failed: {}", e);
+        // Gated on `config.auto_observations` (default false). See the field doc
+        // in `EngineConfig` — recording query→pivots with no success signal
+        // caused failed runs to reinforce wrong pivots on subsequent queries.
+        if self.config.auto_observations {
+            let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
+            if let Err(e) = self
+                .memory
+                .lock()
+                .record_auto_observation(task, &pivot_fqns)
+            {
+                tracing::warn!("auto-observation failed: {}", e);
+            }
         }
 
         // Log query metrics.
@@ -1292,17 +1381,28 @@ impl CoreEngine {
     ) -> Result<String> {
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(query);
-        let capsule =
-            self.build_context_capsule(query, budget, &intent, None, None, max_results, min_score)?;
+        let capsule = self.build_context_capsule(
+            query,
+            budget,
+            &intent,
+            None,
+            None,
+            max_results,
+            min_score,
+            None,
+        )?;
 
-        // Auto-capture this tool call as an observation for cross-session memory.
-        let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
-        if let Err(e) = self
-            .memory
-            .lock()
-            .record_auto_observation(query, &pivot_fqns)
-        {
-            tracing::warn!("auto-observation failed: {}", e);
+        // Auto-capture is gated on config.auto_observations (default false);
+        // see the field doc on EngineConfig.
+        if self.config.auto_observations {
+            let pivot_fqns: Vec<String> = capsule.pivots.iter().map(|p| p.fqn.clone()).collect();
+            if let Err(e) = self
+                .memory
+                .lock()
+                .record_auto_observation(query, &pivot_fqns)
+            {
+                tracing::warn!("auto-observation failed: {}", e);
+            }
         }
 
         Ok(format_capsule(&capsule))
@@ -1429,6 +1529,7 @@ impl CoreEngine {
         &self,
         symbol_fqn: &str,
         max_depth: Option<u32>,
+        max_results: Option<usize>,
         include_tests: bool,
     ) -> Result<ImpactResult> {
         let graph = self.graph.read();
@@ -1454,9 +1555,9 @@ impl CoreEngine {
 
         let target_id = target.id;
         let depth = max_depth.unwrap_or(self.config.max_blast_radius_depth);
+        let cap = max_results.unwrap_or(self.config.max_impact_results).max(1);
 
-        let is_test = |s: &SymbolRef| -> bool {
-            let p = &s.file_path;
+        let is_test_path = |p: &str| -> bool {
             p.contains("/test")
                 || p.contains("_test.")
                 || p.contains("test_")
@@ -1464,27 +1565,43 @@ impl CoreEngine {
                 || p.contains("_spec.")
         };
 
-        let direct: Vec<SymbolRef> = graph
+        // Rank by descending centrality so the most-depended-on dependents
+        // survive truncation; FQN ascending breaks ties for stable output.
+        // Centrality is f32 in [0, 1); scale to i64 for total ordering.
+        let rank_key = |s: &Symbol| -> (i64, String) {
+            let c = (graph.centrality_score(s.id) * 1_000_000.0) as i64;
+            (-c, s.fqn.clone())
+        };
+
+        let mut direct: Vec<&Symbol> = graph
             .dependents(target_id)
             .into_iter()
-            .map(sym_ref)
-            .filter(|s| include_tests || !is_test(s))
+            .filter(|s| include_tests || !is_test_path(&s.file_path))
             .collect();
+        direct.sort_by_cached_key(|s| rank_key(s));
+        let direct_total = direct.len();
+        let direct_truncated = direct_total.saturating_sub(cap);
+        direct.truncate(cap);
+        let direct_refs: Vec<SymbolRef> = direct.into_iter().map(sym_ref).collect();
 
-        let transitive: Vec<SymbolRef> = graph
+        let mut transitive: Vec<&Symbol> = graph
             .blast_radius(target_id, depth)
             .into_iter()
-            .map(sym_ref)
-            .filter(|s| include_tests || !is_test(s))
+            .filter(|s| include_tests || !is_test_path(&s.file_path))
             .collect();
-
-        let total = direct.len() + transitive.len();
+        transitive.sort_by_cached_key(|s| rank_key(s));
+        let transitive_total = transitive.len();
+        let transitive_truncated = transitive_total.saturating_sub(cap);
+        transitive.truncate(cap);
+        let transitive_refs: Vec<SymbolRef> = transitive.into_iter().map(sym_ref).collect();
 
         Ok(ImpactResult {
             target_fqn: symbol_fqn.to_string(),
-            direct_dependents: direct,
-            transitive_dependents: transitive,
-            total_affected: total,
+            direct_dependents: direct_refs,
+            transitive_dependents: transitive_refs,
+            total_affected: direct_total + transitive_total,
+            direct_truncated,
+            transitive_truncated,
         })
     }
 
@@ -2318,6 +2435,16 @@ impl CoreEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Build a ranked capsule for `query`.
+    ///
+    /// `anchor_context`, when `Some`, is a raw-text blob used *only* for
+    /// anchor extraction — anchors are extracted from `query + "\n" +
+    /// anchor_context` (extract() handles dedup). Lets callers recover
+    /// identifiers the agent may have paraphrased out of a compact `query`
+    /// but that are still visible in the raw problem statement. BM25/ANN/
+    /// graph always run on `query` alone so a large context doesn't blow
+    /// the primary query budget.
+    #[allow(clippy::too_many_arguments)]
     fn build_context_capsule(
         &self,
         query: &str,
@@ -2327,6 +2454,7 @@ impl CoreEngine {
         file_hint: Option<&str>,
         max_results: Option<usize>,
         min_score: Option<f32>,
+        anchor_context: Option<&str>,
     ) -> Result<Capsule> {
         // ── Stage 1: Candidate Retrieval (BM25 + graph neighbors + ANN) ──────────
         let bm25_results = self.search.lock().search(query, BM25_POOL_SIZE)?;
@@ -2345,13 +2473,129 @@ impl CoreEngine {
         // the query (prose identifiers, imports, code-block API calls). Empty
         // when the query has no extractable identifiers, in which case the
         // RRF blend is unchanged.
-        let (anchor_results, astats) = self.anchor_candidates(query, ANCHOR_CANDIDATES);
-        tracing::debug!("anchor stats: {:?}", astats);
+        //
+        // If `anchor_context` is provided (e.g. the raw problem statement the
+        // agent's `task` was derived from), we concatenate it with the query
+        // and run extraction on the combined blob. The underlying
+        // `extract()` dedupes on symbol name, so identifiers that appear in
+        // both are counted once.
+        let anchor_source: String = match anchor_context {
+            Some(ctx) if !ctx.is_empty() => format!("{query}\n{ctx}"),
+            _ => query.to_string(),
+        };
+        let (anchor_results, astats) = self.anchor_candidates(&anchor_source, ANCHOR_CANDIDATES);
+        tracing::debug!(
+            "anchor stats: {:?} (context bytes: {})",
+            astats,
+            anchor_context.map(|c| c.len()).unwrap_or(0)
+        );
 
-        // ANN semantic retrieval + RRF fusion across all four sources.
+        // Stage 1e: reverse-edge expansion from exception-class anchors
+        // (issue #67). For symptom-anchored bug reports the user names the
+        // error type but the fix site is only reachable by walking backward
+        // through callers/raisers. Fires only on anchors classified as
+        // reverse-expand seeds (exception/error/warning type definitions)
+        // so generic anchors like `parse_latex` or `exp` don't trigger a
+        // blowup. Walk is depth- and fan-out-bounded — see ranking.rs
+        // REVERSE_EXPAND_* constants.
+        //
+        // Issue #69 v2: when embeddings are available, per-caller scoring
+        // inside the BFS blends the existing query-term-overlap signal with
+        // cosine similarity between the query embedding and each caller's
+        // body embedding. This recovers fix sites like sympy-21379's
+        // `Mod.eval` whose body is topically aligned with the problem
+        // statement but has no lexical overlap with the query terms.
+        #[cfg(feature = "embeddings")]
+        let (re_query_vec, re_emb_guard) = {
+            self.ensure_embedding_cache();
+            let qv = self
+                .embedder
+                .get()
+                .and_then(|emb| match emb.embed_one(&anchor_source) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!("reverse-expand query embed failed: {}", e);
+                        None
+                    }
+                });
+            let guard = qv.as_ref().map(|_| self.embedding_cache.read());
+            (qv, guard)
+        };
+        #[cfg(feature = "embeddings")]
+        let re_emb_lookup: Option<std::collections::HashMap<u64, &[f32]>> =
+            re_emb_guard.as_ref().map(|g| g.iter().collect());
+
+        let reverse_results: Vec<(u64, f32)> = if self.config.reverse_expand_anchors {
+            let graph = self.graph.read();
+            let seed_ids: Vec<u64> = anchor_results
+                .iter()
+                .filter_map(|(id, _)| {
+                    let sym = graph.get_symbol(*id)?;
+                    if !is_reverse_expand_seed(sym) {
+                        return None;
+                    }
+                    // Hub guard: skip seeds with more than
+                    // REVERSE_EXPAND_SEED_MAX_CALLERS direct callers — their
+                    // reverse set is too broad to rank usefully.
+                    if graph.dependents(*id).len() > REVERSE_EXPAND_SEED_MAX_CALLERS {
+                        return None;
+                    }
+                    Some(*id)
+                })
+                .collect();
+            if seed_ids.is_empty() {
+                Vec::new()
+            } else {
+                let terms = query_terms_for_reverse_expand(&anchor_source);
+
+                #[cfg(feature = "embeddings")]
+                let semantic_closure = |id: u64| -> Option<f32> {
+                    let qv = re_query_vec.as_ref()?;
+                    let v = re_emb_lookup.as_ref()?.get(&id)?;
+                    Some(cosine_similarity(qv, v).clamp(0.0, 1.0))
+                };
+                #[cfg(feature = "embeddings")]
+                let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = if re_query_vec.is_some()
+                    && re_emb_lookup
+                        .as_ref()
+                        .map(|m| !m.is_empty())
+                        .unwrap_or(false)
+                {
+                    Some(&semantic_closure)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "embeddings"))]
+                let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = None;
+
+                let out = reverse_expand_from_anchors(
+                    &graph,
+                    &seed_ids,
+                    &terms,
+                    REVERSE_EXPAND_MAX_DEPTH,
+                    REVERSE_EXPAND_FAN_OUT,
+                    REVERSE_EXPAND_CANDIDATES,
+                    semantic_ref,
+                );
+                tracing::debug!(
+                    "reverse-expand: {} seeds → {} candidates (depth={}, fan_out={}, semantic={})",
+                    seed_ids.len(),
+                    out.len(),
+                    REVERSE_EXPAND_MAX_DEPTH,
+                    REVERSE_EXPAND_FAN_OUT,
+                    semantic_ref.is_some()
+                );
+                out
+            }
+        } else {
+            Vec::new()
+        };
+
+        // ANN semantic retrieval + RRF fusion across all sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
         // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
-        // lost the target to body-field noise.
+        // lost the target to body-field noise. Reverse-expansion sits between
+        // anchors and the default retrievers (`REVERSE_EXPAND_RRF_K`).
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
@@ -2360,6 +2604,7 @@ impl CoreEngine {
                 (&graph_results, RRF_K),
                 (&ann_results, RRF_K),
                 (&anchor_results, ANCHOR_RRF_K),
+                (&reverse_results, REVERSE_EXPAND_RRF_K),
             ])
         };
         #[cfg(not(feature = "embeddings"))]
@@ -2367,6 +2612,7 @@ impl CoreEngine {
             (&bm25_results, RRF_K),
             (&graph_results, RRF_K),
             (&anchor_results, ANCHOR_RRF_K),
+            (&reverse_results, REVERSE_EXPAND_RRF_K),
         ]);
 
         let graph = self.graph.read();
@@ -2449,14 +2695,54 @@ impl CoreEngine {
         // regardless of centrality ranking — bug-site symbols are usually
         // low-centrality and were getting cut by v1.5's RRF-based cap.
         //
+        // Reverse-expansion results (issue #67) participate in the same
+        // file-diversity pass — they represent the same identity-of-user-
+        // intent signal as direct anchors. Direct anchors are iterated first
+        // so they claim file slots before reverse-expanded callers.
+        //
         // Phase 2: fill remaining slots from the centrality-ranked RRF fusion,
         // skipping anything already pinned. See docs/explicit-symbol-anchors.md.
+        //
+        // `is_eligible_pivot` filters out symbols that carry no behaviour
+        // worth putting in a pivot slot:
+        //   - `is_stub`: external references, no body.
+        //   - `SymbolKind::Import`: `from X import (A, B, C)` statement
+        //     lines. Their FQN / body textually contain query terms (the
+        //     names they re-export), so BM25 and query-aware reverse-expand
+        //     score them highly — but they have no behaviour, no callees
+        //     beyond the imported names, and no agent-useful content. When
+        //     they win pivot slots they push the agent into unrelated
+        //     files. Regressed sympy-21379 from 290 s success to 600 s
+        //     timeout before this filter landed.
+        //   - `is_trivial_exception_pivot`: `class FooError(Base): pass`
+        //     stubs. Body is a single declaration line — useless as a
+        //     pivot, yet ranks high when the task names the exception
+        //     class. Reverse-expand has already walked up from them to
+        //     behaviour-carrying callers (raisers); those callers deserve
+        //     the slot instead. See sympy-21379 where `PolynomialError`
+        //     stole a slot that `Mod.eval` should have taken.
+        let is_eligible_pivot = |id: u64| -> bool {
+            graph
+                .get_symbol(id)
+                .map(|s| {
+                    !s.is_stub
+                        && s.kind != crate::symbol::SymbolKind::Import
+                        && !is_trivial_exception_pivot(s)
+                })
+                .unwrap_or(false)
+        };
+
+        let pinning_candidates: Vec<(u64, f32)> = anchor_results
+            .iter()
+            .copied()
+            .chain(reverse_results.iter().copied())
+            .collect();
         let mut anchor_by_file: HashMap<String, Vec<u64>> = HashMap::new();
-        for (id, _) in &anchor_results {
+        for (id, _) in &pinning_candidates {
+            if !is_eligible_pivot(*id) {
+                continue;
+            }
             if let Some(sym) = graph.get_symbol(*id) {
-                if sym.is_stub {
-                    continue;
-                }
                 anchor_by_file
                     .entry(sym.file_path.clone())
                     .or_default()
@@ -2466,16 +2752,16 @@ impl CoreEngine {
 
         let mut pinned: Vec<u64> = Vec::new();
         let mut pinned_files_in_order: Vec<String> = Vec::new();
-        for (id, _) in &anchor_results {
+        for (id, _) in &pinning_candidates {
             if pinned.len() >= ANCHOR_FILE_BUDGET.min(max_pivots) {
                 break;
+            }
+            if !is_eligible_pivot(*id) {
+                continue;
             }
             let Some(sym) = graph.get_symbol(*id) else {
                 continue;
             };
-            if sym.is_stub {
-                continue;
-            }
             if pinned_files_in_order.contains(&sym.file_path) {
                 continue;
             }
@@ -2497,7 +2783,7 @@ impl CoreEngine {
         let rrf_fill: Vec<u64> = scored
             .iter()
             .filter(|(id, _)| !pinned_set.contains(id))
-            .filter(|(id, _)| !graph.get_symbol(*id).map(|s| s.is_stub).unwrap_or(false))
+            .filter(|(id, _)| is_eligible_pivot(*id))
             .take(pivot_slots)
             .map(|(id, _)| *id)
             .collect();

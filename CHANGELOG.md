@@ -5,6 +5,92 @@ All notable changes to codesurgeon are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Reverse-edge expansion from exception anchors** (#67). When the task names
+  an exception/error/warning type, BFS walks **incoming** edges up to 3 hops
+  to surface callers and raisers that BM25 + graph-forward expansion miss.
+  Gated by `EngineConfig::reverse_expand_anchors` (default `true`). Per-hop
+  fan-out is capped at 5; total candidates at 20. Six regression tests in
+  `crates/cs-core/tests/reverse_expand.rs` cover the feature flag, generic-
+  anchor suppression, and pivot eligibility. See `docs/ranking.md` §1d.
+- **Body-text semantic similarity in reverse-expand** (#69 v2). When the
+  `embeddings` feature is active, per-hop caller scoring blends
+  `cos(query_embedding, caller_body_embedding)` into the selection beam so
+  zero-overlap fix sites (e.g. sympy-21379's `Mod.eval`) surface by topical
+  relevance instead of losing the slot to centrality. Weight = 2.0, calibrated
+  so one lexical term match still outweighs a moderately related semantic hit.
+  Four unit tests in `crates/cs-core/src/ranking.rs` cover the scorer
+  branches. See `docs/ranking.md` §1d "Why body-text semantic similarity".
+- **Python traceback frame extraction in anchors** (#69 v2, traceback half).
+  `anchors::extract` now pulls function/method identifiers out of pasted
+  Python tracebacks (`File "...", line N, in <name>`) as a new step 3,
+  inserted between imports and prose. Frame-name identifiers bypass the
+  snake/camel shape filter that prose tokens require, so plain lowercase
+  names (`eval`, `apply`, `frobnicate`) become anchors when they appear in
+  a stack frame. Synthetic frames (`<module>`, `<listcomp>`, `<genexpr>`,
+  `<lambda>`), stop-words, and names <3 chars are filtered. Dotted frames
+  (`Mod.eval`) push both the full chain (flagged `from_dotted_call`) and
+  the tail. Six unit tests in `anchors.rs` plus an integration test in
+  `tests/engine.rs` (`context_traceback_frame_surfaces_plain_lowercase_function`)
+  that proves the engine-layer wiring routes a pasted traceback through
+  the new extractor and surfaces the frame's function as a pivot when the
+  prose shape filter alone would reject it. Pairs with the semantic
+  reverse-expand above to cover both halves of the #69 v2 design — the
+  ~40% of Python bug reports that include a traceback (anchor path) and
+  the ~60% that don't (semantic reverse-expand path).
+- **`run_pipeline` optional `context` parameter** (anchor-extraction v1.7).
+  Callers can now pass an additional raw-text blob alongside `task` — typically
+  the full problem statement, bug report, or stack trace the task was derived
+  from. Anchor extraction runs on `task + context` with dedup by symbol name,
+  so identifiers paraphrased out of a compact task string are recovered from
+  the raw source. BM25, semantic search, graph retrieval, and intent detection
+  still run on `task` alone, so `context` has no effect on query budget or
+  intent classification. Backward-compatible: existing callers see identical
+  behavior. New `CoreEngine::run_pipeline_with_context` entrypoint; MCP tool
+  schema advertises `context` with a persuasive description so real-world
+  agents (not just the SWE-bench harness) populate the field. CLI gains
+  `codesurgeon context --context @path/to/file|-|<literal>`. Three unit tests
+  in `crates/cs-core/tests/engine.rs`. See `docs/explicit-symbol-anchors.md`
+  §v1.7 for design notes.
+- **SWE-bench harness — per-arm prompt fairness**. `benches/swebench/run.py`
+  now branches `PROMPT_PREFIX` by arm via `build_prompt(arm, problem_statement)`.
+  The control (`without`) arm no longer receives the
+  `mcp__cs-codesurgeon__run_pipeline` nudge, since the tool isn't available
+  under `--strict-mcp-config` with an empty `mcpServers` map. Removes a
+  long-standing confound from the A/B.
+- **`get_impact_graph` response size cap** (#65). Hard-caps the number of
+  dependents/dependencies serialized into the response so a query against a
+  high-fan-in utility doesn't produce a multi-MB payload that blows the
+  client's context window.
+- **MCP tool descriptions rewritten for BM25 ranking**. Tool descriptions
+  now include bug-fix / refactor / exception-handling keywords the agent's
+  internal tool selector scores against, so `run_pipeline` gets picked for
+  symptom-anchored tasks instead of a generic search tool.
+
+### Fixed
+
+- **Reverse-expand no longer surfaces `SymbolKind::Import` statements as
+  pivots.** Re-export shims (`from err import DeepError`) were winning pivot
+  slots because their FQN literally contained the query term. Filter applied
+  in both `reverse_expand_from_anchors` and pivot eligibility. Regression
+  test in `reverse_expand.rs`.
+- **Trivial exception-class stubs excluded from pivot slots.** A 1-line
+  `class FooError(Base): pass` has no body to show; before the filter, it
+  would beat behaviour-carrying callers on BM25 when the task named the
+  exception. Stubs remain available as reverse-expand *seeds*; they just
+  can't occupy a pivot slot on their own. Regression tests cover both the
+  stub exclusion and the preservation of non-trivial exception classes with
+  real methods.
+- **Auto-observation feedback loop disabled by default** (`auto_observations`
+  config key). Writing every `run_pipeline` call back into the observation
+  store poisoned session memory across runs: the consolidator merged query
+  pivots into `Consolidated` rows that re-surfaced as hints in future
+  capsules, biasing pivot selection toward prior choices regardless of their
+  correctness. Opt-in for users who actively curate observations.
+
 ## [1.0.0] - 2026-04-10
 
 First stable release. codesurgeon is a local-first dependency graph and session

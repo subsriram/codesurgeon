@@ -139,6 +139,22 @@ pub struct IndexingConfig {
     /// USD cost per token for savings display in `get_stats`.
     /// Set via `[observability] token_rate_usd = 0.000003` in `config.toml`. Default: None.
     pub token_rate_usd: Option<f64>,
+
+    /// When true, every `run_pipeline` / `get_context_capsule` call auto-records
+    /// the `query → top-pivots` tuple as an `Auto` observation. The consolidator
+    /// later merges similar entries into `[consolidated from N observations]` memories
+    /// that surface in future capsules.
+    ///
+    /// Default: **false**. The record-side has no success signal — a query
+    /// whose capsule returned the wrong pivots is recorded identically to one
+    /// that led to a correct fix, so repeated failures cement the wrong
+    /// pivots as "canonical" memory and poison future runs (regression
+    /// observed on sympy-21379 in the SWE-bench harness).
+    ///
+    /// Set `[observability] auto_observations = true` in `config.toml` to
+    /// restore the pre-#72 behaviour. Explicit `save_observation` calls are
+    /// unaffected — they remain the agent-attested memory path.
+    pub auto_observations: bool,
 }
 
 impl IndexingConfig {
@@ -181,6 +197,9 @@ impl IndexingConfig {
         if let Some(obs) = table.get("observability").and_then(|v| v.as_table()) {
             if let Some(v) = obs.get("token_rate_usd").and_then(|v| v.as_float()) {
                 cfg.token_rate_usd = Some(v);
+            }
+            if let Some(v) = obs.get("auto_observations").and_then(|v| v.as_bool()) {
+                cfg.auto_observations = v;
             }
         }
         // CS_TRACK_MANIFEST env var overrides config.toml
@@ -227,6 +246,9 @@ impl IndexingConfig {
             }
             if ws.token_rate_usd.is_some() {
                 cfg.token_rate_usd = ws.token_rate_usd;
+            }
+            if ws.auto_observations {
+                cfg.auto_observations = true;
             }
         }
 

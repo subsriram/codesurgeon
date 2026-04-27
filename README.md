@@ -183,6 +183,14 @@ Call this before every edit. Give it a plain-English task description. It auto-d
 run_pipeline(task="fix the retry logic in the HTTP client")
 ```
 
+Optional `context` parameter — pass the raw verbatim source the task was derived from (full problem statement, bug report, error trace). Identifiers present in the raw source but paraphrased out of `task` are recovered via anchor extraction, which runs on `task + context` while BM25/semantic/intent detection stay on `task` alone.
+```
+run_pipeline(
+  task="fix PolynomialError on subs with Piecewise",
+  context="<full GitHub issue body with code snippet and traceback>"
+)
+```
+
 ---
 
 **`get_context_capsule`** — lightweight search

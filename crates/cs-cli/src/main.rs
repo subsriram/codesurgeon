@@ -51,6 +51,12 @@ enum Commands {
         /// Seed the search with a file path substring (e.g. src/auth)
         #[arg(short, long)]
         file_hint: Option<String>,
+        /// Optional raw-text blob for anchor extraction — the full
+        /// problem statement / bug report / error trace the task was
+        /// summarized from. Use @path/to/file to read from a file, or -
+        /// to read from stdin.
+        #[arg(long)]
+        context: Option<String>,
     },
 
     /// Show current configuration
@@ -155,9 +161,24 @@ async fn main() -> Result<()> {
             budget,
             language,
             file_hint,
+            context,
         } => {
-            let result = engine.run_pipeline(
+            // Resolve @path / - / literal into a plain String, matching the
+            // existing `diff` subcommand's ergonomics.
+            let context_resolved: Option<String> = match context.as_deref() {
+                Some("-") => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    Some(buf)
+                }
+                Some(s) if s.starts_with('@') => Some(std::fs::read_to_string(&s[1..])?),
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
+            let result = engine.run_pipeline_with_context(
                 &task,
+                context_resolved.as_deref(),
                 Some(budget),
                 language.as_deref(),
                 file_hint.as_deref(),
@@ -236,20 +257,42 @@ async fn main() -> Result<()> {
         }
 
         Commands::Impact { symbol_fqn } => {
-            let result = engine.get_impact_graph(&symbol_fqn, None, true)?;
+            let result = engine.get_impact_graph(&symbol_fqn, None, None, true)?;
             println!("Impact graph for: {}", result.target_fqn);
             println!("Total affected: {}\n", result.total_affected);
 
             if !result.direct_dependents.is_empty() {
-                println!("Direct dependents:");
+                println!(
+                    "Direct dependents ({} shown{}):",
+                    result.direct_dependents.len(),
+                    if result.direct_truncated > 0 {
+                        format!(", {} more truncated", result.direct_truncated)
+                    } else {
+                        String::new()
+                    }
+                );
                 for s in &result.direct_dependents {
                     println!("  {} ({}:{})", s.fqn, s.file_path, s.start_line);
                 }
+                if result.direct_truncated > 0 {
+                    println!("  … + {} more (truncated)", result.direct_truncated);
+                }
             }
             if !result.transitive_dependents.is_empty() {
-                println!("\nTransitive dependents:");
+                println!(
+                    "\nTransitive dependents ({} shown{}):",
+                    result.transitive_dependents.len(),
+                    if result.transitive_truncated > 0 {
+                        format!(", {} more truncated", result.transitive_truncated)
+                    } else {
+                        String::new()
+                    }
+                );
                 for s in &result.transitive_dependents {
                     println!("  {} ({}:{})", s.fqn, s.file_path, s.start_line);
+                }
+                if result.transitive_truncated > 0 {
+                    println!("  … + {} more (truncated)", result.transitive_truncated);
                 }
             }
         }

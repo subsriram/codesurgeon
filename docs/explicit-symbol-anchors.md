@@ -1,13 +1,657 @@
 # Design: Explicit Symbol-Name Anchors in the Ranking Pipeline
 
-> **Status**: v1 → v1.6 implemented.
-> **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`
-> **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`
+> **Status**: v1 → v1.7 landed, plus #67 (reverse-edge expansion) and
+> `SymbolKind::Import` pivot filter. #69 (density+query-aware reverse-expand
+> ranking) landed and was **reverted** after empirical regression; see the
+> "Session 2026-04-21 findings" section below.
+> **Target**: `crates/cs-core/src/engine.rs::build_context_capsule`, `crates/cs-core/src/anchors.rs`, `crates/cs-core/src/ranking.rs`
+> **Related**: `docs/ranking.md`, SWE-bench benchmark report `benches/swebench/report_29c_interim.md`, `benches/swebench/WARM_WORKSPACES.md`
 > **Motivation**: SWE-bench #29c revealed that capsule ranking misses the target
 > file in 5 out of 6 regression tasks even with semantic (embedding) retrieval
 > enabled. The failure mode is always the same: the task explicitly names the
 > target symbol, but the ranker treats it as bag-of-words and surfaces
 > tangentially-related files instead.
+
+---
+
+## Session 2026-04-21 findings — `sympy__sympy-21379` deep-dive
+
+End-to-end SWE-bench harness validation on the motivating v1.6 regression
+case (`sympy__sympy-21379`: `PolynomialError` on `subs()` with `Piecewise`
+argument; fix site `sympy/core/mod.py::Mod.eval`, reached 3+ hops upstream
+via reverse edges). Full reproducer, artifacts, and stream logs captured
+in `target/swebench/with/sympy__sympy-21379/` on branch
+`claude/clever-leakey-7ab62d`.
+
+### Outcome across configurations
+
+| Config | Wall | Cost | Patch | Notes |
+|---|---:|---:|---:|---|
+| Bare claude (29c backup) | 96 s | $0.30 | 610 B ✓ | No codesurgeon, Grep → edit |
+| v1.7 + 5b nudge only | 290 s | $1.01 | 864 B ✓ | Phase 3 baseline |
+| v1.7 + #65 cap + CLAUDE.md | 296 s | $1.02 | 864 B ✓ | Phase 4a/b — identical pivots to Phase 3 |
+| + #67 reverse-expand | 296 s | $1.02 | 864 B ✓ | Walk fires, 20 candidates, none reach `Mod.eval` |
+| **+ #69 density+query-aware** | **600 s** | **—** | **0 B ✗** | Phase 4c timeout, imports won pivots |
+| + #69 + import filter | 600 s | — | 0 B ✗ | Phase 4d — non-import pivots still distract |
+| **Revert #69, keep import filter** | **279 s** | **$0.95** | **582 B ✓** | Phase 4e — restores success |
+
+### Three empirical claims this session added to the record
+
+#### 1. `Mod.eval` is not reachable via the default reverse-expand walk
+
+The chain `Mod.eval → AssocOp._from_args → ComplexRootOf.__new__ →
+PolynomialError` exists in the graph (verified via `codesurgeon flow`),
+but default `REVERSE_EXPAND_FAN_OUT = 5` explores a narrow 5×5×5 ≈ 125-node
+beam and `Mod.eval` is outside it. Doubling the pool (#69's density-aware
+fan-out 5..25) didn't change the outcome: `Mod.eval` still absent from
+pivots, adjacents, and skeletons. Tracked by #69.
+
+#### 2. Query-aware ranking has a sharp failure mode on symptom-anchored queries
+
+The core observation: **the fix site has zero query-term overlap by
+construction**. For `sympy__sympy-21379` the user names `PolynomialError`,
+`subs`, `Piecewise`, `sinh`, `exp`, `symbols` — never `Mod` (the containing
+class) or `eval` (the method). Ranking callers by term overlap with the
+query actively demotes the fix site because it has none of the words the
+query mentions.
+
+Consequences of #69's query-aware ranking observed in harness runs:
+- Bare `from X import (A, B, C)` lines scored highest (their FQN/body
+  literally list the query's named symbols) and won pivot slots. Fixed by
+  filtering `SymbolKind::Import` at pivot selection (commit `359d4ad`).
+- Even with imports filtered, the shifted pivot composition sent the agent
+  into a deeper exploration loop: 64 tool calls across 10+ files, reaching
+  `Mod.eval` but never committing to an edit before the 600 s timeout.
+  Phase 4d. Unfixed by any local tuning; root cause is the ranking criterion
+  itself.
+
+This is the anti-correlation already flagged in the v1.7 finding below:
+query-aware ranking helps queries that already name the fix site (where
+anchors alone would have fired) and hurts queries that don't (the class
+reverse-expansion was designed for). #69 has been reverted pending a
+different approach (centrality-dominated ranking with term overlap as
+tiebreaker, or semantic embedding similarity on function bodies rather
+than surface-text term match).
+
+#### 3. `SymbolKind::Import` must be excluded from pivot eligibility globally
+
+Not just reverse-expand. Import-statement symbols have a distinctive
+pathology: their FQN is literally the statement text (`from X import (A,
+B, …)`), so any retriever that scores on name/FQN/body term overlap
+promotes them when the query mentions their re-exported symbols. BM25
+does this too. Pivot-level filter (`is_eligible_pivot` in
+`build_context_capsule`, commit `359d4ad`) is load-bearing regardless of
+which retrieval source surfaced the import. Regression test:
+`reverse_expand_does_not_surface_import_statements` in
+`crates/cs-core/tests/reverse_expand.rs`.
+
+### What still doesn't work — open structural problem
+
+Capsules on symptom-anchored queries remain ~3× bare-claude cost on
+sympy-21379 ($0.95 / 279 s vs $0.30 / 96 s). Root cause: **anchor-based
+retrieval has no mechanism to reach fix sites named after internal
+primitives the user doesn't know about.** Three possible next directions,
+in order of estimated leverage:
+
+- **Traceback parsing**: when `context` contains `File "...", line N, in
+  func_name` frames, extract FQNs directly as anchors. Deterministic;
+  works on ~40% of real bug reports. Doesn't help sympy-21379 (no trace
+  in the post) but would solve the class on tasks that do have traces.
+- **Body-text embedding similarity to task+context**: rerank reverse-expand
+  candidates by semantic similarity of the function body to the query
+  rather than by surface term overlap. `Mod.eval`'s body calls `gcd(p, q)`
+  and handles numeric cases — semantically near "polynomial"/"modulo"
+  themes. Heavier engineering (per-symbol embeddings already exist for
+  ANN; the infrastructure is reusable).
+- **Reproducer-test awareness**: swebench tasks ship failing tests. Their
+  imports and assertions pin the fix site precisely. Narrow win for
+  swebench; doesn't generalize to real-world use.
+
+Phase 4 CLAUDE.md delivery went through two corrections. Initially
+(`--inject-claude-md` via file write only), `claude --print` does not
+auto-load `cwd/CLAUDE.md` — interactive-mode-only behaviour — so the
+file sat on disk and the agent never saw it. Verified post-hoc: all
+121 events / 467 KB of the Phase 4e stream contain zero distinctive
+CLAUDE.md content.
+
+Fixed in commit `b122161`: `--inject-claude-md` now inlines the
+CLAUDE.md body into `PROMPT_PREFIX` after `TREATMENT_NUDGE`. The
+on-disk write is retained as an audit artifact.
+
+Reran the harness with delivery confirmed working (Phase 4f). Outcome:
+
+| Metric | Phase 4e (delivery no-op) | Phase 4f (delivery working) |
+|---|---|---|
+| Wall / cost | 279 s / $0.95 | **600 s timeout** |
+| Patch | 582 B ✓ | **0 B ✗** |
+| Tool calls | 40 | 64 |
+| `get_impact_graph` calls | 0 | **0** (unchanged) |
+| Files explored | focused, reached `mod.py` | `trigsimp.py`×9, never `mod.py` |
+
+The extra 2,781 chars of guidance **changed the agent's exploration
+path** (9 Reads on `sympy/simplify/trigsimp.py`, new behaviour) but
+did **not** trigger the specifically-recommended `run_pipeline →
+get_impact_graph` chain. It sent the agent into a different and less
+productive exploration subtree, and the 600 s budget expired without
+an edit attempt.
+
+Revised conclusion: prompt-level CLAUDE.md-style chain guidance is
+**not a reliable steering lever** — not because it isn't read, but
+because reading it doesn't change tool-selection behaviour and the
+extra content can actively distract. The best outcome on this task
+remains without CLAUDE.md injection. Recommendation: disable
+`--inject-claude-md` for automated benchmarks until a steering approach
+empirically helps. Real-user interactive use is unaffected (interactive
+mode does auto-load `CLAUDE.md`).
+
+### Phase 4g — minimal-dose tool mention (one 134-char line)
+
+To test whether the CLAUDE.md regression was about volume rather than
+direction, added a single 134-char line to `TREATMENT_NUDGE_5B`:
+
+> Other codesurgeon tools: `get_impact_graph` (callers/raisers of a symbol), `get_skeleton` (file API), `search_logic_flow` (trace A→B).
+
+Outcome on the same task:
+
+| Config | Wall | Cost | Tool calls | Patch | cs- tools used |
+|---|---:|---:|---:|---:|---|
+| Phase 4e (no tool mention) | 279 s | $0.95 | 40 | 582 B ✓ | `run_pipeline` |
+| **Phase 4g (134-char mention)** | **479 s** | **$1.73** | **60** | 887 B ✓ | `run_pipeline` (same) |
+| Phase 4f (2,781-char CLAUDE.md) | 600 s timeout | — | 64 | 0 B ✗ | `run_pipeline` (same) |
+
+Monotonic across doses: **more prompt-level tool advertising →
+more exploration cost → no chaining gain**. Agent used only
+`run_pipeline` at every dose; extra prose advertising the other tools
+increased Grep/Read/Bash exploration (40 → 60 → 64 calls) without ever
+triggering a chained tool use. The 134-char dose nearly doubled the
+cost for the same correct patch; the 2,781-char dose tipped into
+timeout.
+
+The mechanism is almost certainly that the MCP `tools/list` event at
+session init already surfaces all tools; prose restatement adds
+nothing the model needs and measurably distracts it. Reverted the
+134-char line; left a code comment flagging the empirical finding so
+future maintainers don't re-add it.
+
+**Reference baseline for future ranking work** (now firmly supported
+by three experiments): v1.7 + #67 (reverse-expand) + `SymbolKind::Import`
+filter + `--nudge 5b`, **without** `--inject-claude-md` and **without**
+any tool-advertising prose. 279 s / $0.95 / correct 582 B patch on
+sympy-21379. Measure any new approach against this number.
+
+### Phase 5 — inference-prompt A/B (5e–5i)
+
+Tested whether asking the agent to do NER + light inference at the
+prompt level — rather than just pasting the problem verbatim — beats
+the server-side regex extraction that `5b` relies on. Seven variants
+across the dose-and-framing spectrum, all on the same warm workspace,
+same binary, same task:
+
+| Variant | Nudge ch | Wall | Cost | Patch | Context shape | Notes |
+|---|---:|---:|---:|---:|---|---|
+| **5b** | 716 | 279 s | **$0.95** | 582 B ✓ | 1,747 ch verbatim | reference baseline |
+| 5g | 529 | **256 s** | $0.99 | 582 B ✓ | 94 ch grounded identifiers | Pareto-comparable to 5b |
+| 5i | 482 | 368 s | $1.34 | 582 B ✓ | 68 ch grounded identifiers | correct, costlier |
+| 5e | 568 | 474 s | $1.60 | 597 B ✓ | 114 ch speculative | agent guessed `trigsimp` (wrong subtree) |
+| 4g | 850 | 479 s | $1.73 | 887 B ✓ | 1,747 ch + 134-ch tool line | reverted |
+| 5f | 787 | timeout | — | 0 B ✗ | 1,896 ch verbatim+inferred | wrong-direction inference amplified |
+| 5h | 559 | timeout | — | 0 B ✗ | 69 ch with hallucinations | agent hallucinated `ask_key`, `ask_assumptions` |
+| 4f | 3,497 | timeout | — | 0 B ✗ | 1,747 + 2,781-ch CLAUDE.md | reverted |
+
+### Conclusions from Phase 5 (and overall prompt-A/B session)
+
+1. **5b and 5g are in the same success band** (~$0.95–$0.99 / ~256–279 s).
+   Single-run noise (~±30% in cost, ±30 s in wall) is large enough that
+   their difference is not a signal. Keeping 5b as default; 5g stays in
+   `NUDGES` for future multi-run validation.
+
+2. **Every variant that promotes speculation or adds tool advertising
+   >~130 chars either regressed or timed out.** The Phase 4g dose-response
+   (0 / 134 / 2,781 chars → $0.95 / $1.73 / timeout) was not a one-off —
+   the pattern held across seven variants. Volume of prompt content
+   correlates with exploration overhead regardless of what the content
+   says.
+
+3. **Agents never chain MCP tools from prompt-level guidance.** Across 7
+   variants with different tool-naming formats (short names, FQN, post-
+   capsule framing, CLAUDE.md narrative, inline mention), **zero calls**
+   to `get_impact_graph` / `get_skeleton` / `search_logic_flow` were
+   observed. Agent defaults to `run_pipeline` once then Grep/Read for
+   exploration. This is robust.
+
+4. **Agent inference adds noise more often than signal on this task.**
+   When asked to infer internal symbols (5e/5f/5h), the agent pulled
+   either irrelevant adjacent territory (`trigsimp`, `_eval_rewrite_as_exp`)
+   or outright hallucinations (`ask_key`, `ask_assumptions`). None of
+   the inference variants surfaced `Mod.eval`, the actual fix site.
+   The agent doesn't have the sympy-implementation-specific knowledge
+   that `subs({1: 1.0})` routes through `Mod.eval`.
+
+**Prompt-level steering is closed as a lever on this task class.**
+Further gains come from server-side capsule content. Candidate
+directions tracked in [#69](https://github.com/subsriram/codesurgeon/issues/69)'s
+v2 recommendations: body-text embedding similarity on reverse-expand
+candidates (replaces surface-text term overlap), traceback parsing on
+`context` (high-precision signal when tracebacks are present),
+reproducer-test awareness (swebench-specific).
+
+### Harness / measurement infrastructure — stable baseline
+
+Workflow to reproduce any of the rows in the table above:
+
+```bash
+bash benches/swebench/prepare_workspace.sh sympy__sympy-21379
+
+uv run benches/swebench/run.py \
+  --instance-ids sympy__sympy-21379 \
+  --arms with \
+  --reuse-workdir target/swebench-warm/sympy__sympy-21379 \
+  --max-budget-usd 3.00 \
+  --timeout 600 \
+  --nudge 5b \
+  --inject-claude-md \
+  --stream-json \
+  --clean
+```
+
+Stream log under `target/swebench/with/<instance_id>/claude_stream.jsonl`
+is the authoritative record of tool-call behaviour. Diff log under the
+same directory is captured even on timeout (commit `07b4848`).
+
+---
+
+## Session 2026-04-22 findings — three fixes that together solved `sympy-21379`
+
+Continuation of the 2026-04-21 deep-dive, on claude 2.1.117 (fresh regression
+re: MCP tool registration — `init`'s `mcp_servers` reports `[]` even with the
+sidecar pre-warm; tools arrive via ToolSearch on first call). Three changes
+landed together and produced a reproducible `OK` on the warm sympy-21379
+workspace:
+
+| # | Change | Commit |
+|---|---|---|
+| 1 | Reverse-expand body-text semantic similarity (#69 v2) — cosine(query, caller body) mixes into per-hop BFS scoring so zero-overlap fix sites like `Mod.eval` aren't eliminated by pure term overlap + centrality | `8684552` (cherry-pick of `a313a76`) |
+| 2 | Auto-observation recording default off (#72) | `d50d824` |
+| 3 | Trivial exception-class pivot filter (#73) — drop `class FooError(Base): pass` stubs from pivot eligibility | `d50d824` |
+
+### Measured outcome (same workspace, same prompt, same nudge 5b)
+
+| Config | Wall | Cost | Turns | Patch | Stop reason |
+|---|---:|---:|---:|---:|---|
+| Claude 2.1.117 + sidecar only (14:09 UTC) | 389 s | $1.06 | 38 | 0 B ✗ | `error_max_budget_usd` |
+| + fixes #1/#2/#3 (14:34 UTC) | **203 s** | **$0.62** | 28 | **864 B ✓** | `success` |
+
+Diff produced matches the canonical upstream fix: wrap `gcd(p, q)` in
+`sympy/core/mod.py::Mod.eval` with a try/except on `PolynomialError` returning
+`S.One` on catch.
+
+### What the capsule looked like, before and after
+
+Eight pivot slots; only position 8 differed between runs.
+
+| Slot | Before (14:09) | After (14:34) |
+|---|---|---|
+| 1 | `sympy/core/symbol.py::symbols` | same |
+| 2 | `sympy/functions/elementary/exponential.py::exp` | same |
+| 3 | `sympy/plotting/intervalmath/lib_interval.py::exp` | same |
+| 4 | `sympy/functions/elementary/hyperbolic.py::sinh` | same |
+| 5 | `sympy/functions/elementary/piecewise.py::Piecewise` | same |
+| 6 | `sympy/strategies/tools.py::subs` | same |
+| 7 | `sympy/strategies/rl.py::subs` | same |
+| 8 | **`sympy/polys/polyerrors.py::PolynomialError`** (1-line stub) | **`sympy/matrices/common.py::MatrixOperations::subs`** |
+
+And below the pivots:
+
+| Section | Before | After |
+|---|---|---|
+| Session memory | 3 consolidated rows reading *"Queries: 'fix PolynomialError on subs with Piecewise …' — pivots: symbols, exp, interval.exp"* | _(no session memory — empty table after the Auto+Consolidated wipe)_ |
+
+### Why the fix worked despite `Mod.eval` still not being in the pivots
+
+Key nuance: even with all three fixes in place, the capsule **still did not
+surface `Mod.eval` as a pivot**. The semantic reverse-expand (#69 v2) didn't
+rank `Mod.eval` high enough to break into the top 8 — file-diversity pinning
+still held 5 of those slots for anchor-named files.
+
+The agent reached `Mod.eval` via grep exploration (`grep "gcd" sympy/core/`)
+not via the capsule. **The win came from removing misleading signal, not
+adding correct signal:**
+
+1. **Auto-observations off (#72)** — the three stale consolidated memories
+   that previously steered the agent toward `exp` / `symbols` /
+   `interval.exp` were no longer present. Without them, the agent's own
+   exploration followed `parallel_poly_from_expr` and `cancel` to
+   `polytools.py`, then traced back to the caller site via standard grep.
+2. **Trivial-exception filter (#73)** — pivot slot 8 stopped being a 1-line
+   `class PolynomialError(Base): pass` stub and became a real symbol. Not
+   decisive, but freed a slot that the agent otherwise had to read-and-
+   discard.
+3. **Reverse-expand semantic scoring (#69 v2)** — loaded for correctness
+   even though it didn't surface `Mod.eval` this run. Regressions on other
+   SWE-bench instances can use this path without the import-filter and
+   trivial-exception-filter crutches below it.
+
+Together, these moved the 38-turn / $1.06 / `error_max_budget_usd` outcome
+down to 28 turns / $0.62 / `success`. Budget headroom was the proximate
+cause of the success: the previous run ran out of money mid-exploration at
+turn 38 with the assistant text *"Now let me look at the source of the error
+message and the relevant code paths."* The new run had 10 turns of headroom
+to actually write the fix.
+
+### Pre-requisite: wipe the poisoned observations
+
+A warm workspace that accumulated Auto / Consolidated rows under the old
+default will still have them on disk. The flag change prevents NEW rows from
+landing but doesn't delete existing ones. To reproduce the clean result:
+
+```bash
+sqlite3 target/swebench-warm/<instance>/.codesurgeon/index.db \
+  "DELETE FROM observations WHERE kind IN ('auto', 'consolidated');"
+```
+
+Alternatively, re-prepare the workspace (the cold indexer creates an empty
+observations table on workspaces with no warm state).
+
+### Caveats
+
+- **n=1 on a stochastic benchmark**: claude-code exploration paths vary run
+  to run. Two consecutive runs on the same workspace can produce
+  turn-counts that differ by ±30% purely from tool-order variance. Before
+  treating any of this as robust, collect n=3 samples on the same config
+  and report the spread.
+- **MCP race still present**: `init`'s `mcp_servers: []` on 2.1.117 is
+  unchanged. The sidecar keeps the cs-codesurgeon MCP warm but claude's
+  own spawned MCP still misses the init handshake, so tools arrive via
+  ToolSearch and the nudge has to name the tool explicitly (5b does:
+  `mcp__cs-codesurgeon__run_pipeline`). Without the explicit name the
+  BM25 description rewrites (commit `8037aaf`) are the fallback.
+- **Other SWE-bench instances not retested**: this session validated only
+  sympy-21379. The #69-revert from 2026-04-21 was kept; the new
+  reverse-expand semantic path is additive to it. Broader harness run
+  (the 75-instance pilot) is a separate follow-up.
+
+### Why these fixes generalise beyond sympy-21379
+
+The three changes address failure modes that any corpus can hit — this
+task just happens to exhibit all three at once:
+
+- **Poisoning via consolidation** fires whenever the same query class is
+  run repeatedly with inconsistent outcomes. Any benchmark run, any
+  user-facing flow where the same bug report template recurs.
+- **Trivial exception stubs** exist in every mature Python / Java / Rust
+  library — they're the conventional way to define a namespaced error
+  hierarchy. BM25 always ranks them into the pivot pool when a task names
+  them by word.
+- **Reverse-expand semantic scoring** shifts which callers get promoted
+  out of the overlap=0 group. Wherever the fix site's body doesn't lift
+  query tokens but is topically aligned, this helps.
+
+---
+
+## Session 2026-04-24 findings — re-validation on `sympy-21379` after cherry-picking e1568fa + populating embeddings
+
+Re-ran the same warm sympy-21379 workspace with both halves of #69 v2 in
+place: `8684552` (semantic reverse-expand, already on the branch) plus
+`e1568fa` (Python traceback frame extraction, cherry-picked from
+`quizzical-mahavira`). Re-indexed sympy with the embeddings-enabled
+release binary so the per-symbol embedding cache is populated for the
+first time on this workspace (55,709 symbols → 171 MB `embeddings.bin`,
+prior runs had a 9 KB stub from a no-features build).
+
+### Measured outcome (n=1 each, four configurations)
+
+| Config | Claude | Wall | Cost | Diff | Tool calls | Canonical fix? | cs-codesurgeon used? |
+|---|---|---:|---:|---:|---:|---|---|
+| `without` (control) | 2.1.117 | 225.9 s | $0.77 | 611 B | — | ✓ | n/a |
+| `with` v1 (broken MCP) | 2.1.117 | 139.8 s | $0.42 | 582 B | 0 cs | ✓ | ✗ — `mcp_servers: []` at init |
+| `with` v2 (working MCP) | **2.1.114** | 487.9 s | $1.61 | 582 B | 53 | ✓ | ✓ — 1× `run_pipeline` |
+| `with` v3 (post-fix) | **2.1.119** | **81.8 s** | $0.79 | 1067 B | **10** | ✓ | ✓ — 1× `run_pipeline` |
+
+All four runs produced the canonical upstream patch in
+`sympy/core/mod.py::Mod.eval` (try/except `PolynomialError` around
+`gcd(p, q)`). Wall-time spread across **6.0×** (82 s → 488 s) on
+identical workspace + task — variance dominates n=1.
+
+**2.1.119 verdict on the `--mcp-config` regression**: the bug observed
+on 2.1.117 (cleared globals + valid config + `--strict-mcp-config`
+still produced `mcp_servers: []`) is **fixed** in 2.1.119. Smoke test
+on the same workspace + same materialized config: init reports
+`mcp_servers: [{cs-codesurgeon, connected}]`, 40 tools advertised
+(25 built-in + 13 cs MCP + 2 plugin), agent invokes `run_pipeline`
+successfully without any pinning workaround. WARM_WORKSPACES.md's
+`CLAUDE_BIN=2.1.114` mitigation is no longer needed; the
+post-run `mcp_servers: []` diagnostic check still useful as a
+regression guard.
+
+### 2.1.119 also reverted two earlier behaviour changes
+
+Two follow-up smoke tests after the v3 run, in response to the
+"are any harness assumptions tied to earlier versions?" audit:
+
+**1. MCP tool deferral (Cause 1) is FIXED.** Direct probe on the
+warm sympy workspace: `init` event lists all 13
+`mcp__cs-codesurgeon__*` tools in `tools[]` from the start. No
+`ToolSearch` round-trip required. The 2.1.117 regression that
+deferred MCP schemas behind a `ToolSearch select:<name>` lookup is
+reverted in 2.1.119.
+
+Direct probe of the Phase 4g/4h conclusion (the prompt-level
+steering hypothesis): ran nudge `5g` — which explicitly advertises
+`get_impact_graph`, `get_skeleton`, and `search_logic_flow` — on
+2.1.119 against the same warm sympy workspace. **Agent still made
+zero chained-MCP calls.** Tool budget: 1× `run_pipeline` + 1×
+`ToolSearch` + 10× Bash + 6× Read + 2× Edit. Same mechanism as v3:
+agent ran the MWE via `python -c`, got a Python traceback frame
+`mod.py:169, in eval`, went straight to Edit. Wall: 132.1 s; cost:
+$1.17; diff: 1037 B (canonical fix).
+
+So the Phase 4g/4h conclusion **holds on 2.1.119** even though the
+deferred-loading friction is gone. The agent's bias toward
+Bash/Read/Edit over chained MCP tools is structural, not an
+artifact of the 2.1.117 deferral. Confirms the existing run.py
+choice of 5b as default. The full 8-variant re-run (5b/5g/5e/5f/
+5h/5i/5j/5k) is no longer warranted on 2.1.119 — the gating
+mechanism the rerun was meant to test is provably absent.
+
+**2. `claude --print` now auto-loads workdir/CLAUDE.md.** Verified
+by planting a fingerprinted CLAUDE.md in a tmpdir, running
+`claude --print` from that tmpdir with no `--mcp-config`, asking
+"What is 2+2?" — the agent's reply contained the fingerprint
+verbatim (the only way it could have known about the token was
+by reading the on-disk file). On 2.1.114 (the version the harness
+was originally calibrated against, per
+[run.py:362-364](../benches/swebench/run.py#L362)), `--print`
+explicitly did NOT auto-load workdir/CLAUDE.md, which was why the
+harness inlines the codesurgeon guidance in the prompt body. On
+2.1.119 the `--inject-claude-md` flag now produces **double
+delivery** — once via the in-prompt inline and once via the
+auto-loaded on-disk file. Token cost roughly doubles for the
+CLAUDE.md content. Mitigation noted in `run.py` docstring; pick
+one delivery path before the next harness run that uses
+`--inject-claude-md`.
+
+The v3 with-arm run from 2026-04-25 was unaffected by #2 because
+the warm sympy workspace ships no CLAUDE.md and the harness
+wasn't invoked with `--inject-claude-md`. The 81.8 s / $0.79 /
+1067 B numbers stand as measured.
+
+### `Mod.eval` still does not surface as a pivot — even with embeddings
+
+The `with v2` run's `run_pipeline` capsule (`task` paraphrased,
+`context` = full problem statement verbatim per v1.7) returned 8
+pivots: `symbols`, `exp`, `exp` (interval), `sinh`, `Piecewise`,
+`subs` (strategies/tools), `subs` (strategies/rl), `MatrixOperations.subs`.
+
+**Zero matches for `Mod.eval` in the capsule.** Same symptom as the
+2026-04-22 session, but now with embeddings populated and the v2
+semantic scorer actively running. Reproduced across two distinct
+runs (v2 on 2.1.114 and v3 on 2.1.119) — same 8 pivots returned both
+times.
+
+The v2 (2.1.114) agent reached `Mod.eval` through **26 Read + 16
+Grep** calls. The v3 (2.1.119) agent reached `Mod.eval` more
+efficiently through a **different mechanism**: it ran the MWE from
+the problem statement via `python -c`, which produced a Python
+traceback containing `File ".../sympy/core/mod.py", line 169, in
+eval`. That single Bash result gave it the file + line + symbol
+directly; only 3 Reads + 2 Edits followed.
+
+This is suggestive: even when codesurgeon's semantic reverse-expand
+fails to surface the fix site, an agent willing to *execute* the
+problem-statement MWE will get the traceback for free. The
+traceback half of #69 v2 (`e1568fa`) is designed to extract symbols
+from such tracebacks, but it operates on the *input* — it would
+help if the agent fed the runtime traceback back into a second
+`run_pipeline` call. The v3 agent didn't loop; it went straight to
+Edit. So the win there came from claude's behaviour change in
+2.1.119, not from any codesurgeon improvement.
+
+This confirms the 2026-04-22 caveat — the win on that session came
+from *removing misleading signal* (auto-obs off, trivial-stub
+filter), not from the semantic reverse-expand surfacing the fix
+site directly. The unit-tested algorithm works on synthetic graphs;
+on the real sympy-core graph the fix site stays outside the
+top-`fan_out` beam from `PolynomialError` regardless of whether
+embeddings are populated.
+
+Open structural problem (carried over from 2026-04-22): symptom-anchored
+queries where the fix site is N hops upstream through a dense raiser
+graph, and the fix site's body has no lexical overlap with the query.
+The 2.0× semantic weight is calibrated against unit fixtures with
+narrow per-hop fan-out; on a real high-fan-in node like
+`PolynomialError` the top-5 beam still drops the relevant hop. The
+follow-up direction noted in the 2026-04-22 section ("density-aware
+fan-out, but with centrality dominating instead of query-aware") is
+unchanged.
+
+### Two operational findings
+
+**1. `claude 2.1.117` broke `--mcp-config` in `--print` mode entirely**
+— this extends the prior Cause 1 / Cause 2 documented in
+`benches/swebench/WARM_WORKSPACES.md`. Even after:
+
+- removing every `cs-*` and `perplexity` registration from
+  `~/.claude.json` (clean global state, `claude mcp list` empty);
+- pointing `--mcp-config` at a freshly-written, syntactically valid
+  per-task config; passing `--strict-mcp-config`;
+- confirming the binary path is correct and the binary responds to a
+  manual `initialize` JSON-RPC handshake;
+
+the session's `init` event still showed `mcp_servers: []` and the
+agent's `ToolSearch select:mcp__cs-codesurgeon__index_status` returned
+"No matching deferred tools found." Pinning
+`CLAUDE_BIN=~/.local/share/claude/versions/2.1.114` restored the
+expected behaviour: `mcp_servers: [{name: cs-codesurgeon, status:
+connected}]`, 42 tools (25 built-in + 17 deferred MCP), agent invokes
+`run_pipeline` successfully.
+
+**Implication for harness runs**: pin `CLAUDE_BIN=2.1.114` for any
+SWE-bench A/B until upstream fixes 2.1.117's `--print`-mode MCP
+loading. Without it the `with` arm degrades silently to a
+codesurgeon-absent run (visible only by inspecting the `init` event in
+`claude_stream.jsonl`). The first `with` run this session
+(walltime=139.8 s, cost=$0.42) is exactly this failure mode — fastest
+of the three runs because no MCP overhead was incurred, but
+codesurgeon was never actually exercised.
+
+**2. The `with` arm with working MCP was the slowest and most
+expensive of the three.** Same canonical fix produced, but wall time
+went from 226 s (without) to 488 s (with), and cost from $0.77 to
+$1.61. The agent called `run_pipeline` exactly once at the start, then
+fell back to 26 Reads + 16 Greps + 10 Bash + 1 Edit. The capsule
+provided context but no decisive routing — the fix-site discovery
+happened through standard exploration tools. n=1 on a stochastic
+benchmark, but consistent with the 2026-04-22 observation that the
+agent calls MCP tools sparingly on 2.1.114+ (deferred-tool prep
+round-trip biases toward built-ins).
+
+### Caveats
+
+- **n=1 across all three arms.** Variance on this benchmark routinely
+  exceeds 30%, and these three runs span 3.4× walltime. Treat the
+  numbers as anecdotes, not measurements.
+- **`e1568fa` (traceback frame extraction) was not exercised here.**
+  sympy-21379's problem statement is pure prose with no Python
+  traceback (verified: zero `File "...", line N, in <name>` matches).
+  Validating that commit empirically requires picking a task with
+  tracebacks (9 of 100 tasks in `tasks.json` qualify; top candidates
+  by frame count: `psf__requests-1724` 33, `sympy__sympy-17630` 15,
+  `django__django-16938` 13).
+- **Compute cost**: full validation cycle (build + cold sympy index
+  with embeddings + 3 harness runs + restore) was ~75 min wall and
+  ~$3 in Anthropic credits.
+
+---
+
+## v1.7 — optional `context` param on `run_pipeline` (LANDED)
+
+**Problem v1.6 leaves open**: anchor extraction runs on the `task` string
+the agent provides. When agents paraphrase a long problem statement into a
+short `task`, identifier tokens routinely drop out of the summary and the
+anchor extractor loses its signal — even though the raw source (the
+original problem statement, bug report, or stack trace) still names every
+relevant symbol. This is the "agent-compliance" ceiling on the pure
+prompt-level fix.
+
+**Fix**: give the MCP `run_pipeline` tool an optional `context` parameter.
+When set, anchors are extracted from `task + "\n" + context` (dedup via
+`extract()`'s existing `seen` set), so identifiers present in the raw
+source are recovered regardless of how the agent summarized them. BM25,
+ANN, graph retrieval, and intent detection still run on `task` alone — a
+large context blob can't blow the primary query budget or mis-classify
+the intent.
+
+**Shape of the change**:
+- New engine method `CoreEngine::run_pipeline_with_context(task, context, …)`.
+  `run_pipeline` itself is unchanged; it delegates to the new method with
+  `context=None`. Backward-compatible.
+- `build_context_capsule` grows an `anchor_context: Option<&str>` param
+  threaded into the anchor-extraction call.
+- MCP tool schema advertises `context` with a description that tells the
+  agent to pass the raw unmodified source, not a paraphrase. Every MCP
+  client (not just the harness) sees this.
+- 3 unit tests in `crates/cs-core/tests/engine.rs`:
+  `context_none_matches_plain_run_pipeline`,
+  `context_recovers_identifier_paraphrased_out_of_task`,
+  `context_dedupes_against_task`.
+
+**Not included** (Phase 3 of the anchor roadmap):
+- A/B measurement of tool-description alone vs. a PROMPT_PREFIX variant
+  that explicitly tells the agent to paste the problem statement into
+  `context`. Depends on v1.7 being live; tracked against the 6-task
+  regression set.
+
+### Empirical finding — v1.7 on `sympy__sympy-21379`
+
+Single-task validation with `--nudge 5b --stream-json --reuse-workdir`
+(2026-04-20). The agent complied with the verbatim-forward nudge:
+
+- **One `run_pipeline` call** at the start with both params populated:
+  - `task` = 42 chars (terse summary)
+  - `context` = 1,747 chars (verbatim problem statement)
+- All anchor identifiers from the problem (`symbols`, `exp`, `sinh`,
+  `Piecewise`, `subs`, `PolynomialError`) resolved correctly and appeared
+  as pivots. v1.6 file-diversity pinning held.
+
+**But the capsule missed the fix site.** The actual bug is in
+`sympy/core/mod.py::Mod.eval`, reached only via `PolynomialError →
+parallel_poly_from_expr → gcd → Mod.eval` (4 hops backward). The problem
+statement never names `Mod` — anchors can only fire on identifiers the
+user mentioned. Consequence: the agent solved the task correctly but
+burned 43 post-capsule tool calls (17× Read, 13× Bash, 8× Grep, 4× Edit,
+1× ToolSearch) finding the fix site on its own, ending at $1.01 / 290 s
+vs bare-claude's $0.30 / 96 s on the same task.
+
+**Takeaway**: v1.7 closes the agent-paraphrase hole in the anchor
+pipeline, but does not address the "bug site is transitively reached from
+an anchor, not named in the problem" case. The structural fix landed as
+**reverse-edge expansion from exception-class anchors** (issue #67,
+`ranking.rs:reverse_expand_from_anchors`) — when an anchor resolves to an
+`Error`/`Exception`/`Warning` type, the capsule assembler now walks its
+callers backward up to 3 hops and fuses the results into RRF. This closes
+the chain automatically: an agent no longer has to manually call
+`get_impact_graph(PolynomialError)` to find `Mod.eval`. See
+`docs/ranking.md` Stage 1d for parameters.
 
 ---
 
@@ -65,10 +709,27 @@ threaded into pivot count selection.
 - **v1.1** (BM25-name fallback for substring matches) — landed. Catches the
   sphinx-9711 case where user says `needs_extensions` but the symbol is
   `verify_needs_extensions`.
-- **Benchmark driver change** — `benches/swebench/run.py` `PROMPT_PREFIX` now
-  instructs the agent to preserve identifiers verbatim in the `task` field
-  (rather than paraphrasing them away). This is an *orthogonal* fix that
-  makes anchors fire reliably. Keep it.
+- **Benchmark driver change — PLANNED, NOT YET LANDED**. Earlier drafts of
+  this doc claimed `PROMPT_PREFIX` was updated to instruct the agent to
+  preserve identifiers verbatim in the `task` field. That edit was never
+  actually made — the prefix only *illustrates* identifier usage via an
+  example string. Follow-up work tracks three candidate steering mechanisms
+  that supersede the original single-prompt idea:
+  1. **Server-side tool description** on a new optional `context` param of
+     `run_pipeline` — every MCP client sees it, persuades real-world agents
+     to pass the raw problem statement.
+  2. **PROMPT_PREFIX variant (identifier preservation)** — nudge the agent
+     to keep identifiers in `task`. Agent-compliance-dependent; works on
+     the existing schema.
+  3. **PROMPT_PREFIX variant (verbatim forward)** — nudge the agent to
+     paste the full problem statement into `context`. Easier compliance
+     ask (mechanical forwarding, no summarization judgment), but still
+     depends on the new schema field landing first.
+
+  The Phase 1 prompt-split that now branches `PROMPT_PREFIX` by arm (control
+  arm no longer sees the `run_pipeline` nudge) is an orthogonal fairness
+  fix, not an anchor-reliability fix. See
+  `benches/swebench/run.py::build_prompt`.
 
 **End-to-end validation against the 3 regression case studies** (with pre-indexed
 workspaces, identifier-preserving task strings, post-v1.1 binary):
@@ -1090,9 +1751,20 @@ Success criteria:
 
 ---
 
+## Landed follow-ups
+
+- **Reverse-edge expansion from error types** — landed via issue #67. When an
+  anchor resolves to an exception/error/warning type definition, the capsule
+  now walks its callers/raisers backward up to 3 hops (fan-out 5 per hop) and
+  fuses those candidates into RRF with `k = 30`. See `docs/ranking.md` Stage
+  1d for parameters and `ranking.rs:reverse_expand_from_anchors` for the
+  walk. Addresses symptom-anchored bug reports where the user names the
+  exception but the fix site is only reachable through the raise chain
+  (motivating case: sympy-21379, `PolynomialError ← parallel_poly_from_expr
+  ← gcd ← Mod.eval`).
+
 ## Out of scope (file follow-ups separately)
 
-- **Reverse-edge expansion from error types** (issue: walk callers/raisers of symbols in the current capsule). Addresses sphinx-9711's `VersionRequirementError → needs_extensions` case *even without anchors*. Complementary, not a substitute.
 - **Path-segment scoring for antonym segments** (`parsing/` vs `printing/`). Anchors solve sympy-21612 directly, but path-segment scoring would catch the generalized case where no API call is quoted.
 - **Short-body function floor** — a symbol whose body is < N tokens should get a bonus based on exact name match to a query token. Overlaps partly with anchors but useful when the user describes the bug without naming the function.
 

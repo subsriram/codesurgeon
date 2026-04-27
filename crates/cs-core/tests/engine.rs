@@ -8,10 +8,27 @@ fn test_engine(dir: &TempDir) -> CoreEngine {
     CoreEngine::new(config).expect("engine init failed")
 }
 
+/// Engine with `auto_observations = true`. Use from tests that exercise the
+/// legacy auto-memory path; the production default is off (#72).
+fn test_engine_with_auto_obs(dir: &TempDir) -> CoreEngine {
+    let mut config = EngineConfig::new(dir.path()).without_embedder();
+    config.auto_observations = true;
+    CoreEngine::new(config).expect("engine init failed")
+}
+
 fn indexed_engine_with_two_langs(dir: &TempDir) -> CoreEngine {
     std::fs::write(dir.path().join("lib.rs"), "pub fn rust_fn() {}\n").unwrap();
     std::fs::write(dir.path().join("script.py"), "def py_fn(): pass\n").unwrap();
     let engine = test_engine(dir);
+    engine.index_workspace().expect("index failed");
+    engine
+}
+
+/// Like `indexed_engine_with_two_langs` but with auto-observations enabled.
+fn indexed_engine_with_two_langs_auto_obs(dir: &TempDir) -> CoreEngine {
+    std::fs::write(dir.path().join("lib.rs"), "pub fn rust_fn() {}\n").unwrap();
+    std::fs::write(dir.path().join("script.py"), "def py_fn(): pass\n").unwrap();
+    let engine = test_engine_with_auto_obs(dir);
     engine.index_workspace().expect("index failed");
     engine
 }
@@ -160,10 +177,10 @@ fn get_impact_graph_exclude_tests_filters_test_files() {
     engine.index_workspace().expect("index failed");
 
     let with_tests = engine
-        .get_impact_graph("lib.rs::target", None, true)
+        .get_impact_graph("lib.rs::target", None, None, true)
         .unwrap();
     let without_tests = engine
-        .get_impact_graph("lib.rs::target", None, false)
+        .get_impact_graph("lib.rs::target", None, None, false)
         .unwrap();
     for dep in &without_tests.direct_dependents {
         assert!(
@@ -188,15 +205,60 @@ fn get_impact_graph_max_depth_limits_traversal() {
     engine.index_workspace().expect("index failed");
 
     let shallow = engine
-        .get_impact_graph("lib.rs::base", Some(1), true)
+        .get_impact_graph("lib.rs::base", Some(1), None, true)
         .unwrap();
     let deep = engine
-        .get_impact_graph("lib.rs::base", Some(5), true)
+        .get_impact_graph("lib.rs::base", Some(5), None, true)
         .unwrap();
     assert!(
         shallow.total_affected <= deep.total_affected,
         "shallow traversal should find ≤ symbols than deep"
     );
+}
+
+/// `get_impact_graph` must cap each list at `max_results` for high-fan-out
+/// symbols and report the dropped count via `direct_truncated`. Without this
+/// cap, central symbols (e.g. exception base classes) overflow agent context —
+/// see issue #65, where `PolynomialError` returned 30k+ transitive dependents.
+#[test]
+fn get_impact_graph_caps_direct_dependents_for_high_fanout() {
+    let dir = tempfile::tempdir().unwrap();
+    // 1 target + 60 distinct callers all in one file.
+    let mut src = String::from("pub fn target() {}\n");
+    for i in 0..60 {
+        src.push_str(&format!("pub fn caller_{i:02}() {{ target(); }}\n"));
+    }
+    std::fs::write(dir.path().join("lib.rs"), src).unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index failed");
+
+    let result = engine
+        .get_impact_graph("lib.rs::target", None, Some(10), true)
+        .expect("get_impact_graph failed");
+
+    assert_eq!(
+        result.direct_dependents.len(),
+        10,
+        "direct list must respect the max_results cap"
+    );
+    assert_eq!(
+        result.direct_truncated, 50,
+        "direct_truncated must report dropped count: 60 callers - 10 cap"
+    );
+    // total_affected must reflect the *real* blast radius, not the truncated view.
+    assert!(
+        result.total_affected >= 60,
+        "total_affected must be the pre-cap count, got {}",
+        result.total_affected
+    );
+
+    // Cap is stable: a second call returns the same set in the same order.
+    let again = engine
+        .get_impact_graph("lib.rs::target", None, Some(10), true)
+        .unwrap();
+    let first: Vec<_> = result.direct_dependents.iter().map(|s| &s.fqn).collect();
+    let second: Vec<_> = again.direct_dependents.iter().map(|s| &s.fqn).collect();
+    assert_eq!(first, second, "truncation order must be deterministic");
 }
 
 /// `get_skeleton` with `max_depth=1` must return only top-level symbols.
@@ -227,11 +289,12 @@ fn get_skeleton_max_depth_filters_nested_symbols() {
     }
 }
 
-/// `run_pipeline` must write an `auto` observation when pivots are found.
+/// `run_pipeline` must write an `auto` observation when pivots are found
+/// AND `auto_observations` is enabled in config (off by default — #72).
 #[test]
 fn run_pipeline_writes_auto_observation() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
     engine
         .run_pipeline("rust fn", Some(4000), None, None)
         .expect("run_pipeline failed");
@@ -255,11 +318,12 @@ fn run_pipeline_writes_auto_observation() {
     );
 }
 
-/// `get_context_capsule` must write an `auto` observation when pivots are found.
+/// `get_context_capsule` must write an `auto` observation when pivots are found
+/// AND `auto_observations` is enabled in config (off by default — #72).
 #[test]
 fn get_context_capsule_writes_auto_observation() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
     engine
         .get_context_capsule("py fn", Some(4000), None, None)
         .expect("get_context_capsule failed");
@@ -279,10 +343,11 @@ fn get_context_capsule_writes_auto_observation() {
 }
 
 /// Calling `run_pipeline` twice with the same task must deduplicate — only one auto observation.
+/// Exercises the auto-observation path; default is off (#72).
 #[test]
 fn run_pipeline_deduplicates_auto_observations() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
     engine
         .run_pipeline("rust fn", Some(4000), None, None)
         .expect("first call failed");
@@ -304,11 +369,13 @@ fn run_pipeline_deduplicates_auto_observations() {
     );
 }
 
-/// `run_pipeline` with no matching symbols must not write an auto observation.
+/// `run_pipeline` with no matching symbols must not write an auto observation,
+/// even when the auto-observation flag is on. Without enabling the flag this
+/// would be a tautology (#72 disables auto-obs by default).
 #[test]
 fn run_pipeline_no_pivots_skips_auto_observation() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(&dir); // empty index — no symbols
+    let engine = test_engine_with_auto_obs(&dir); // empty index — no symbols
     engine
         .run_pipeline("xyzzy no match", Some(4000), None, None)
         .expect("run_pipeline failed");
@@ -325,6 +392,57 @@ fn run_pipeline_no_pivots_skips_auto_observation() {
         auto_obs.is_empty(),
         "expected no auto observation when there are no pivots, got: {:?}",
         auto_obs.iter().map(|o| &o.content).collect::<Vec<_>>()
+    );
+}
+
+/// Default `auto_observations = false` (#72): `run_pipeline` must NOT write
+/// an auto observation on a vanilla engine, even when pivots are found.
+/// Repeatedly running with the default must keep the memory table empty of
+/// Auto-kind rows, so failed runs can't poison future runs.
+#[test]
+fn run_pipeline_does_not_auto_record_when_flag_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = indexed_engine_with_two_langs(&dir); // default config: auto_observations = false
+    engine
+        .run_pipeline("rust fn", Some(4000), None, None)
+        .expect("run_pipeline failed");
+    engine
+        .run_pipeline("py fn", Some(4000), None, None)
+        .expect("run_pipeline failed");
+
+    let observations = engine
+        .get_session_context()
+        .expect("get_session_context failed")
+        .observations;
+    let auto_obs: Vec<_> = observations
+        .iter()
+        .filter(|o| o.kind.as_str() == "auto")
+        .collect();
+    assert!(
+        auto_obs.is_empty(),
+        "auto_observations=false is the default; no 'auto' rows should be written, got: {:?}",
+        auto_obs.iter().map(|o| &o.content).collect::<Vec<_>>()
+    );
+}
+
+/// `[observability] auto_observations = true` in config.toml must enable the
+/// legacy auto-memory path even though the EngineConfig default is off.
+#[test]
+fn config_toml_enables_auto_observations() {
+    use cs_core::memory::IndexingConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join(".codesurgeon");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[observability]\nauto_observations = true\n",
+    )
+    .unwrap();
+
+    let cfg = IndexingConfig::load_from_toml(&config_dir.join("config.toml"));
+    assert!(
+        cfg.auto_observations,
+        "auto_observations should be true after loading from [observability]"
     );
 }
 
@@ -792,10 +910,11 @@ fn compress_observations_merges_symbol_observations() {
 }
 
 /// `get_session_context` wraps observations and staleness_score together.
+/// Auto-observations are only recorded when the flag is enabled (#72).
 #[test]
 fn get_session_context_returns_session_context_struct() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
     engine
         .run_pipeline("rust fn", Some(4000), None, None)
         .unwrap();
@@ -1314,11 +1433,12 @@ fn consolidate_observations_is_noop_without_embedder() {
 }
 
 /// Auto observations written by `run_pipeline` must survive `consolidate_observations`
-/// intact when the embedder is absent (no premature expiry).
+/// intact when the embedder is absent (no premature expiry). Requires the
+/// auto-observation flag since the default is off (#72).
 #[test]
 fn consolidate_does_not_expire_observations_without_embedder() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = indexed_engine_with_two_langs(&dir);
+    let engine = indexed_engine_with_two_langs_auto_obs(&dir);
 
     engine
         .run_pipeline("rust fn", Some(4000), None, None)
@@ -2113,4 +2233,196 @@ fn index_workspace_prunes_stale_files() {
         .get_context_capsule("kept_fn", None, None, None)
         .unwrap();
     assert!(kept.contains("kept_fn"), "kept symbol should survive prune");
+}
+
+// ─── run_pipeline_with_context (Phase 2 / v1.7 context param) ───────────────
+//
+// The `context` parameter is a raw-text blob used *only* for anchor
+// extraction. It exists so callers (notably the SWE-bench harness) can pass
+// the full problem statement alongside a paraphrased `task` — identifiers the
+// agent dropped from the summary are recovered from the raw source.
+//
+// These tests verify:
+//   1. `context=None` is behaviorally identical to plain `run_pipeline`.
+//   2. Identifiers present *only* in `context` (not in `task`) surface symbols
+//      that would otherwise miss.
+
+/// Helper: in a workspace with a distinctively-named Python symbol, assert
+/// whether a capsule built from `(task, context)` contains the symbol.
+fn capsule_has_symbol(
+    engine: &CoreEngine,
+    task: &str,
+    context: Option<&str>,
+    needle: &str,
+) -> bool {
+    let out = engine
+        .run_pipeline_with_context(task, context, Some(4000), None, None)
+        .expect("run_pipeline_with_context");
+    out.contains(needle)
+}
+
+#[test]
+fn context_none_matches_plain_run_pipeline() {
+    // Byte-equality of capsule output across the two entrypoints. We use
+    // two independent engine/workspace pairs so the auto-observation side
+    // effect of the first call doesn't pollute the second's session memory.
+    fn make() -> (TempDir, CoreEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mod.py"),
+            "def distinctive_anchor_zzz():\n    return 1\n",
+        )
+        .unwrap();
+        let engine = test_engine(&dir);
+        engine.index_workspace().expect("index");
+        (dir, engine)
+    }
+    let (_d1, e1) = make();
+    let a = e1
+        .run_pipeline("distinctive_anchor_zzz bug", Some(4000), None, None)
+        .unwrap();
+    let (_d2, e2) = make();
+    let b = e2
+        .run_pipeline_with_context("distinctive_anchor_zzz bug", None, Some(4000), None, None)
+        .unwrap();
+    assert_eq!(
+        a, b,
+        "run_pipeline and run_pipeline_with_context(context=None) must match"
+    );
+}
+
+#[test]
+fn context_recovers_identifier_paraphrased_out_of_task() {
+    // Simulates the SWE-bench failure mode: the agent paraphrased away the
+    // identifier into a bag-of-English `task`, but the raw problem statement
+    // still names the function. Without context, BM25 likely misses; with
+    // context, the anchor fires.
+    let dir = tempfile::tempdir().unwrap();
+    // Target symbol with a unique name unlikely to match BM25 on generic prose.
+    std::fs::write(
+        dir.path().join("target.py"),
+        "def obscurely_named_fn_q42():\n    \"\"\"short doc\"\"\"\n    return None\n",
+    )
+    .unwrap();
+    // Decoy files so the capsule isn't trivial.
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("decoy_{i}.py")),
+            format!("def decoy_{i}():\n    return {i}\n"),
+        )
+        .unwrap();
+    }
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index");
+
+    // Paraphrased task — strips the identifier.
+    let task_without_anchor = "fix bug in the obscure function";
+    // Raw context still names the symbol verbatim.
+    let raw_problem = "Error trace:\n  File 'target.py', line 3, in obscurely_named_fn_q42\nfailed";
+
+    let without = capsule_has_symbol(&engine, task_without_anchor, None, "obscurely_named_fn_q42");
+    let with = capsule_has_symbol(
+        &engine,
+        task_without_anchor,
+        Some(raw_problem),
+        "obscurely_named_fn_q42",
+    );
+
+    assert!(
+        with,
+        "context containing identifier should surface the symbol via anchor extraction"
+    );
+    // Note: `without` is not strictly required to be false — this is a smoke
+    // test of the recovery path. We assert the positive case only so the test
+    // stays stable across ranker tweaks. If it ever does surface without the
+    // context, delete this comment — no harm.
+    let _ = without;
+}
+
+#[test]
+fn context_dedupes_against_task() {
+    // Sanity: if an identifier appears in both `task` and `context`, the
+    // symbol isn't double-counted (no panic, no duplicate pivot). Pure smoke.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("m.py"),
+        "def unique_q99_fn():\n    return 1\n",
+    )
+    .unwrap();
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index");
+
+    let out = engine
+        .run_pipeline_with_context(
+            "fix unique_q99_fn",
+            Some("Problem: unique_q99_fn crashes."),
+            Some(4000),
+            None,
+            None,
+        )
+        .expect("pipeline");
+    assert!(out.contains("unique_q99_fn"), "symbol should be present");
+}
+
+/// Issue #69 v2 (traceback half): a Python traceback pasted into `context`
+/// must surface its frame-name function as an anchor *even when the name
+/// fails the prose shape filter* (plain lowercase, no underscore, no internal
+/// caps). The traceback pass in `anchors::extract` bypasses the shape filter
+/// for names that come from a `File "...", line N, in <name>` frame.
+///
+/// We prove the wiring by:
+///   1. Indexing a function whose name (`frobnicate`) is plain lowercase —
+///      the prose-shape filter rejects it as plain English.
+///   2. Running with a paraphrased task and a real-shape traceback in
+///      `context`. The symbol must surface.
+///   3. Running with the same task and a `context` that mentions
+///      `frobnicate` only in prose (no `File "..."` shape). The prose-only
+///      mention must NOT route through the traceback pass — this is the
+///      specificity check that proves the previous run actually used the
+///      traceback path and not the existing prose path.
+#[test]
+fn context_traceback_frame_surfaces_plain_lowercase_function() {
+    let dir = tempfile::tempdir().unwrap();
+    // Plain lowercase name — fails prose shape filter (no `_`, no internal caps).
+    std::fs::write(
+        dir.path().join("target.py"),
+        "def frobnicate(x):\n    \"\"\"transform x in place\"\"\"\n    return x\n",
+    )
+    .unwrap();
+    // Decoys so the capsule isn't trivial and BM25 has competition.
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("decoy_{i}.py")),
+            format!("def decoy_func_{i}():\n    return {i}\n"),
+        )
+        .unwrap();
+    }
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index");
+
+    let task = "investigate the reported crash";
+    let traceback_ctx = "\
+Traceback (most recent call last):
+  File \"app/main.py\", line 12, in <module>
+    target.frobnicate(value)
+  File \"target.py\", line 3, in frobnicate
+    raise RuntimeError(\"boom\")
+RuntimeError: boom
+";
+    let prose_only_ctx = "The crash report mentions frobnicate but no traceback was attached.";
+
+    let with_traceback = capsule_has_symbol(&engine, task, Some(traceback_ctx), "frobnicate");
+    let with_prose_only = capsule_has_symbol(&engine, task, Some(prose_only_ctx), "frobnicate");
+
+    assert!(
+        with_traceback,
+        "traceback frame `in frobnicate` must extract the identifier and surface the symbol; \
+         this validates the engine-layer wiring of the #69 v2 traceback anchor pass"
+    );
+    assert!(
+        !with_prose_only,
+        "plain prose mention of `frobnicate` (no `File \"...\", in frobnicate` shape) must NOT \
+         surface — the prose shape filter rejects plain lowercase tokens. This is the specificity \
+         check: it proves the traceback case above used the new traceback path, not the prose path."
+    );
 }
