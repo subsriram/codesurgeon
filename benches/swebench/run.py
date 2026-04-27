@@ -252,15 +252,21 @@ NUDGES: dict[str, str] = {
 #  - Agent NEVER called get_impact_graph / get_skeleton / search_logic_flow
 #    across all 7 variants, regardless of tool-name format or framing
 #
-# Conclusion (also 2.1.114/2.1.117-era; UNVERIFIED on 2.1.119+):
-# prompt-level workflow steering is closed as a lever on this task
-# class. Further gains come from server-side capsule content (#69 v2:
-# body-text embedding similarity, traceback parsing, etc.). The
-# 2.1.119 deferred-tool behaviour change may invalidate the second
-# half of this conclusion — the agent now reaches dynamic-tool prep
-# faster, so longer prompts that advertise additional tools may not
-# regress the way they did on 2.1.117. Re-validate before treating
-# "prompt-level steering is closed" as authoritative.
+# Conclusion (also 2.1.114/2.1.117-era; **re-confirmed on 2.1.119**
+# 2026-04-25): prompt-level workflow steering is closed as a lever on
+# this task class. Further gains come from server-side capsule content
+# (#69 v2: body-text embedding similarity, traceback parsing, etc.).
+#
+# 2026-04-25 re-validation: nudge `5g` (advertising get_impact_graph
+# / get_skeleton / search_logic_flow) was run on 2.1.119 against the
+# same warm sympy-21379 workspace. Result: agent made zero chained-
+# MCP calls — same Bash + Read + Edit fallback as 2.1.117 era. Wall
+# 132.1 s / $1.17 / 1037 B canonical fix; worse than 5b's 81.8 s /
+# $0.79 / 1067 B from the same session. The 2.1.119 fix to MCP
+# eager-loading (Cause 1) does NOT unlock chained MCP usage — the
+# agent's bias toward Bash/Read/Edit is structural. 5b stays the
+# default; the 5e/5f/5g/5h/5i/5j/5k variants are kept for archival
+# only.
 
 PROMPT_SUFFIX = """
 
@@ -359,7 +365,6 @@ def build_prompt(
     arm: str,
     problem_statement: str,
     nudge_variant: str = "5b",
-    inline_claude_md: bool = False,
 ) -> str:
     """Assemble the per-arm prompt.
 
@@ -371,36 +376,15 @@ def build_prompt(
     `nudge_variant`. Default 5b (verbatim-forward of problem statement
     into `context`); 5c (tool-description-only) is used for A/B isolation.
 
-    When `inline_claude_md` is True (the treatment arm, `--inject-claude-md`
-    set), the full codesurgeon guidance text is appended after the nudge
-    and before the problem statement. **WARNING: behaviour changed in
-    2.1.119.**
-
-    2.1.114 (the version this harness was originally calibrated against):
-    `claude --print` did NOT auto-load workdir/CLAUDE.md. The in-prompt
-    inline was the only path that delivered the content, and the on-disk
-    companion (`maybe_inject_claude_md`) was redundant theatre.
-
-    2.1.119 (verified 2026-04-25): `claude --print` DOES auto-load
-    workdir/CLAUDE.md. Reproduced with a fingerprinted token in
-    `<tmpdir>/CLAUDE.md` while running `claude --print` from `<tmpdir>`:
-    the agent emitted the fingerprint in its reply without being
-    explicitly told to read the file. Implication for `--inject-claude-md`
-    in this harness: **content is now double-injected** — once inline in
-    the prompt and once via the workdir's on-disk CLAUDE.md. Both
-    deliver the same text, so the agent sees it twice (different
-    framings, same information). Token-cost: 2× the CLAUDE.md content.
-
-    Mitigation when running on 2.1.119+: pick one delivery path. Either
-    (a) keep the in-prompt inline and skip the on-disk write, or (b)
-    keep the on-disk write and drop the in-prompt inline. Empirically
-    the on-disk path is closer to the way real users wire CLAUDE.md, so
-    (b) is the cleaner default. This requires changing
-    `maybe_inject_claude_md` to be the single source and removing the
-    `inline_claude_md` branch here.
-
-    Until that refactor lands: `--inject-claude-md` runs on 2.1.119+
-    will overstate the cost of the CLAUDE.md content vs reality.
+    CLAUDE.md guidance for the treatment arm is delivered **on-disk only**
+    via `maybe_inject_claude_md` (gated on `--inject-claude-md`). The
+    in-prompt inline path was removed on 2026-04-25 because `claude
+    --print` auto-loads workdir/CLAUDE.md on 2.1.119+ — keeping the
+    inline as well would double-inject the same content. On 2.1.114 the
+    inline was the only delivery path; if you need to support that
+    legacy version, revive the inline branch (see git history) or pin
+    `CLAUDE_BIN=2.1.114` and accept that on-disk CLAUDE.md will be
+    ignored by claude.
     """
     parts = [PROMPT_BASE]
     if arm == "with":
@@ -409,9 +393,6 @@ def build_prompt(
                 f"unknown nudge_variant {nudge_variant!r}; expected one of {list(NUDGES)}"
             )
         parts.append(NUDGES[nudge_variant])
-        if inline_claude_md:
-            parts.append("\n\n")
-            parts.append(CODESURGEON_CLAUDE_MD)
     parts.append(PROMPT_SUFFIX)
     parts.append(problem_statement)
     return "".join(parts)
@@ -1137,7 +1118,6 @@ def run_one(
             arm,
             task["problem_statement"],
             nudge_variant=nudge_variant,
-            inline_claude_md=inject_claude_md,
         )
         cmd = build_claude_cmd(
             claude_bin, mcp_config, workdir, prompt, max_budget_usd, model,

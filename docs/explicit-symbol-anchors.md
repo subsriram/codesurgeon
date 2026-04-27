@@ -433,13 +433,25 @@ warm sympy workspace: `init` event lists all 13
 `mcp__cs-codesurgeon__*` tools in `tools[]` from the start. No
 `ToolSearch` round-trip required. The 2.1.117 regression that
 deferred MCP schemas behind a `ToolSearch select:<name>` lookup is
-reverted in 2.1.119. Implication: the Phase 4g/4h findings
-recorded under deferred loading ("agent NEVER chained
-`get_impact_graph` / `get_skeleton` / `search_logic_flow`",
-"prompt-level workflow steering is closed as a lever") were
-measured against a defunct claude version and **may not hold on
-2.1.119**. Worth re-running the existing 5b/5g/5e/5f/5h/5i/5j/5k
-matrix on 2.1.119 before any further prompt-engineering work.
+reverted in 2.1.119.
+
+Direct probe of the Phase 4g/4h conclusion (the prompt-level
+steering hypothesis): ran nudge `5g` — which explicitly advertises
+`get_impact_graph`, `get_skeleton`, and `search_logic_flow` — on
+2.1.119 against the same warm sympy workspace. **Agent still made
+zero chained-MCP calls.** Tool budget: 1× `run_pipeline` + 1×
+`ToolSearch` + 10× Bash + 6× Read + 2× Edit. Same mechanism as v3:
+agent ran the MWE via `python -c`, got a Python traceback frame
+`mod.py:169, in eval`, went straight to Edit. Wall: 132.1 s; cost:
+$1.17; diff: 1037 B (canonical fix).
+
+So the Phase 4g/4h conclusion **holds on 2.1.119** even though the
+deferred-loading friction is gone. The agent's bias toward
+Bash/Read/Edit over chained MCP tools is structural, not an
+artifact of the 2.1.117 deferral. Confirms the existing run.py
+choice of 5b as default. The full 8-variant re-run (5b/5g/5e/5f/
+5h/5i/5j/5k) is no longer warranted on 2.1.119 — the gating
+mechanism the rerun was meant to test is provably absent.
 
 **2. `claude --print` now auto-loads workdir/CLAUDE.md.** Verified
 by planting a fingerprinted CLAUDE.md in a tmpdir, running

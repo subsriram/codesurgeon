@@ -421,66 +421,53 @@ is not available in this environment."*
 There are **two independent** causes, both observed in the 2026-04-21
 session. Check both.
 
-#### Cause 1 — Claude Code version ≥ 2.1.117 defers MCP tool schemas
+#### Cause 1 — Claude Code 2.1.117 deferred MCP tool schemas (FIXED in 2.1.119)
 
-The version bump from **2.1.114 → 2.1.117** (auto-updated on 2026-04-21
-around 18:00) changed Claude Code's dynamic-tool-loading behavior. On
-2.1.114, MCP tool schemas were **eager-loaded** at session init — the
-agent saw all 13 `mcp__cs-codesurgeon__*` tools in its initial tool set
-(42 tools total; 25 built-in + 13 cs-codesurgeon + plugin tools). On
-2.1.117, schemas are **deferred** by default — the agent sees only 25
-built-in tools at init and must explicitly call `ToolSearch
-select:<tool_name>` before invoking an MCP tool. The diagnostic signal
-is a line in the stream's init event / debug log:
+**Status: historical.** The 2.1.117 deferred-loading regression was
+reverted in 2.1.119. If `claude --version` reports `2.1.119` or later,
+this section's symptoms do not apply — `mcp__cs-codesurgeon__*` tools
+are eager-loaded in the initial tool list. Verified 2026-04-25 against
+the warm sympy workspace: `init` event lists all 13 cs-codesurgeon
+tools, 40 tools total (25 built-in + 13 cs MCP + 2 plugin), no
+`ToolSearch` round-trip required.
+
+##### What 2.1.117 looked like (for anyone still on it)
+
+The version bump from 2.1.114 → 2.1.117 (auto-updated 2026-04-21)
+deferred MCP tool schemas: the agent saw only 25 built-in tools at
+init and had to call `ToolSearch select:<tool_name>` before invoking
+an MCP tool. The diagnostic signal in the stream's init event /
+debug log was:
 
 ```
 Dynamic tool loading: 0/17 deferred tools included
 ```
 
-(0 on 2.1.117, 17 on 2.1.114).
+(0 on 2.1.117, 17 on 2.1.114, 17 again on 2.1.119.)
 
-Consequence: the agent is biased toward built-in tools (Bash, Read,
-Grep) that cost no prep round-trip, and away from MCP tools that do.
-Across 7+ prompt variants on 2.1.117, **zero chained `get_impact_graph`
-/ `get_skeleton` / `search_logic_flow` calls** were observed even when
-the prompt explicitly recommended them. The agent calls `run_pipeline`
-exactly once (if the nudge requires it), then defaults to Grep/Read.
+Consequence on 2.1.117: the agent was biased toward built-in tools
+(Bash, Read, Grep) that cost no prep round-trip, and away from MCP
+tools that did. Across 7+ prompt variants, zero chained
+`get_impact_graph` / `get_skeleton` / `search_logic_flow` calls were
+observed even when the prompt explicitly recommended them. The agent
+called `run_pipeline` exactly once (if the nudge required it), then
+defaulted to Grep/Read.
 
-Diagnostic: `claude --version`. If ≥ 2.1.117, this behavior is the
-default. No flag observed to force eager-load across MCP servers. The
-older binary may still be on disk at
-`~/.local/share/claude/versions/2.1.114` — pin a specific version via
+The Phase 4g/4h conclusions ("prompt-level workflow steering is
+closed as a lever", "agent NEVER chained get_impact_graph /
+get_skeleton / search_logic_flow") were initially flagged for
+re-validation on 2.1.119. Direct probe (2026-04-25, nudge `5g`,
+which explicitly advertises the chained tools) showed they **still
+hold**: agent made zero chained-MCP calls even with eager-loaded
+tool schemas, falling back to Bash + Read + Edit just as it did on
+2.1.117. The structural bias is not an artifact of deferred
+loading. The existing run.py default (5b) is correct; no full
+nudge-matrix re-run needed.
+
+If you must run on 2.1.117 (or are debugging an old stream from that
+era), the 2.1.114 binary may still be on disk:
+`~/.local/share/claude/versions/2.1.114`. Pin via
 `CLAUDE_BIN=~/.local/share/claude/versions/2.1.114 uv run …`.
-
-Fresh measurement needed: any "reference baseline" from 2.1.114 runs
-(Phase 3, 4a–4e) should be re-measured against 2.1.117 before using as
-a comparison point. 2.1.117 is what real users will hit; it's the
-realistic baseline, but comparison across versions is apples-to-oranges.
-
-> **2026-04-25 follow-up: Cause 1 is FIXED in 2.1.119.** Direct probe
-> confirmed: `claude --print` against the warm sympy workspace with
-> `--mcp-config` pointing at `codesurgeon-mcp` produces an `init`
-> event with **all 13 `mcp__cs-codesurgeon__*` tools eager-loaded** in
-> the initial tool set (40 tools total = 25 built-in + 13 cs MCP +
-> 2 plugin). No `ToolSearch` round-trip is required before invoking
-> them. The regression introduced in 2.1.117 was reverted in 2.1.119.
->
-> The v3 with-arm run from 2026-04-25 still showed a `ToolSearch
-> select:mcp__cs-codesurgeon__run_pipeline,TodoWrite` call, but that
-> is now a vestigial habit from the agent's training and not a
-> protocol requirement — the tool was already in the init list with
-> its schema available. The Phase 4g/4h findings ("agent NEVER
-> chained `get_impact_graph` / `get_skeleton` / `search_logic_flow`",
-> "prompt-level workflow steering is closed as a lever") were
-> measured under deferred-loading and **may not hold on 2.1.119**.
-> Re-validation with the existing nudge variants (5b, 5g, 5e, 5f,
-> 5h, 5i, 5j, 5k) is now warranted before any further
-> prompt-engineering work.
->
-> Practical implication: the `CLAUDE_BIN=2.1.114` workaround is no
-> longer needed for any reason — neither for `--mcp-config` loading
-> nor for eager-tool delivery. The harness can run on whatever
-> claude is on PATH.
 
 ##### 2026-04-24 follow-up: 2.1.117 breaks `--mcp-config` entirely in `--print` mode
 
@@ -513,27 +500,18 @@ jq -r 'select(.type=="system" and .subtype=="init") | .mcp_servers' \
 
 If this returns `[]`, the run did not exercise codesurgeon — the
 treatment-arm result is invalid for A/B purposes regardless of
-walltime / cost / diff outcome. **Workaround**: pin
-`CLAUDE_BIN=~/.local/share/claude/versions/2.1.114`. Verified working
-on 2.1.114 on the same workspace, same `--mcp-config`, with `init`
-showing `mcp_servers: [{name: cs-codesurgeon, status: connected}]`
-and 42 tools advertised.
-
-Until upstream fixes this, every `with`-arm run on 2.1.117 produces
-sham data. Treat the 2026-04-22 session findings as authoritative for
-the affirmative-claim portion (canonical fix produced, capsule
-contents) and discount any walltime/cost claims that didn't include
-this `mcp_servers: []` check.
+walltime / cost / diff outcome. **Fixed in 2.1.119** (see below); on
+2.1.117 specifically, the only known mitigation was pinning
+`CLAUDE_BIN=~/.local/share/claude/versions/2.1.114`.
 
 ##### 2026-04-25 update: fixed in 2.1.119
 
 Re-tested on `claude 2.1.119`. Same workspace, same materialized
 `--mcp-config`, same `--strict-mcp-config` flag. Init now reports
-`mcp_servers: [{name: cs-codesurgeon, status: connected}]` and 40
-tools (25 built-in + 15 deferred MCP). Agent invokes `run_pipeline`
-successfully without any `CLAUDE_BIN` pinning. The 2.1.117-only
-regression is fixed; the `CLAUDE_BIN=2.1.114` workaround is no
-longer needed for `--print`-mode harness runs.
+`mcp_servers: [{name: cs-codesurgeon, status: connected}]` with all
+13 cs-codesurgeon tools eager-loaded (40 tools total: 25 built-in +
+13 cs MCP + 2 plugin). Agent invokes `run_pipeline` successfully
+without any `CLAUDE_BIN` pinning.
 
 The post-run `jq -r 'select(.type=="system" and .subtype=="init") |
 .mcp_servers'` diagnostic above is still worth running on every
