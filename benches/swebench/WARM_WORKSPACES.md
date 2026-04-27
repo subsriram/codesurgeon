@@ -457,18 +457,30 @@ Fresh measurement needed: any "reference baseline" from 2.1.114 runs
 a comparison point. 2.1.117 is what real users will hit; it's the
 realistic baseline, but comparison across versions is apples-to-oranges.
 
-> **TODO (post-2.1.119)**: Cause 1's status on 2.1.119 is **unconfirmed**.
-> The 2026-04-25 follow-up below verified `--mcp-config` itself works
-> on 2.1.119 (the strictly-worse regression is fixed), but did not
-> measure whether MCP tool schemas are still deferred behind
-> ToolSearch. The post-fix v3 run still showed only 1× `run_pipeline`
-> + 0× chained `get_impact_graph` / `get_skeleton` /
-> `search_logic_flow`, consistent with the deferred-tool bias from
-> 2.1.117. Worth a direct `claude --debug` capture on 2.1.119 to look
-> for the `Dynamic tool loading: N/M deferred tools included` line —
-> if N=M, deferral is gone; if N=0, the agent is still being
-> dispatched the same way as 2.1.117 and any prompt-tuning conclusions
-> from that era still hold.
+> **2026-04-25 follow-up: Cause 1 is FIXED in 2.1.119.** Direct probe
+> confirmed: `claude --print` against the warm sympy workspace with
+> `--mcp-config` pointing at `codesurgeon-mcp` produces an `init`
+> event with **all 13 `mcp__cs-codesurgeon__*` tools eager-loaded** in
+> the initial tool set (40 tools total = 25 built-in + 13 cs MCP +
+> 2 plugin). No `ToolSearch` round-trip is required before invoking
+> them. The regression introduced in 2.1.117 was reverted in 2.1.119.
+>
+> The v3 with-arm run from 2026-04-25 still showed a `ToolSearch
+> select:mcp__cs-codesurgeon__run_pipeline,TodoWrite` call, but that
+> is now a vestigial habit from the agent's training and not a
+> protocol requirement — the tool was already in the init list with
+> its schema available. The Phase 4g/4h findings ("agent NEVER
+> chained `get_impact_graph` / `get_skeleton` / `search_logic_flow`",
+> "prompt-level workflow steering is closed as a lever") were
+> measured under deferred-loading and **may not hold on 2.1.119**.
+> Re-validation with the existing nudge variants (5b, 5g, 5e, 5f,
+> 5h, 5i, 5j, 5k) is now warranted before any further
+> prompt-engineering work.
+>
+> Practical implication: the `CLAUDE_BIN=2.1.114` workaround is no
+> longer needed for any reason — neither for `--mcp-config` loading
+> nor for eager-tool delivery. The harness can run on whatever
+> claude is on PATH.
 
 ##### 2026-04-24 follow-up: 2.1.117 breaks `--mcp-config` entirely in `--print` mode
 

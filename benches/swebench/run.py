@@ -373,19 +373,34 @@ def build_prompt(
 
     When `inline_claude_md` is True (the treatment arm, `--inject-claude-md`
     set), the full codesurgeon guidance text is appended after the nudge
-    and before the problem statement. This is how the CLAUDE.md content
-    actually reaches the agent — `claude --print` does NOT auto-load
-    workdir/CLAUDE.md, verified empirically against the 2026-04-20
-    stream logs (claude 2.1.114). See `maybe_inject_claude_md` for the
-    on-disk companion.
+    and before the problem statement. **WARNING: behaviour changed in
+    2.1.119.**
 
-    TODO (post-2.1.119 update): re-verify that `claude --print` still
-    does not auto-load workdir/CLAUDE.md. Smoke test: drop a CLAUDE.md
-    with a uniquely-fingerprinted token, run `--print` without
-    `--inject-claude-md`, grep the stream for the fingerprint. If the
-    behaviour changed in 2.1.119, `--inject-claude-md` would now
-    duplicate content (in-prompt + on-disk) — remove the in-prompt
-    path or the on-disk path, not both.
+    2.1.114 (the version this harness was originally calibrated against):
+    `claude --print` did NOT auto-load workdir/CLAUDE.md. The in-prompt
+    inline was the only path that delivered the content, and the on-disk
+    companion (`maybe_inject_claude_md`) was redundant theatre.
+
+    2.1.119 (verified 2026-04-25): `claude --print` DOES auto-load
+    workdir/CLAUDE.md. Reproduced with a fingerprinted token in
+    `<tmpdir>/CLAUDE.md` while running `claude --print` from `<tmpdir>`:
+    the agent emitted the fingerprint in its reply without being
+    explicitly told to read the file. Implication for `--inject-claude-md`
+    in this harness: **content is now double-injected** — once inline in
+    the prompt and once via the workdir's on-disk CLAUDE.md. Both
+    deliver the same text, so the agent sees it twice (different
+    framings, same information). Token-cost: 2× the CLAUDE.md content.
+
+    Mitigation when running on 2.1.119+: pick one delivery path. Either
+    (a) keep the in-prompt inline and skip the on-disk write, or (b)
+    keep the on-disk write and drop the in-prompt inline. Empirically
+    the on-disk path is closer to the way real users wire CLAUDE.md, so
+    (b) is the cleaner default. This requires changing
+    `maybe_inject_claude_md` to be the single source and removing the
+    `inline_claude_md` branch here.
+
+    Until that refactor lands: `--inject-claude-md` runs on 2.1.119+
+    will overstate the cost of the CLAUDE.md content vs reality.
     """
     parts = [PROMPT_BASE]
     if arm == "with":

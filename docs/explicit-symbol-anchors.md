@@ -417,11 +417,51 @@ on 2.1.117 (cleared globals + valid config + `--strict-mcp-config`
 still produced `mcp_servers: []`) is **fixed** in 2.1.119. Smoke test
 on the same workspace + same materialized config: init reports
 `mcp_servers: [{cs-codesurgeon, connected}]`, 40 tools advertised
-(25 built-in + 15 deferred MCP), agent invokes `run_pipeline`
+(25 built-in + 13 cs MCP + 2 plugin), agent invokes `run_pipeline`
 successfully without any pinning workaround. WARM_WORKSPACES.md's
 `CLAUDE_BIN=2.1.114` mitigation is no longer needed; the
 post-run `mcp_servers: []` diagnostic check still useful as a
 regression guard.
+
+### 2.1.119 also reverted two earlier behaviour changes
+
+Two follow-up smoke tests after the v3 run, in response to the
+"are any harness assumptions tied to earlier versions?" audit:
+
+**1. MCP tool deferral (Cause 1) is FIXED.** Direct probe on the
+warm sympy workspace: `init` event lists all 13
+`mcp__cs-codesurgeon__*` tools in `tools[]` from the start. No
+`ToolSearch` round-trip required. The 2.1.117 regression that
+deferred MCP schemas behind a `ToolSearch select:<name>` lookup is
+reverted in 2.1.119. Implication: the Phase 4g/4h findings
+recorded under deferred loading ("agent NEVER chained
+`get_impact_graph` / `get_skeleton` / `search_logic_flow`",
+"prompt-level workflow steering is closed as a lever") were
+measured against a defunct claude version and **may not hold on
+2.1.119**. Worth re-running the existing 5b/5g/5e/5f/5h/5i/5j/5k
+matrix on 2.1.119 before any further prompt-engineering work.
+
+**2. `claude --print` now auto-loads workdir/CLAUDE.md.** Verified
+by planting a fingerprinted CLAUDE.md in a tmpdir, running
+`claude --print` from that tmpdir with no `--mcp-config`, asking
+"What is 2+2?" — the agent's reply contained the fingerprint
+verbatim (the only way it could have known about the token was
+by reading the on-disk file). On 2.1.114 (the version the harness
+was originally calibrated against, per
+[run.py:362-364](../benches/swebench/run.py#L362)), `--print`
+explicitly did NOT auto-load workdir/CLAUDE.md, which was why the
+harness inlines the codesurgeon guidance in the prompt body. On
+2.1.119 the `--inject-claude-md` flag now produces **double
+delivery** — once via the in-prompt inline and once via the
+auto-loaded on-disk file. Token cost roughly doubles for the
+CLAUDE.md content. Mitigation noted in `run.py` docstring; pick
+one delivery path before the next harness run that uses
+`--inject-claude-md`.
+
+The v3 with-arm run from 2026-04-25 was unaffected by #2 because
+the warm sympy workspace ships no CLAUDE.md and the harness
+wasn't invoked with `--inject-claude-md`. The 81.8 s / $0.79 /
+1067 B numbers stand as measured.
 
 ### `Mod.eval` still does not surface as a pivot — even with embeddings
 
