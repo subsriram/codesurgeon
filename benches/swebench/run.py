@@ -787,6 +787,22 @@ def build_claude_cmd(
     return cmd
 
 
+def _read_tail(path: Path, n_bytes: int) -> str:
+    """Return the last ``n_bytes`` of ``path`` as UTF-8 text, or "" if missing.
+
+    Seeks rather than reading the whole file so multi-MB stderr logs (cs_core
+    debug output over a multi-hour task) don't have to be loaded into memory
+    just to extract a 2 KB tail for the error message.
+    """
+    if not path.exists():
+        return ""
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        if size > n_bytes:
+            f.seek(-n_bytes, 2)
+        return f.read().decode("utf-8", errors="replace")
+
+
 def parse_claude_json(stdout: str, stream_json: bool = False) -> dict:
     """Extract the structured result from ``claude --print`` output.
 
@@ -1152,31 +1168,44 @@ def run_one(
                 error=None,
             )
 
+        # Pre-create the artifact dir so stderr can stream to a file rather
+        # than be buffered in memory. Under cs_core=debug the MCP sidecar
+        # logs run into the megabytes over a long task; capture_output would
+        # hold all of that in process RSS for the duration. The file is
+        # later kept as `claude.stderr` next to the other per-task artifacts.
+        artifact_base = results_dir / arm / task["instance_id"]
+        artifact_base.mkdir(parents=True, exist_ok=True)
+        stderr_path = artifact_base / "claude.stderr"
+
         t0 = time.monotonic()
         try:
             try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_s,
-                    cwd=workdir,
-                )
+                with stderr_path.open("wb") as stderr_f:
+                    proc = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=stderr_f,
+                        text=True,
+                        timeout=timeout_s,
+                        cwd=workdir,
+                    )
                 exit_code = proc.returncode
                 stdout = proc.stdout
-                stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
+                stderr_tail = _read_tail(stderr_path, 2000)
                 err_msg = None if exit_code == 0 else f"exit={exit_code}; stderr-tail={stderr_tail}"
             except subprocess.TimeoutExpired as e:
-                # Preserve whatever was captured before the kill so the partial
-                # stream (stream-json mode) can be inspected post-mortem —
-                # otherwise a timed-out run is a total black box.
+                # Preserve whatever stdout was captured before the kill so the
+                # partial stream (stream-json mode) can be inspected
+                # post-mortem — otherwise a timed-out run is a total black
+                # box. Stderr is on disk already (file-piped above); just
+                # read its tail.
                 #
-                # `subprocess.TimeoutExpired.stdout` / `.stderr` are **bytes**
-                # on Python 3.14, regardless of `text=True` on `run()`. (A
-                # completed `proc.stdout` under `text=True` is `str`; the
-                # exception attrs are not decoded by the same path.) Decode
-                # defensively so downstream code that expects `str` (e.g.
-                # `Path.write_text`) doesn't crash.
+                # `subprocess.TimeoutExpired.stdout` is **bytes** on Python
+                # 3.14, regardless of `text=True` on `run()`. (A completed
+                # `proc.stdout` under `text=True` is `str`; the exception
+                # attr is not decoded by the same path.) Decode defensively
+                # so downstream code that expects `str` (e.g. `Path.write_text`)
+                # doesn't crash.
                 def _decode(x: object) -> str:
                     if x is None:
                         return ""
@@ -1186,11 +1215,11 @@ def run_one(
 
                 exit_code = -2
                 stdout = _decode(e.stdout)
-                partial_stderr = _decode(e.stderr)
-                stderr_tail = partial_stderr[-2000:]
+                stderr_size = stderr_path.stat().st_size if stderr_path.exists() else 0
+                stderr_tail = _read_tail(stderr_path, 2000)
                 err_msg = (
                     f"timeout after {timeout_s}s "
-                    f"(captured {len(stdout)} B stdout, {len(partial_stderr)} B stderr)"
+                    f"(captured {len(stdout)} B stdout, {stderr_size} B stderr)"
                 )
         finally:
             # Always reap the sidecar MCP, even on timeout / exception.
@@ -1211,8 +1240,8 @@ def run_one(
         #   - `archive/<isotime>_*` — permanent per-run copies so
         #     subsequent runs don't overwrite them. Preserves the stream
         #     for every configuration tried on the same task.
-        artifact_base = results_dir / arm / task["instance_id"]
-        artifact_base.mkdir(parents=True, exist_ok=True)
+        # `artifact_base` was created above before the subprocess.run so
+        # stderr could stream into it; just ensure the archive subdir exists.
         archive_dir = artifact_base / "archive"
         archive_dir.mkdir(exist_ok=True)
         run_ts = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
