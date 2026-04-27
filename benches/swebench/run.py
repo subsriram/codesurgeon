@@ -53,6 +53,15 @@ MCP_WITHOUT_PATH = REPO_ROOT / "benches" / "swebench" / "mcp_without.json"
 RESULTS_DIR = REPO_ROOT / "target" / "swebench"
 RESULTS_PATH = RESULTS_DIR / "results.jsonl"
 
+# Per-(repo, base_commit) index cache. When an index is successfully built
+# for a task, the resulting `.codesurgeon/` is copied here keyed by
+# (repo_slug, base_commit). Subsequent tasks hitting the same pair skip
+# the 5–30 min cold index and just copy from cache. Big win on multi-task
+# runs where many tasks share a base commit (e.g. SWE-bench Verified has
+# repeated bases within each repo).
+INDEX_CACHE_DIR = RESULTS_DIR / "index_cache"
+INDEX_TIMEOUT_S = 600  # cold-index timeout per task; cache hits ignore this
+
 DEFAULT_MCP_BIN = REPO_ROOT / "target" / "release" / "codesurgeon-mcp"
 DEFAULT_CS_BIN = REPO_ROOT / "target" / "release" / "codesurgeon"
 DEFAULT_CLAUDE_BIN = "claude"
@@ -742,6 +751,109 @@ def clone_task_repo(task: dict, dest: Path) -> None:
     git(["checkout", "--quiet", base_commit], cwd=dest)
 
 
+def _cache_key(task: dict) -> tuple[str, str]:
+    """Return (repo_slug, base_commit) used to index into INDEX_CACHE_DIR."""
+    return (task["repo"].replace("/", "__"), task["base_commit"])
+
+
+def cache_path_for(task: dict) -> Path:
+    """Absolute path to the cached `.codesurgeon/` for a task's (repo, base_commit)."""
+    slug, commit = _cache_key(task)
+    return INDEX_CACHE_DIR / slug / commit
+
+
+def cache_is_valid(cache_dir: Path) -> bool:
+    """Cache entry is valid iff index.db exists and a READY marker is present.
+
+    The READY marker is written *after* the copy finishes so a crash
+    mid-copy can't leave a half-populated dir that a later run mistakes
+    for a hit.
+    """
+    return (cache_dir / "READY").exists() and (cache_dir / "index.db").exists()
+
+
+def populate_cache_from(src_cs_dir: Path, task: dict) -> None:
+    """Copy a freshly-built `.codesurgeon/` directory into the per-task cache.
+
+    Writes to a staging path and renames on completion so partial copies
+    never become visible. If another process won the race, drop our copy
+    and keep theirs.
+    """
+    cache_dir = cache_path_for(task)
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = cache_dir.parent / f".{cache_dir.name}.staging-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    shutil.copytree(src_cs_dir, staging)
+    if cache_is_valid(cache_dir):
+        # Another process won the race AND finished cleanly. Keep theirs.
+        shutil.rmtree(staging, ignore_errors=True)
+        return
+    if cache_dir.exists():
+        # Stale or partial entry from a prior crash — replace it.
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    staging.rename(cache_dir)
+    (cache_dir / "READY").touch()
+
+
+def restore_cache_into(cache_dir: Path, workdir: Path) -> None:
+    """Copy a cached `.codesurgeon/` into a task workdir (overwrite-safe).
+
+    Drops the READY marker from the workdir copy so its on-disk state is
+    indistinguishable from a natively-produced index.
+    """
+    dest = workdir / ".codesurgeon"
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(cache_dir, dest)
+    (dest / "READY").unlink(missing_ok=True)
+
+
+def ensure_indexed(
+    task: dict,
+    workdir: Path,
+    cs_bin: Path,
+    timeout_s: int = INDEX_TIMEOUT_S,
+) -> tuple[bool, float, str | None]:
+    """Ensure ``workdir/.codesurgeon/`` exists, from cache if possible.
+
+    Returns ``(ok, wall_s, err)``. On a cache hit, ``wall_s`` is the copy
+    time. On a miss, runs ``codesurgeon index`` and then populates the
+    cache for future tasks with the same (repo, base_commit).
+    """
+    cache_dir = cache_path_for(task)
+    t0 = time.monotonic()
+
+    if cache_is_valid(cache_dir):
+        try:
+            restore_cache_into(cache_dir, workdir)
+            return True, time.monotonic() - t0, None
+        except OSError as e:
+            print(f"    cache restore failed ({e}); re-indexing", file=sys.stderr)
+
+    try:
+        proc = subprocess.run(
+            [str(cs_bin), "index", "--workspace", str(workdir)],
+            env={**os.environ, "CS_WORKSPACE": str(workdir)},
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return False, time.monotonic() - t0, f"index timed out after {timeout_s}s"
+    wall = time.monotonic() - t0
+    if proc.returncode != 0:
+        return False, wall, f"index failed: {proc.stderr[-500:]}"
+
+    try:
+        populate_cache_from(workdir / ".codesurgeon", task)
+    except OSError as e:
+        # Non-fatal — workdir index is still usable for this task.
+        print(f"    cache populate failed ({e}) — continuing without cache", file=sys.stderr)
+
+    return True, wall, None
+
+
 def build_claude_cmd(
     claude_bin: str,
     mcp_config: Path,
@@ -1008,16 +1120,8 @@ def run_one(
         if arm == "with" and not dry_run and reuse_workdir is not None:
             mcp_config = materialize_mcp_with(mcp_bin, workdir, tmp)
         elif arm == "with" and not dry_run:
-            t_idx = time.monotonic()
-            idx_proc = subprocess.run(
-                [str(cs_bin), "index", "--workspace", str(workdir)],
-                env={**os.environ, "CS_WORKSPACE": str(workdir)},
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            idx_wall = time.monotonic() - t_idx
-            if idx_proc.returncode != 0:
+            ok, idx_wall, err = ensure_indexed(task, workdir, cs_bin)
+            if not ok:
                 print(f"  INDEX-FAIL wall={idx_wall:.1f}s", file=sys.stderr)
                 return RunResult(
                     instance_id=task["instance_id"],
@@ -1033,7 +1137,7 @@ def run_one(
                     diff_bytes=0,
                     diff_path=None,
                     claude_json_path=None,
-                    error=f"index failed: {idx_proc.stderr[-500:]}",
+                    error=err,
                 )
             mcp_config = materialize_mcp_with(mcp_bin, workdir, tmp)
         elif arm == "with" and dry_run:
