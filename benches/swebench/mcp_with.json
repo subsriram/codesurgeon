@@ -5,7 +5,8 @@
       "command": "@CODESURGEON_MCP_BIN@",
       "args": [],
       "env": {
-        "CS_WORKSPACE": "@CS_WORKSPACE@"
+        "CS_WORKSPACE": "@CS_WORKSPACE@",
+        "CS_LOG": "info,cs_mcp=debug,cs_core=debug"
       }
     }
   }
