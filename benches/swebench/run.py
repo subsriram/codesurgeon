@@ -1272,6 +1272,29 @@ def append_result(path: Path, result: RunResult) -> None:
         f.write(json.dumps(asdict(result)) + "\n")
 
 
+def load_completed_pairs(path: Path) -> set[tuple[str, str]]:
+    """Read results.jsonl and return the set of (instance_id, arm) already done.
+
+    Used by ``--resume`` to skip pairs that have already been recorded so an
+    interrupted run can pick up exactly where it left off. Malformed rows
+    (truncated writes, missing fields) are skipped silently.
+    """
+    done: set[tuple[str, str]] = set()
+    if not path.exists():
+        return done
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                done.add((row["instance_id"], row["arm"]))
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return done
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", type=int, default=None, help="run only first N tasks")
@@ -1306,6 +1329,11 @@ def main() -> int:
         help=f"results.jsonl output path (default: {RESULTS_PATH.relative_to(REPO_ROOT)})",
     )
     parser.add_argument("--clean", action="store_true", help="truncate results.jsonl before running")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip (task, arm) pairs already in results.jsonl — use to continue an interrupted run",
+    )
     parser.add_argument(
         "--inject-claude-md",
         action="store_true",
@@ -1387,6 +1415,10 @@ def main() -> int:
     elif args.tasks is not None:
         tasks = tasks[: args.tasks]
 
+    if args.clean and args.resume:
+        print("--clean and --resume are mutually exclusive", file=sys.stderr)
+        return 2
+
     print(
         f"running {len(tasks)} tasks × {len(arms)} arms ({'dry-run' if args.dry_run else 'live'}) → {args.results.relative_to(REPO_ROOT) if args.results.is_relative_to(REPO_ROOT) else args.results}",
         file=sys.stderr,
@@ -1397,8 +1429,19 @@ def main() -> int:
 
     results_dir = args.results.parent
 
+    done = load_completed_pairs(args.results) if args.resume else set()
+    if done:
+        total_pairs = len(tasks) * len(arms)
+        skipped = sum(1 for t in tasks for a in arms if (t["instance_id"], a) in done)
+        print(
+            f"  resume: {skipped}/{total_pairs} pairs already done, {total_pairs - skipped} remaining",
+            file=sys.stderr,
+        )
+
     for task in tasks:
         for arm in arms:
+            if (task["instance_id"], arm) in done:
+                continue
             result = run_one(
                 task=task,
                 arm=arm,
