@@ -76,6 +76,15 @@ DEFAULT_CLAUDE_BIN = "claude"
 DEFAULT_MAX_BUDGET_USD = 1.00
 DEFAULT_TASK_TIMEOUT_S = 900  # 15 minutes
 
+# Transient-error retry: when claude exits fast with no work done (auth
+# token expired, rate-limit window closed) the right thing is to wait for
+# the window to roll over and retry the same task — not record a failure.
+# Flat 30-min wait (no backoff) up to 8 retries gives a 4-hour ceiling
+# per stuck task, which covers almost every real-world quota interval.
+QUOTA_MAX_RETRIES = 8
+QUOTA_WAIT_S = 1800
+QUOTA_WALL_THRESHOLD_S = 10  # exit-≠-0 runs faster than this are suspicious
+
 # Instruction preamble injected before the task's problem_statement. Keeps the
 # agent focused on producing a diff rather than asking clarifying questions.
 #
@@ -1472,6 +1481,79 @@ def load_completed_pairs(path: Path) -> set[tuple[str, str]]:
     return done
 
 
+def looks_like_transient_error(result: RunResult, stderr_text: str = "") -> bool:
+    """Decide whether a failed run looks like a transient quota/auth issue.
+
+    Covers OAuth quota exhaustion ("hit your limit"), rate-limit responses,
+    and token expiry ("authentication_error", 401). All three present the
+    same way: claude exits fast with no work done, no diff, no output
+    tokens. The fix for all three is the same — wait for the window to
+    refresh, then retry. Returning True asks the main loop to do that
+    rather than record the result.
+
+    ``stderr_text`` is optional; if the harness has already written
+    `claude.stderr` to disk (PR #88), passing the tail in lets the
+    classifier match explicit error strings. Without it, the heuristic
+    on result fields is still reliable for the dominant pattern.
+    """
+    if result.exit_code == 0:
+        return False
+    if stderr_text:
+        sl = stderr_text.lower()
+        if any(s in sl for s in (
+            "hit your limit", "rate limit", "rate_limit",
+            "authentication_error", "invalid authentication", " 401 ",
+        )):
+            return True
+    # Heuristic: fast exit with literally nothing produced.
+    if (
+        result.walltime_s < QUOTA_WALL_THRESHOLD_S
+        and result.diff_bytes == 0
+        and (result.output_tokens is None or result.output_tokens == 0)
+    ):
+        return True
+    return False
+
+
+def probe_claude_auth(claude_bin: str) -> bool:
+    """Quick liveness check — can claude authenticate right now?
+
+    Sends a 1-token prompt and waits up to 30s. Used between retries to
+    avoid burning a full clone+index+run cycle on a still-dead token.
+    The prompt is intentionally trivial; if it succeeds, the rate-limit
+    window has rolled over.
+    """
+    try:
+        proc = subprocess.run(
+            [claude_bin, "--print", "say ok"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0 and "ok" in proc.stdout.lower()
+
+
+def _read_stderr_for(results_dir: Path, arm: str, instance_id: str, n_bytes: int = 8000) -> str:
+    """Read the tail of `claude.stderr` for a (arm, instance_id) if present.
+
+    Returns "" when the file doesn't exist (older harness runs that didn't
+    stream stderr to a file, or runs that failed before the subprocess).
+    """
+    p = results_dir / arm / instance_id / "claude.stderr"
+    if not p.exists():
+        return ""
+    try:
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > n_bytes:
+                f.seek(-n_bytes, 2)
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", type=int, default=None, help="run only first N tasks")
@@ -1615,26 +1697,62 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    def _do_run(task: dict, arm: str) -> RunResult:
+        return run_one(
+            task=task,
+            arm=arm,
+            claude_bin=claude_bin,
+            mcp_bin=mcp_bin,
+            cs_bin=cs_bin,
+            max_budget_usd=args.max_budget_usd,
+            timeout_s=args.timeout,
+            model=args.model,
+            dry_run=args.dry_run,
+            results_dir=results_dir,
+            inject_claude_md=args.inject_claude_md,
+            nudge_variant=args.nudge,
+            reuse_workdir=args.reuse_workdir,
+            stream_json=args.stream_json,
+        )
+
     for task in tasks:
         for arm in arms:
             if (task["instance_id"], arm) in done:
                 continue
-            result = run_one(
-                task=task,
-                arm=arm,
-                claude_bin=claude_bin,
-                mcp_bin=mcp_bin,
-                cs_bin=cs_bin,
-                max_budget_usd=args.max_budget_usd,
-                timeout_s=args.timeout,
-                model=args.model,
-                dry_run=args.dry_run,
-                results_dir=results_dir,
-                inject_claude_md=args.inject_claude_md,
-                nudge_variant=args.nudge,
-                reuse_workdir=args.reuse_workdir,
-                stream_json=args.stream_json,
-            )
+            result = _do_run(task, arm)
+
+            # Transient-error retry: if the run looks like a quota/auth
+            # blip (fast exit, no work done), wait for the rate-limit
+            # window to roll over and retry. probe_claude_auth before
+            # each retry avoids spending a clone+index+run cycle on a
+            # still-dead token. Up to QUOTA_MAX_RETRIES retries — each
+            # successful retry resets the budget for the *next* task.
+            for retry in range(1, QUOTA_MAX_RETRIES + 1):
+                stderr_text = _read_stderr_for(results_dir, arm, task["instance_id"])
+                if not looks_like_transient_error(result, stderr_text):
+                    break
+                print(
+                    f"  ⏳ transient error on {task['instance_id']}/{arm} "
+                    f"— retry {retry}/{QUOTA_MAX_RETRIES} after {QUOTA_WAIT_S // 60}min",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                while True:
+                    time.sleep(QUOTA_WAIT_S)
+                    if probe_claude_auth(claude_bin):
+                        print(
+                            f"  ✓ claude auth OK — retrying {task['instance_id']}/{arm}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        break
+                    print(
+                        f"  … still down, waiting another {QUOTA_WAIT_S // 60}min",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                result = _do_run(task, arm)
+
             append_result(args.results, result)
 
     print(f"done → {args.results}", file=sys.stderr)
