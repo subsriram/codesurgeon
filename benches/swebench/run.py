@@ -763,13 +763,27 @@ def cache_path_for(task: dict) -> Path:
 
 
 def cache_is_valid(cache_dir: Path) -> bool:
-    """Cache entry is valid iff index.db exists and a READY marker is present.
+    """Cache entry is valid iff all required artifacts exist + READY marker.
+
+    The canonical contents of `.codesurgeon/` produced by `codesurgeon index`
+    are listed in the indexer's own `.gitignore` generator (engine.rs:438):
+    `index.db`, `embeddings.bin` (default `metal`/`embeddings` builds), and
+    optionally `manifest.json`. Without `embeddings.bin` the MCP server
+    silently rebuilds the embedding store on first semantic query — fine
+    for one task, but wasteful when N future tasks each hit the same cache
+    and re-pay the rebuild every time.
 
     The READY marker is written *after* the copy finishes so a crash
     mid-copy can't leave a half-populated dir that a later run mistakes
     for a hit.
+
+    Note: assumes the indexer was built with embeddings (the default
+    `--features metal` and `--features embeddings` builds). A no-features
+    build doesn't produce `embeddings.bin` and would invalidate every
+    cache entry; clear the cache manually when switching builds.
     """
-    return (cache_dir / "READY").exists() and (cache_dir / "index.db").exists()
+    required = ("READY", "index.db", "embeddings.bin")
+    return all((cache_dir / f).exists() for f in required)
 
 
 def populate_cache_from(src_cs_dir: Path, task: dict) -> None:
