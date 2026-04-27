@@ -398,18 +398,30 @@ release binary so the per-symbol embedding cache is populated for the
 first time on this workspace (55,709 symbols → 171 MB `embeddings.bin`,
 prior runs had a 9 KB stub from a no-features build).
 
-### Measured outcome (n=1 each, three configurations)
+### Measured outcome (n=1 each, four configurations)
 
-| Config | Claude | Wall | Cost | Diff | Canonical fix? | cs-codesurgeon used? |
-|---|---|---:|---:|---:|---|---|
-| `without` (control) | 2.1.117 | 225.9 s | $0.77 | 611 B | ✓ | n/a |
-| `with` v1 (broken MCP) | 2.1.117 | 139.8 s | $0.42 | 582 B | ✓ | ✗ — `mcp_servers: []` at init |
-| `with` v2 (working MCP) | **2.1.114** | 487.9 s | $1.61 | 582 B | ✓ | ✓ — 1× `run_pipeline` |
+| Config | Claude | Wall | Cost | Diff | Tool calls | Canonical fix? | cs-codesurgeon used? |
+|---|---|---:|---:|---:|---:|---|---|
+| `without` (control) | 2.1.117 | 225.9 s | $0.77 | 611 B | — | ✓ | n/a |
+| `with` v1 (broken MCP) | 2.1.117 | 139.8 s | $0.42 | 582 B | 0 cs | ✓ | ✗ — `mcp_servers: []` at init |
+| `with` v2 (working MCP) | **2.1.114** | 487.9 s | $1.61 | 582 B | 53 | ✓ | ✓ — 1× `run_pipeline` |
+| `with` v3 (post-fix) | **2.1.119** | **81.8 s** | $0.79 | 1067 B | **10** | ✓ | ✓ — 1× `run_pipeline` |
 
-All three runs produced the canonical upstream patch in
+All four runs produced the canonical upstream patch in
 `sympy/core/mod.py::Mod.eval` (try/except `PolynomialError` around
-`gcd(p, q)`). Variance dominates: same workspace, same task — wall
-times spread across **3.4×** (139 s → 488 s).
+`gcd(p, q)`). Wall-time spread across **6.0×** (82 s → 488 s) on
+identical workspace + task — variance dominates n=1.
+
+**2.1.119 verdict on the `--mcp-config` regression**: the bug observed
+on 2.1.117 (cleared globals + valid config + `--strict-mcp-config`
+still produced `mcp_servers: []`) is **fixed** in 2.1.119. Smoke test
+on the same workspace + same materialized config: init reports
+`mcp_servers: [{cs-codesurgeon, connected}]`, 40 tools advertised
+(25 built-in + 15 deferred MCP), agent invokes `run_pipeline`
+successfully without any pinning workaround. WARM_WORKSPACES.md's
+`CLAUDE_BIN=2.1.114` mitigation is no longer needed; the
+post-run `mcp_servers: []` diagnostic check still useful as a
+regression guard.
 
 ### `Mod.eval` still does not surface as a pivot — even with embeddings
 
@@ -420,14 +432,35 @@ pivots: `symbols`, `exp`, `exp` (interval), `sinh`, `Piecewise`,
 
 **Zero matches for `Mod.eval` in the capsule.** Same symptom as the
 2026-04-22 session, but now with embeddings populated and the v2
-semantic scorer actively running. The agent reached `Mod.eval` through
-**26 Read + 16 Grep** calls, not via the capsule. This confirms the
-2026-04-22 caveat — the win on that session came from *removing
-misleading signal* (auto-obs off, trivial-stub filter), not from the
-semantic reverse-expand surfacing the fix site directly. The
-unit-tested algorithm works on synthetic graphs; on the real sympy-core
-graph the fix site stays outside the top-`fan_out` beam from
-`PolynomialError`.
+semantic scorer actively running. Reproduced across two distinct
+runs (v2 on 2.1.114 and v3 on 2.1.119) — same 8 pivots returned both
+times.
+
+The v2 (2.1.114) agent reached `Mod.eval` through **26 Read + 16
+Grep** calls. The v3 (2.1.119) agent reached `Mod.eval` more
+efficiently through a **different mechanism**: it ran the MWE from
+the problem statement via `python -c`, which produced a Python
+traceback containing `File ".../sympy/core/mod.py", line 169, in
+eval`. That single Bash result gave it the file + line + symbol
+directly; only 3 Reads + 2 Edits followed.
+
+This is suggestive: even when codesurgeon's semantic reverse-expand
+fails to surface the fix site, an agent willing to *execute* the
+problem-statement MWE will get the traceback for free. The
+traceback half of #69 v2 (`e1568fa`) is designed to extract symbols
+from such tracebacks, but it operates on the *input* — it would
+help if the agent fed the runtime traceback back into a second
+`run_pipeline` call. The v3 agent didn't loop; it went straight to
+Edit. So the win there came from claude's behaviour change in
+2.1.119, not from any codesurgeon improvement.
+
+This confirms the 2026-04-22 caveat — the win on that session came
+from *removing misleading signal* (auto-obs off, trivial-stub
+filter), not from the semantic reverse-expand surfacing the fix
+site directly. The unit-tested algorithm works on synthetic graphs;
+on the real sympy-core graph the fix site stays outside the
+top-`fan_out` beam from `PolynomialError` regardless of whether
+embeddings are populated.
 
 Open structural problem (carried over from 2026-04-22): symptom-anchored
 queries where the fix site is N hops upstream through a dense raiser

@@ -500,6 +500,21 @@ the affirmative-claim portion (canonical fix produced, capsule
 contents) and discount any walltime/cost claims that didn't include
 this `mcp_servers: []` check.
 
+##### 2026-04-25 update: fixed in 2.1.119
+
+Re-tested on `claude 2.1.119`. Same workspace, same materialized
+`--mcp-config`, same `--strict-mcp-config` flag. Init now reports
+`mcp_servers: [{name: cs-codesurgeon, status: connected}]` and 40
+tools (25 built-in + 15 deferred MCP). Agent invokes `run_pipeline`
+successfully without any `CLAUDE_BIN` pinning. The 2.1.117-only
+regression is fixed; the `CLAUDE_BIN=2.1.114` workaround is no
+longer needed for `--print`-mode harness runs.
+
+The post-run `jq -r 'select(.type=="system" and .subtype=="init") |
+.mcp_servers'` diagnostic above is still worth running on every
+`with`-arm result as a regression guard — silent MCP-load failure is
+the kind of bug that recurs.
+
 #### Cause 2 — stale `claude mcp add*` registration poisons CLI state
 
 Claude Code's CLI maintains a global MCP registry state (in
