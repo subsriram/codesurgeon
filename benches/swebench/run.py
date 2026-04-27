@@ -46,6 +46,12 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+# Git clone retry configuration. Sequence with default values: 30s, 60s,
+# 120s, 240s, 480s — caps at CLONE_RETRY_WAIT_MAX_S to avoid runaway waits.
+CLONE_MAX_RETRIES = 5
+CLONE_RETRY_WAIT_S = 30
+CLONE_RETRY_WAIT_MAX_S = 480
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TASKS_PATH = REPO_ROOT / "benches" / "swebench" / "tasks.json"
 MCP_WITH_TEMPLATE = REPO_ROOT / "benches" / "swebench" / "mcp_with.json"
@@ -726,6 +732,10 @@ def clone_task_repo(task: dict, dest: Path) -> None:
 
     Uses ``git fetch --depth 1`` of the exact base_commit SHA to avoid
     pulling the full history. This is ~10x faster than a full clone.
+
+    Retries the fetch with exponential backoff on transient GitHub failures
+    (503s, network timeouts, connection resets). With defaults the sequence
+    is 30s → 60s → 120s → 240s → 480s, up to ``CLONE_MAX_RETRIES`` attempts.
     """
     repo_url = f"https://github.com/{task['repo']}.git"
     base_commit = task["base_commit"]
@@ -733,12 +743,32 @@ def clone_task_repo(task: dict, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     git(["init", "--quiet"], cwd=dest)
     git(["remote", "add", "origin", repo_url], cwd=dest)
-    # Some providers don't allow single-commit fetches without unshallow;
-    # fall back to a deeper fetch if needed.
-    try:
-        git(["fetch", "--depth", "1", "origin", base_commit], cwd=dest)
-    except subprocess.CalledProcessError:
-        git(["fetch", "--depth", "50", "origin"], cwd=dest)
+
+    wait_s = CLONE_RETRY_WAIT_S
+    last_err: subprocess.CalledProcessError | None = None
+    for attempt in range(1, CLONE_MAX_RETRIES + 1):
+        try:
+            try:
+                git(["fetch", "--depth", "1", "origin", base_commit], cwd=dest)
+            except subprocess.CalledProcessError:
+                # Some providers don't allow single-commit fetches; fall back.
+                git(["fetch", "--depth", "50", "origin"], cwd=dest)
+            last_err = None
+            break
+        except subprocess.CalledProcessError as e:
+            last_err = e
+            if attempt < CLONE_MAX_RETRIES:
+                print(
+                    f"    clone attempt {attempt}/{CLONE_MAX_RETRIES} failed — "
+                    f"retrying in {wait_s}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(wait_s)
+                wait_s = min(wait_s * 2, CLONE_RETRY_WAIT_MAX_S)
+    if last_err is not None:
+        raise last_err
+
     git(["checkout", "--quiet", base_commit], cwd=dest)
 
 
