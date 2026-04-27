@@ -169,6 +169,7 @@ struct PolicyArm {
 
     // Ranker knobs — how candidates are scored and fused.
     centrality_weight: f32,
+    centrality_k: f32,          // smoothing constant in raw/(raw+k); default = median(in*2+out) over corpus (#82)
     reranker_temp: f32,
     bm25_embed_mix: f32,        // 0 = pure BM25, 1 = pure embeddings
     graph_hop_budget: u32,
