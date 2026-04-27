@@ -225,9 +225,17 @@ NUDGES: dict[str, str] = {
 # Used to choose `5b` as the default; all other variants kept for
 # reproducibility and future re-runs.
 #
+# IMPORTANT — measured on **claude 2.1.114 / 2.1.117**. The 2.1.119
+# update changed `--print`-mode behaviour materially: a fresh n=1 5b
+# run on the same workspace produced 81.8 s / $0.79 / 1067 B (3.4×
+# faster wall, larger-but-still-canonical patch). Treat the table
+# below as a **historical** reference, not a target. Any nudge-tuning
+# decision made on its numbers needs to be re-measured on 2.1.119+
+# before being acted on.
+#
 # | Variant | Prompt ch | Wall  | Cost   | Patch  | Notes
 # |---------|----------:|------:|-------:|-------:|------
-# | 5b      |       716 | 279 s | $0.95  | 582 B  | VERBATIM-ONLY; reference baseline
+# | 5b      |       716 | 279 s | $0.95  | 582 B  | VERBATIM-ONLY; reference baseline (2.1.114-era)
 # | 5g      |       529 | 256 s | $0.99  | 582 B  | grounded inference + short tool names; Pareto-comparable
 # | 5i      |       482 | 368 s | $1.34  | 582 B  | tightest imperative + FQN tool names; correct, costlier
 # | 5e      |       568 | 474 s | $1.60  | 597 B  | speculative inference; agent guessed `trigsimp` (wrong subtree)
@@ -236,16 +244,23 @@ NUDGES: dict[str, str] = {
 # | 5h      |       559 | 600 s | TIMEOUT|   0 B  | FQN tools + "include the" phrasing; agent hallucinated `ask_key`
 # | (4f)    |     3,497 | 600 s | TIMEOUT|   0 B  | 5b + full 2,781-char CLAUDE.md (reverted)
 #
-# Key signals that survive noise (single-run, n=1 per variant):
+# Key signals that survive noise (single-run, n=1 per variant) — **on
+# 2.1.114/2.1.117**:
 #  - 5b and 5g occupy the same success band (~$0.95-$0.99 / ~256-279 s)
 #  - Every variant that promotes speculation OR adds tool advertising
 #    >~130 chars degraded or timed out
 #  - Agent NEVER called get_impact_graph / get_skeleton / search_logic_flow
 #    across all 7 variants, regardless of tool-name format or framing
 #
-# Conclusion: prompt-level workflow steering is closed as a lever on
-# this task class. Further gains come from server-side capsule content
-# (#69 v2: body-text embedding similarity, traceback parsing, etc.).
+# Conclusion (also 2.1.114/2.1.117-era; UNVERIFIED on 2.1.119+):
+# prompt-level workflow steering is closed as a lever on this task
+# class. Further gains come from server-side capsule content (#69 v2:
+# body-text embedding similarity, traceback parsing, etc.). The
+# 2.1.119 deferred-tool behaviour change may invalidate the second
+# half of this conclusion — the agent now reaches dynamic-tool prep
+# faster, so longer prompts that advertise additional tools may not
+# regress the way they did on 2.1.117. Re-validate before treating
+# "prompt-level steering is closed" as authoritative.
 
 PROMPT_SUFFIX = """
 
@@ -361,7 +376,16 @@ def build_prompt(
     and before the problem statement. This is how the CLAUDE.md content
     actually reaches the agent — `claude --print` does NOT auto-load
     workdir/CLAUDE.md, verified empirically against the 2026-04-20
-    stream logs. See `maybe_inject_claude_md` for the on-disk companion.
+    stream logs (claude 2.1.114). See `maybe_inject_claude_md` for the
+    on-disk companion.
+
+    TODO (post-2.1.119 update): re-verify that `claude --print` still
+    does not auto-load workdir/CLAUDE.md. Smoke test: drop a CLAUDE.md
+    with a uniquely-fingerprinted token, run `--print` without
+    `--inject-claude-md`, grep the stream for the fingerprint. If the
+    behaviour changed in 2.1.119, `--inject-claude-md` would now
+    duplicate content (in-prompt + on-disk) — remove the in-prompt
+    path or the on-disk path, not both.
     """
     parts = [PROMPT_BASE]
     if arm == "with":
@@ -542,6 +566,18 @@ def mcp_sidecar_start(
     starting the stdio loop. That eliminates the race where the first
     ``tools/call run_pipeline`` arrives before the engine is ready and
     returns the ``⏳ Engine still initializing`` placeholder.
+
+    TODO (post-2.1.119 update): the sidecar was added to dodge an
+    initialize-vs-engine-ready race observed on 2.1.117. If 2.1.119
+    serialises ``initialize`` against engine readiness internally (or
+    if the race never manifested on 2.1.119 to begin with), the
+    sidecar is dead weight — costs ~0.2-1.4 s per run and one extra
+    PID-lock holder. To measure: run with the sidecar code path
+    bypassed (early-return ``(None, "sidecar disabled")``) and confirm
+    no ``⏳ Engine still initializing`` placeholders in the first
+    ``tools/call run_pipeline`` result across n=3 runs. If clean,
+    drop the sidecar or gate it behind ``--use-sidecar`` (default off
+    on 2.1.119+).
 
     Returns ``(Popen, message)``. Returns ``(None, err_msg)`` if the
     sidecar failed to reach engine-ready within ``ready_timeout_s``; the
