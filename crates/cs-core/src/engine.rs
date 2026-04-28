@@ -2669,25 +2669,45 @@ impl CoreEngine {
         } else {
             let graph = self.graph.read();
 
-            // Build the seed-candidate pool. Issue #96: anchor_candidates
-            // truncates to top-K-per-name with a prefer_module sort, which
-            // can drop legitimate seed targets when a wrapper sibling out-
-            // ranks them — observed on matplotlib-24177 where `pyplot::hist`
-            // displaced `Axes::hist` (the actual implementation). For seed
-            // selection we want every distinct exact-name match per anchor
-            // so each subtree gets walk budget independently. Hub guard
-            // (`EXPAND_SEED_FANOUT_LIMIT`) still applies — a public API
-            // with thousands of callees is a flood risk regardless.
+            // Build the seed-candidate pool. Issue #96 — two-phase
+            // resolution problem:
+            //   * `anchor_candidates` truncates to top-K-per-name with a
+            //     prefer_module sort, dropping legit seed targets when a
+            //     wrapper sibling outranks them (matplotlib `pyplot::hist`
+            //     displacing `Axes::hist`).
+            //   * The DB's `name` column stores qualified names for class
+            //     methods (`name = "Axes::hist"`), so `WHERE name = "hist"`
+            //     misses methods even when they exist in the index.
+            // Fix: use `symbols_by_leaf_name` which matches against the
+            // last `::`-segment via the indexed `leaf_name` column. That
+            // catches both top-level functions and class methods. Hub
+            // guard (`EXPAND_SEED_FANOUT_LIMIT`) still applies — a public
+            // API with thousands of callees is a flood risk regardless.
             let anchors_for_seeding = crate::anchors::extract(&anchor_source);
             let mut seed_candidate_ids: HashSet<u64> = HashSet::new();
             {
                 let db = self.db.lock();
                 for name in &anchors_for_seeding.symbol_names {
                     let lookup = name.rsplit('.').next().unwrap_or(name);
-                    if let Ok(ids) = db.symbols_by_exact_name(lookup, EXPAND_SEED_PER_NAME_LIMIT) {
-                        for id in ids {
-                            seed_candidate_ids.insert(id);
-                        }
+                    let by_leaf = db
+                        .symbols_by_leaf_name(lookup, EXPAND_SEED_PER_NAME_LIMIT)
+                        .unwrap_or_default();
+                    // Belt-and-suspenders: also try exact-name. Catches
+                    // symbols where the indexer stored a non-`::`-suffixed
+                    // name that the leaf computation wouldn't reproduce
+                    // (e.g. languages whose qualifier convention differs).
+                    let by_name = db
+                        .symbols_by_exact_name(lookup, EXPAND_SEED_PER_NAME_LIMIT)
+                        .unwrap_or_default();
+                    tracing::debug!(
+                        target: "cs_core::ranking",
+                        "seed-lookup: name={:?} → leaf={} exact={} (union)",
+                        lookup,
+                        by_leaf.len(),
+                        by_name.len()
+                    );
+                    for id in by_leaf.into_iter().chain(by_name) {
+                        seed_candidate_ids.insert(id);
                     }
                 }
             }
@@ -2741,6 +2761,7 @@ impl CoreEngine {
                         .join(", ")
                 };
                 tracing::debug!(
+                    target: "cs_core::ranking",
                     "expand seeds: {} forward = [{}]; {} reverse = [{}] (candidates considered: {})",
                     forward_seeds.len(),
                     fmt_fqns(&forward_seeds),
@@ -2872,6 +2893,7 @@ impl CoreEngine {
                 out.retain(|(id, _)| seen.insert(*id));
 
                 tracing::debug!(
+                    target: "cs_core::ranking",
                     "expand: strategy={:?} dir={:?} fwd_seeds={} rev_seeds={} → {} candidates (terms={}, semantic={})",
                     strategy,
                     direction,
