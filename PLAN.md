@@ -740,6 +740,11 @@ Implementation:
 
 ## Benchmark plan
 
+> **Note:** Benchmark code, baselines, and the SWE-bench harness live in a
+> separate repo at `~/projects/cs-benchmark/`. The forward-looking plan
+> below references file paths that, when implemented, land there — not in
+> this repo. See `cs-benchmark/README.md` for the current layout.
+
 ### B1 — SWE-bench Verified (external, end-to-end quality)
 
 The gold-standard external validation for coding agents is

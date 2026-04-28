@@ -5,8 +5,11 @@
 //! `run_pipeline` capsule. Writes `target/token_savings.json` and prints a
 //! markdown table to stdout. Advisory — no CI gate.
 //!
-//! Paired with `scripts/bench_summary.py`, which diffs against a committed
-//! `benches/token_baseline.json` and renders the Δ column for PR comments.
+//! Paired with `cs-benchmark/scripts/bench_summary.py` (in a separate repo
+//! at `~/projects/cs-benchmark/`), which diffs against the committed
+//! `benches/token_baseline.json` there and renders the Δ column for PR
+//! comments. There's also a Python parallel — `cs-benchmark/scripts/token_savings.py`
+//! — that drives the released binary against an arbitrary workspace.
 //!
 //! Usage:
 //!     cargo run --release --example token_savings -p cs-core
