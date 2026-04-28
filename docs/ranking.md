@@ -321,7 +321,9 @@ rather than graph connectivity.
 
 ```
 # Code symbols:
-centrality = centrality_score(id)          # (in*2 + out) / (in*2 + out + 15)
+raw       = in_degree * 2 + out_degree
+k         = corpus_percentile(raw, p)      # default p = 0.5 (median)
+centrality = raw / (raw + k)
 final = reranked_score * (1 + centrality * 3)
 
 # Markdown symbols — centrality bypass:
@@ -330,6 +332,23 @@ final = reranked_score * 2.5
 
 `centrality_score` uses the symbol's own in+out degree (not family), appropriate for the
 general boost since it applies to all symbol kinds equally.
+
+**Why `k` is corpus-derived (issue #82):** `k` defines the degree at which a symbol scores
+0.5 — i.e., it encodes "average" for the graph. A fixed value is only correct if every
+indexed workspace has a similar degree distribution, which is not generally true (a 200-file
+script collection has nothing like the degree spread of a 50-kloc service). At index time
+`warm_caches()` collects `raw = in*2 + out` for every symbol and picks the value at the
+configured percentile (`p` = 0.5 by default), guaranteeing the median symbol scores 0.5
+regardless of corpus density. The chosen `k` is reported through `index_status` /
+`get_stats` so it's observable.
+
+Override via `[ranking]` in `.codesurgeon/config.toml`:
+
+```toml
+[ranking]
+centrality_k_percentile = 0.5   # default; set to 0.75 to favour leafier signals
+centrality_k            = 15.0  # explicit pin; bypasses percentile derivation
+```
 
 **Why markdown bypasses centrality:** Markdown symbols have no graph edges (docs are never
 imported or called), so `centrality_score` is always 0. Without the bypass, a markdown
@@ -508,7 +527,7 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | max_blast_radius_depth | 5 | `engine.rs` |
 | max_impact_results (per-list cap) | 100 | `engine.rs` |
 | family_in_degree k | 5 | `graph.rs` |
-| centrality_score k | 15 | `graph.rs` |
+| centrality_score k | corpus median (p50 of `in*2 + out`) | `graph.rs:warm_caches` (configurable: `[ranking] centrality_k_percentile`, `[ranking] centrality_k`) |
 | Stub score weight | × 0.3 | `ranking.rs:STUB_SCORE_WEIGHT` |
 | Trivial exception pivot filter max body lines | 3 | `ranking.rs:is_trivial_exception_pivot` |
 | Auto-observation recording (default) | off | `engine.rs:EngineConfig::auto_observations` |

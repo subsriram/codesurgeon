@@ -149,6 +149,12 @@ async fn main() -> Result<()> {
             println!("Edges   : {}", stats.edge_count);
             println!("Files   : {}", stats.file_count);
             println!("Session : {}", stats.session_id);
+            let source = if stats.centrality_k_overridden {
+                "config override".to_string()
+            } else {
+                format!("p{:.0} of corpus", stats.centrality_k_percentile * 100.0)
+            };
+            println!("Cent. k : {:.2} ({})", stats.centrality_k, source);
         }
 
         Commands::Search { query, budget } => {

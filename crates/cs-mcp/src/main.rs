@@ -969,6 +969,15 @@ async fn dispatch_tool(engine: &Arc<CoreEngine>, name: &str, args: &Value) -> Re
                     stats.stub_symbol_count
                 ));
             }
+            let centrality_source = if stats.centrality_k_overridden {
+                "config override".to_string()
+            } else {
+                format!("p{:.0} of corpus", stats.centrality_k_percentile * 100.0)
+            };
+            status.push_str(&format!(
+                "- Centrality k: {:.2} ({})\n",
+                stats.centrality_k, centrality_source
+            ));
             status.push_str(&format!("- Session: {}\n", stats.session_id));
             if let Some(updated_at) = &stats.manifest_updated_at {
                 let file_count = stats.manifest_file_count.unwrap_or(0);

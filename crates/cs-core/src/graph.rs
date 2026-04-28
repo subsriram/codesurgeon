@@ -3,6 +3,20 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction;
 use std::collections::HashMap;
 
+/// Default smoothing constant used for the centrality formula when the graph is
+/// empty (or no override is configured). Matches the historical hardcoded value
+/// for backwards-compatible behaviour on tiny / fresh indexes.
+pub const DEFAULT_CENTRALITY_K: f32 = 15.0;
+
+/// Default percentile of the raw-degree distribution used to derive `k` at
+/// `warm_caches()` time. 0.5 ⇒ the median symbol scores 0.5.
+pub const DEFAULT_CENTRALITY_K_PERCENTILE: f32 = 0.5;
+
+/// Floor for the corpus-derived `k`. With many leaf symbols the chosen
+/// percentile of `raw = in*2 + out` can be 0; dividing by `raw + 0` collapses
+/// the score to 1.0 for any non-leaf, so we clamp.
+const CENTRALITY_K_FLOOR: f32 = 1.0;
+
 /// The in-memory dependency graph.
 /// Nodes = Symbols, Edges = EdgeKind relationships.
 pub struct CodeGraph {
@@ -13,6 +27,18 @@ pub struct CodeGraph {
     centrality_cache: Option<HashMap<u64, f32>>,
     /// Cached family in-degree scores (symbol id → score). Invalidated on mutation.
     family_in_degree_cache: Option<HashMap<u64, f32>>,
+    /// Smoothing constant for `centrality_score`. Either derived from the
+    /// degree distribution at `warm_caches()` time (the default), or pinned to
+    /// a fixed value when the operator overrides it via config. See
+    /// `centrality_score` for how it's used.
+    centrality_k: f32,
+    /// Percentile of `raw = in*2 + out` used to derive `centrality_k` during
+    /// `warm_caches()`. Range `[0.0, 1.0]`. Ignored when `centrality_k_override`
+    /// is set.
+    centrality_k_percentile: f32,
+    /// When `Some(k)`, `warm_caches()` skips the percentile derivation and
+    /// pins `centrality_k` to this value. Used for `[ranking] centrality_k = N`.
+    centrality_k_override: Option<f32>,
 }
 
 impl CodeGraph {
@@ -22,7 +48,30 @@ impl CodeGraph {
             id_to_idx: HashMap::new(),
             centrality_cache: None,
             family_in_degree_cache: None,
+            centrality_k: DEFAULT_CENTRALITY_K,
+            centrality_k_percentile: DEFAULT_CENTRALITY_K_PERCENTILE,
+            centrality_k_override: None,
         }
+    }
+
+    /// Configure the percentile of the raw-degree distribution used to derive
+    /// `centrality_k` at `warm_caches()` time. Values outside `[0.0, 1.0]` are
+    /// clamped. Takes effect on the next `warm_caches()` call.
+    pub fn set_centrality_k_percentile(&mut self, percentile: f32) {
+        self.centrality_k_percentile = percentile.clamp(0.0, 1.0);
+    }
+
+    /// Pin `centrality_k` to a fixed value, bypassing percentile derivation.
+    /// `Some(k)` overrides; `None` re-enables corpus-derived `k`. Takes effect
+    /// on the next `warm_caches()` call.
+    pub fn set_centrality_k_override(&mut self, k: Option<f32>) {
+        self.centrality_k_override = k.map(|v| v.max(CENTRALITY_K_FLOOR));
+    }
+
+    /// Current `k` used in `centrality_score`. Reflects the value from the
+    /// most recent `warm_caches()` call (or the default if it hasn't run yet).
+    pub fn centrality_k(&self) -> f32 {
+        self.centrality_k
     }
 
     /// Invalidate cached scores. Called after any graph mutation.
@@ -33,8 +82,9 @@ impl CodeGraph {
 
     /// Populate centrality and family in-degree caches in a single O(V+E) pass.
     pub fn warm_caches(&mut self) {
-        // Centrality cache
-        let centrality: HashMap<u64, f32> = self
+        // ── 1. Compute raw scores once and reuse for both `k` derivation
+        //       and per-symbol centrality.
+        let raw_scores: HashMap<u64, f32> = self
             .id_to_idx
             .iter()
             .map(|(&id, &idx)| {
@@ -46,9 +96,30 @@ impl CodeGraph {
                     .graph
                     .neighbors_directed(idx, Direction::Outgoing)
                     .count() as f32;
-                let raw = in_deg * 2.0 + out_deg;
-                (id, raw / (raw + 15.0))
+                (id, in_deg * 2.0 + out_deg)
             })
+            .collect();
+
+        // ── 2. Pick `k`: explicit override wins; otherwise derive from the
+        //       configured percentile of the raw-score distribution. Empty
+        //       graphs fall back to the historical default so that pre-index
+        //       reads (e.g. on a brand-new workspace) behave the same as before.
+        self.centrality_k = if let Some(k) = self.centrality_k_override {
+            k
+        } else if raw_scores.is_empty() {
+            DEFAULT_CENTRALITY_K
+        } else {
+            let mut sorted: Vec<f32> = raw_scores.values().copied().collect();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let idx = ((sorted.len() - 1) as f32 * self.centrality_k_percentile).round() as usize;
+            sorted[idx.min(sorted.len() - 1)].max(CENTRALITY_K_FLOOR)
+        };
+
+        // ── 3. Materialise the per-symbol cache using the chosen `k`.
+        let k = self.centrality_k;
+        let centrality: HashMap<u64, f32> = raw_scores
+            .iter()
+            .map(|(&id, &raw)| (id, raw / (raw + k)))
             .collect();
         self.centrality_cache = Some(centrality);
 
@@ -233,7 +304,7 @@ impl CodeGraph {
             .neighbors_directed(idx, Direction::Outgoing)
             .count() as f32;
         let raw = in_degree * 2.0 + out_degree;
-        raw / (raw + 15.0)
+        raw / (raw + self.centrality_k)
     }
 
     /// Pure in-degree centrality: "how many other symbols depend on this one?"
@@ -418,5 +489,106 @@ impl CodeGraph {
 impl Default for CodeGraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::Language;
+    use crate::symbol::{EdgeKind, Symbol, SymbolKind};
+
+    fn make_symbol(name: &str, line: u32) -> Symbol {
+        Symbol::new(
+            "test.rs",
+            name,
+            SymbolKind::Function,
+            line,
+            line + 1,
+            format!("fn {}()", name),
+            None,
+            String::new(),
+            Language::Rust,
+        )
+    }
+
+    /// Empty graphs fall back to the historical default `k = 15.0`.
+    #[test]
+    fn centrality_k_empty_graph_uses_default() {
+        let mut g = CodeGraph::new();
+        g.warm_caches();
+        assert!((g.centrality_k() - DEFAULT_CENTRALITY_K).abs() < f32::EPSILON);
+    }
+
+    /// With a hand-built graph, the median raw-degree score is exactly the
+    /// chosen `k` and the median symbol scores 0.5.
+    #[test]
+    fn centrality_k_is_corpus_median() {
+        let mut g = CodeGraph::new();
+        // Five symbols. We'll wire edges so their `raw = in*2 + out` values
+        // are 0, 1, 2, 4, 8 — sorted; median is 2.
+        let ids: Vec<_> = (0..5).map(|i| make_symbol(&format!("s{}", i), i)).collect();
+        let id_vals: Vec<u64> = ids.iter().map(|s| s.id).collect();
+        for s in ids {
+            g.add_symbol(s);
+        }
+
+        // s4 ← incoming x4 → raw = 8
+        for i in 0..4 {
+            g.add_edge(id_vals[i], id_vals[4], EdgeKind::Calls);
+        }
+        // s3 ← incoming x2 → raw = 4
+        g.add_edge(id_vals[0], id_vals[3], EdgeKind::Calls);
+        g.add_edge(id_vals[1], id_vals[3], EdgeKind::Calls);
+        // s2 ← incoming x1 → raw = 2
+        g.add_edge(id_vals[0], id_vals[2], EdgeKind::Calls);
+        // s1 has only outgoing edges already counted (out: s2, s3, s4 = 3).
+        // Recompute expected raws now:
+        //   s0 (out only: s2, s3, s4, s4-attempt-dedup) — outgoing = 3, in = 0 → raw = 3
+        //   s1 (out: s3, s4) → out = 2, in = 0 → raw = 2
+        //   s2 (in:1, out:0) → raw = 2
+        //   s3 (in:2, out:0) → raw = 4
+        //   s4 (in:4, out:0) → raw = 8
+        // Sorted: [2, 2, 2, 3, 4, 8] — wait, that's six values. We only have
+        // five symbols, so the actual sorted distribution is [2, 2, 3, 4, 8],
+        // median (p50) = 3. That's what we assert.
+        g.warm_caches();
+        assert!(
+            (g.centrality_k() - 3.0).abs() < f32::EPSILON,
+            "k = {}",
+            g.centrality_k()
+        );
+
+        // Median symbol (raw = 3) must score 0.5.
+        let median_score = g.centrality_score(id_vals[0]);
+        assert!(
+            (median_score - 0.5).abs() < 1e-5,
+            "median score = {}",
+            median_score
+        );
+    }
+
+    /// Operator override pins `k` regardless of corpus distribution.
+    #[test]
+    fn centrality_k_override_pins_value() {
+        let mut g = CodeGraph::new();
+        for i in 0..3 {
+            g.add_symbol(make_symbol(&format!("s{}", i), i));
+        }
+        g.set_centrality_k_override(Some(42.0));
+        g.warm_caches();
+        assert!((g.centrality_k() - 42.0).abs() < f32::EPSILON);
+    }
+
+    /// `k` is floored to avoid division by ~0 on graphs full of leaves.
+    #[test]
+    fn centrality_k_floors_to_one() {
+        let mut g = CodeGraph::new();
+        // Three symbols, no edges → all raws are 0 → percentile = 0 → floor.
+        for i in 0..3 {
+            g.add_symbol(make_symbol(&format!("s{}", i), i));
+        }
+        g.warm_caches();
+        assert!(g.centrality_k() >= 1.0, "k = {}", g.centrality_k());
     }
 }

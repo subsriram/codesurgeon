@@ -452,17 +452,18 @@ ln -s /path/to/codesurgeon/target/release/codesurgeon /usr/local/bin/codesurgeon
 
 ### Enabling debug logging
 
-Set `RUST_LOG` to see detailed output from the MCP server or CLI:
+Set `CS_LOG` (a [`tracing-subscriber`](https://docs.rs/tracing-subscriber) env-filter
+expression) to see detailed output from the MCP server or CLI. Default: `warn`.
 
 ```bash
 # Info-level (recommended for troubleshooting)
-RUST_LOG=info CS_WORKSPACE=/path/to/project codesurgeon query "my search"
+CS_LOG=info CS_WORKSPACE=/path/to/project codesurgeon query "my search"
 
 # Debug-level (verbose — shows every file indexed, every query scored)
-RUST_LOG=debug CS_WORKSPACE=/path/to/project ./target/release/codesurgeon-mcp
+CS_LOG=debug CS_WORKSPACE=/path/to/project ./target/release/codesurgeon-mcp
 
 # Trace a specific module
-RUST_LOG=cs_core::engine=debug codesurgeon query "my search"
+CS_LOG=cs_core::engine=debug codesurgeon query "my search"
 ```
 
 ## Configuration
@@ -513,6 +514,19 @@ token_rate_usd = 0.000003
 ```
 
 Run `codesurgeon config` to see the effective merged settings and their sources.
+
+## Environment variables
+
+Most settings live in `config.toml` (above). The following env vars control
+runtime concerns that don't belong in committed config:
+
+| Var | Read by | Purpose |
+|---|---|---|
+| `CS_WORKSPACE` | `codesurgeon`, `codesurgeon-mcp` | Workspace root for indexing and queries. Required when not running from inside the workspace. |
+| `CLAUDE_CODE_WORKSPACE` | `codesurgeon`, `codesurgeon-mcp` | Alias of `CS_WORKSPACE`, set automatically by Claude Code. `CS_WORKSPACE` wins if both are set. |
+| `CS_LOG` | `codesurgeon`, `codesurgeon-mcp` | [`tracing-subscriber`](https://docs.rs/tracing-subscriber) env-filter expression (e.g. `info`, `debug`, `cs_core::engine=trace`). Default: `warn`. |
+| `CS_TRACK_MANIFEST` | `codesurgeon`, `codesurgeon-mcp` | Set to `1` to overlay `[git] track_manifest = true` from the environment, omitting `manifest.json` from `.codesurgeon/.gitignore` so it can be shared across clones. |
+| `CS_BENCH_CENTRALITY_K` | `cargo run --example token_savings` | Pin the centrality smoothing constant `k` for the 20-query bench, e.g. `CS_BENCH_CENTRALITY_K=15.0` reproduces pre-#82 behaviour. Unset → corpus-derived (default). Bench-only — has no effect on the binaries. |
 
 ## Contributing
 
