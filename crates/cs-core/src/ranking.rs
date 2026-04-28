@@ -1563,6 +1563,37 @@ mod tests {
         assert_eq!(classify_direction(&g, sym), EffectiveDirection::Forward);
     }
 
+    // ── budget env-var resolvers (#96) ───────────────────────────────────
+    //
+    // These tests mutate process-wide env state and would race if run in
+    // parallel — `cargo test` partitions tests across threads. Serialise
+    // by sharing a single test that sets, asserts, unsets in sequence.
+
+    #[test]
+    fn resolve_total_and_expand_budget_env_overrides() {
+        // Default (unset) → constants.
+        std::env::remove_var("CS_REVERSE_EXPAND_TOTAL_BUDGET");
+        std::env::remove_var("CS_REVERSE_EXPAND_EXPAND_BUDGET");
+        assert_eq!(resolve_total_budget(), REVERSE_EXPAND_TOTAL_BUDGET);
+        assert_eq!(resolve_expand_budget(), REVERSE_EXPAND_EXPAND_BUDGET);
+
+        // Set → parsed value wins.
+        std::env::set_var("CS_REVERSE_EXPAND_TOTAL_BUDGET", "200");
+        std::env::set_var("CS_REVERSE_EXPAND_EXPAND_BUDGET", "1000");
+        assert_eq!(resolve_total_budget(), 200);
+        assert_eq!(resolve_expand_budget(), 1000);
+
+        // Unparseable → falls back to constants without panicking.
+        std::env::set_var("CS_REVERSE_EXPAND_TOTAL_BUDGET", "not-a-number");
+        std::env::set_var("CS_REVERSE_EXPAND_EXPAND_BUDGET", "");
+        assert_eq!(resolve_total_budget(), REVERSE_EXPAND_TOTAL_BUDGET);
+        assert_eq!(resolve_expand_budget(), REVERSE_EXPAND_EXPAND_BUDGET);
+
+        // Cleanup so other tests in the binary don't pick up these vars.
+        std::env::remove_var("CS_REVERSE_EXPAND_TOTAL_BUDGET");
+        std::env::remove_var("CS_REVERSE_EXPAND_EXPAND_BUDGET");
+    }
+
     #[test]
     fn classify_direction_balanced_anchor_is_both() {
         // Symmetric fan-out → ambiguous → Both.
