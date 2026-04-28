@@ -27,3 +27,20 @@ pub use capsule::Capsule;
 pub use engine::{CoreEngine, EngineConfig, IndexStats, SessionContext};
 pub use memory::Observation;
 pub use symbol::{Edge, EdgeKind, Symbol, SymbolKind};
+
+// ── Build identification ─────────────────────────────────────────────────────
+//
+// `GIT_SHA` and `BUILD_TIME` are baked in by `build.rs` so both binaries
+// can report which build is running. `VERSION` is the formatted string
+// surfaced by `codesurgeon --version` and `codesurgeon-mcp --version`.
+
+pub const GIT_SHA: &str = env!("CS_GIT_SHA");
+pub const BUILD_TIME: &str = env!("CS_BUILD_TIME");
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (sha ",
+    env!("CS_GIT_SHA"),
+    ", built ",
+    env!("CS_BUILD_TIME"),
+    ")"
+);

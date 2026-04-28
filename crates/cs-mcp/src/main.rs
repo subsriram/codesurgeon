@@ -413,6 +413,39 @@ fn release_pid_lock(pid_path: &Path) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Minimal CLI: respond to --version / -V / --help / -h before spinning
+    // up the JSON-RPC reader. Everything else is treated as MCP traffic
+    // on stdin. Kept hand-rolled (no clap) because the binary's hot path
+    // is JSON-RPC framing — adding clap to parse one flag would pull in
+    // a build-time dep for no runtime benefit.
+    let args: Vec<String> = std::env::args().collect();
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("codesurgeon-mcp {}", cs_core::VERSION);
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!(
+                    "codesurgeon-mcp {}\n\
+                     \n\
+                     MCP (Model Context Protocol) server for codesurgeon.\n\
+                     Speaks JSON-RPC 2.0 over stdin/stdout.\n\
+                     \n\
+                     Configuration via environment variables:\n\
+                       CS_WORKSPACE   path to the workspace root (required)\n\
+                       CS_LOG         tracing-subscriber filter (default: warn)\n\
+                     \n\
+                     Add to Claude Code with `claude mcp add` — see the\n\
+                     repository README.",
+                    cs_core::VERSION
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // Log to stderr so it doesn't pollute the MCP stdio channel
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

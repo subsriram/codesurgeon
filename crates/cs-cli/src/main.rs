@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "codesurgeon",
-    version,
+    version = cs_core::VERSION,
     about = "Local-first codebase context engine for AI coding agents"
 )]
 struct Cli {
