@@ -659,9 +659,12 @@ fn expand_from_anchors_directional(
     let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
     let mut out: Vec<(u64, f32)> = Vec::new();
     let mut depth_emitted: [usize; 8] = [0; 8];
-    let mut queue: VecDeque<(u64, u32)> = seed_ids.iter().map(|&id| (id, 0)).collect();
+    // Per-seed depth attribution (#96): track which root each emission
+    // descends from. Cheap to maintain — one HashMap entry per seed.
+    let mut per_seed_depth: HashMap<u64, [usize; 8]> = HashMap::new();
+    let mut queue: VecDeque<(u64, u32, u64)> = seed_ids.iter().map(|&id| (id, 0, id)).collect();
 
-    while let Some((id, depth)) = queue.pop_front() {
+    while let Some((id, depth, parent_seed)) = queue.pop_front() {
         if depth >= max_depth {
             continue;
         }
@@ -726,27 +729,91 @@ fn expand_from_anchors_directional(
                 let next_depth = depth + 1;
                 let bucket = (next_depth as usize).min(depth_emitted.len() - 1);
                 depth_emitted[bucket] += 1;
+                let per_seed = per_seed_depth.entry(parent_seed).or_insert([0; 8]);
+                per_seed[bucket] += 1;
                 out.push((cid, score));
                 if out.len() >= max_total {
-                    tracing::debug!(
-                        "expand-bfs [{:?}]: emitted {} (cap), depth_dist={:?}",
+                    log_expand_stats(
+                        "expand-bfs",
                         direction,
-                        out.len(),
-                        &depth_emitted[1..]
+                        graph,
+                        &out,
+                        &depth_emitted,
+                        &per_seed_depth,
+                        true,
                     );
                     return out;
                 }
-                queue.push_back((cid, next_depth));
+                queue.push_back((cid, next_depth, parent_seed));
             }
         }
     }
-    tracing::debug!(
-        "expand-bfs [{:?}]: emitted {}, depth_dist={:?}",
+    log_expand_stats(
+        "expand-bfs",
         direction,
-        out.len(),
-        &depth_emitted[1..]
+        graph,
+        &out,
+        &depth_emitted,
+        &per_seed_depth,
+        false,
     );
     out
+}
+
+/// Emit the expand-walker debug log. Centralises the formatting so both
+/// walkers (#96) produce the same shape:
+///
+/// ```text
+/// expand-bfs [Forward]: emitted 36 (cap), depth_dist=[7, 29, 0, ...]
+///   seed=12345 (Axes::hist) depth_dist=[3, 5, 0, ...]
+///   seed=67890 (pyplot::hist) depth_dist=[4, 24, 0, ...]
+///   …
+/// expand-bfs emissions: lib/.../Axes::hist::do_thing, lib/.../helper, …
+/// ```
+fn log_expand_stats(
+    label: &str,
+    direction: WalkDirection,
+    graph: &CodeGraph,
+    out: &[(u64, f32)],
+    depth_emitted: &[usize; 8],
+    per_seed_depth: &HashMap<u64, [usize; 8]>,
+    cap_hit: bool,
+) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let suffix = if cap_hit { " (cap)" } else { "" };
+    tracing::debug!(
+        "{} [{:?}]: emitted {}{}, depth_dist={:?}",
+        label,
+        direction,
+        out.len(),
+        suffix,
+        &depth_emitted[1..]
+    );
+    // Per-seed buckets — sorted by total emissions so the noisiest
+    // subtree shows up first in the log.
+    let mut by_seed: Vec<(u64, [usize; 8])> = per_seed_depth
+        .iter()
+        .map(|(&id, dist)| (id, *dist))
+        .collect();
+    by_seed.sort_by_key(|(_, d)| std::cmp::Reverse(d.iter().sum::<usize>()));
+    for (seed_id, dist) in &by_seed {
+        let name = graph
+            .get_symbol(*seed_id)
+            .map(|s| s.fqn.as_str())
+            .unwrap_or("<unknown>");
+        tracing::debug!("  seed={} ({}) depth_dist={:?}", seed_id, name, &dist[1..]);
+    }
+    // Pre-RRF emission spot-check (#96): list every FQN the walk
+    // emitted so the user can grep for an expected fix-site name and
+    // disambiguate "walk found it but RRF dropped it" from "walk
+    // never traversed there at all".
+    let fqns: Vec<&str> = out
+        .iter()
+        .filter_map(|(id, _)| graph.get_symbol(*id).map(|s| s.fqn.as_str()))
+        .collect();
+    tracing::debug!("{} emissions: {}", label, fqns.join(", "));
 }
 
 /// Best-first reverse-edge expansion (issue #69 option 3, deferred from
@@ -871,6 +938,7 @@ fn expand_best_first_directional(
     let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
     let mut out: Vec<(u64, f32)> = Vec::new();
     let mut depth_emitted: [usize; 8] = [0; 8];
+    let mut per_seed_depth: HashMap<u64, [usize; 8]> = HashMap::new();
     let mut pq: BinaryHeap<PqItem> = BinaryHeap::new();
     let mut subtree_visits: HashMap<u64, usize> = HashMap::new();
     let mut total_expansions: usize = 0;
@@ -933,16 +1001,25 @@ fn expand_best_first_directional(
             let out_score = 1.0 / (next_depth as f32 + 1.0);
             let bucket = (next_depth as usize).min(depth_emitted.len() - 1);
             depth_emitted[bucket] += 1;
+            let per_seed = per_seed_depth.entry(item.parent_seed).or_insert([0; 8]);
+            per_seed[bucket] += 1;
             out.push((s.id, out_score));
             *subtree_visits.entry(item.parent_seed).or_insert(0) += 1;
 
             if out.len() >= total_budget {
                 tracing::debug!(
-                    "expand-best-first [{:?}]: emitted {} (cap), expansions={}, depth_dist={:?}",
+                    "expand-best-first [{:?}]: expansions={}",
                     direction,
-                    out.len(),
-                    total_expansions,
-                    &depth_emitted[1..]
+                    total_expansions
+                );
+                log_expand_stats(
+                    "expand-best-first",
+                    direction,
+                    graph,
+                    &out,
+                    &depth_emitted,
+                    &per_seed_depth,
+                    true,
                 );
                 return out;
             }
@@ -957,11 +1034,18 @@ fn expand_best_first_directional(
     }
 
     tracing::debug!(
-        "expand-best-first [{:?}]: emitted {}, expansions={}, depth_dist={:?}",
+        "expand-best-first [{:?}]: expansions={}",
         direction,
-        out.len(),
-        total_expansions,
-        &depth_emitted[1..]
+        total_expansions
+    );
+    log_expand_stats(
+        "expand-best-first",
+        direction,
+        graph,
+        &out,
+        &depth_emitted,
+        &per_seed_depth,
+        false,
     );
     out
 }

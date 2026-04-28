@@ -149,7 +149,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Log to stderr so debug output doesn't pollute the stdout JSON
+    // emitted by `--json` modes. Mirrors `codesurgeon-mcp`, where stdout
+    // is the JSON-RPC channel. Reported in #96 — the cs-benchmark panel
+    // had to `awk '/^{/{flag=1} flag'` to recover JSON when running with
+    // `CS_LOG=cs_core::ranking=debug`.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(std::env::var("CS_LOG").unwrap_or_else(|_| "warn".to_string()))
         .init();
 
