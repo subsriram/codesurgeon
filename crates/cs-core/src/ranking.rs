@@ -45,30 +45,30 @@ pub(crate) const ANCHOR_FILE_BUDGET: usize = 5;
 // For symptom-anchored bug reports the user names the error class or a trigger
 // symbol, but the fix site is reached only by walking **backward** through
 // callers. Reverse expansion seeds on exception-class anchors and BFS-walks
-// their callers/raisers up to `REVERSE_EXPAND_MAX_DEPTH` hops, injecting the
+// their callers/raisers up to `EXPAND_MAX_DEPTH` hops, injecting the
 // walk results into the RRF fusion alongside the direct anchor list.
 
 /// Max hops to BFS backward through `dependents()` from each seed anchor.
 /// 3 is the tightest depth that covers the motivating sympy-21379 case
 /// (`PolynomialError ← parallel_poly_from_expr ← gcd ← Mod.eval`).
-pub(crate) const REVERSE_EXPAND_MAX_DEPTH: u32 = 3;
+pub(crate) const EXPAND_MAX_DEPTH: u32 = 3;
 /// Per-hop cap on the number of callers expanded. Prevents exponential blowup
 /// when walking from an exception class that's imported/raised in hundreds of
 /// sites. Selection within a hop is driven by term overlap with the query.
-pub(crate) const REVERSE_EXPAND_FAN_OUT: usize = 5;
+pub(crate) const EXPAND_FAN_OUT: usize = 5;
 /// Overall cap on the reverse-expansion candidate list. Mirrors
 /// `ANCHOR_CANDIDATES` — the walk is precision-first, not recall-first.
-pub(crate) const REVERSE_EXPAND_CANDIDATES: usize = 20;
+pub(crate) const EXPAND_CANDIDATES: usize = 20;
 /// RRF k for the reverse-expansion list. Sits between `ANCHOR_RRF_K = 15`
 /// (aggressive, precision-first) and `RRF_K = 60` (default): seeds-reachable
 /// symbols contribute meaningfully without overwhelming direct-anchor hits.
-pub(crate) const REVERSE_EXPAND_RRF_K: f32 = 30.0;
+pub(crate) const EXPAND_RRF_K: f32 = 30.0;
 /// Upper bound on a seed's direct-caller count. Anchors with more callers are
 /// skipped — they're hubs (e.g. `exp`, `symbols`) whose reverse set would
 /// flood the capsule. Exception classes in real codebases typically have
 /// dozens-to-low-hundreds of raisers; this caps the seed set but the per-hop
-/// `REVERSE_EXPAND_FAN_OUT` still bounds each walk.
-pub(crate) const REVERSE_EXPAND_SEED_MAX_CALLERS: usize = 500;
+/// `EXPAND_FAN_OUT` still bounds each walk.
+pub(crate) const EXPAND_SEED_FANOUT_LIMIT: usize = 500;
 /// Weight applied to body-text semantic similarity when ranking per-hop
 /// callers inside the reverse-expand walk (issue #69 v2). Multiplies the
 /// `[0, 1]` cosine similarity between the query embedding and each caller's
@@ -81,15 +81,15 @@ pub(crate) const REVERSE_EXPAND_SEED_MAX_CALLERS: usize = 500;
 ///
 /// Only applied when the `embeddings` feature is active AND a per-symbol
 /// embedding lookup is provided to `reverse_expand_from_anchors`.
-pub(crate) const REVERSE_EXPAND_SEMANTIC_WEIGHT: f32 = 2.0;
+pub(crate) const EXPAND_SEMANTIC_WEIGHT: f32 = 2.0;
 
 /// Density-aware fan-out parameters (issue #69 v1, originally landed in
 /// `0f35b33` and reverted in `5516865`). Re-introduced behind the
 /// `CS_REVERSE_EXPAND_STRATEGY` env-var gate so the cs-benchmark diagnostic
 /// panel can score it on a stratified panel without making it the default
 /// — see `docs/reverse_expand_panel.md` in the cs-benchmark repo.
-pub(crate) const REVERSE_EXPAND_FAN_OUT_CAP: usize = 25;
-pub(crate) const REVERSE_EXPAND_FAN_OUT_DIVISOR: usize = 5;
+pub(crate) const EXPAND_FAN_OUT_CAP: usize = 25;
+pub(crate) const EXPAND_FAN_OUT_DIVISOR: usize = 5;
 
 /// Best-first reverse-expand parameters (issue #69 option 3, deferred from
 /// the original v1 — never landed before now). The walk replaces the fixed
@@ -99,39 +99,67 @@ pub(crate) const REVERSE_EXPAND_FAN_OUT_DIVISOR: usize = 5;
 /// regardless of hop. `TOTAL_BUDGET` is the cap on output candidates;
 /// `EXPAND_BUDGET` is the cap on graph expansions performed during the walk
 /// (so a dense seed doesn't enumerate the whole graph chasing low-scoring
-/// nodes). Both larger than the BFS's `REVERSE_EXPAND_CANDIDATES = 20`
+/// nodes). Both larger than the BFS's `EXPAND_CANDIDATES = 20`
 /// because best-first is selective by construction — a generous expand
 /// budget rarely emits a generous output.
-pub(crate) const REVERSE_EXPAND_TOTAL_BUDGET: usize = 40;
-pub(crate) const REVERSE_EXPAND_EXPAND_BUDGET: usize = 200;
+pub(crate) const EXPAND_TOTAL_BUDGET: usize = 40;
+pub(crate) const EXPAND_GRAPH_BUDGET: usize = 200;
 
 /// UCB-style exploration weight applied to the priority of frontier
 /// candidates whose parent-seed subtree has been under-visited. Used by
 /// `v3b` only. The classic UCB1 formula uses `c = sqrt(2)`; we use a
 /// smaller value so exploration nudges the walk rather than dominating
 /// the per-candidate signal.
-pub(crate) const REVERSE_EXPAND_UCB_C: f32 = 0.5;
+pub(crate) const EXPAND_UCB_C: f32 = 0.5;
 
-/// Read `CS_REVERSE_EXPAND_TOTAL_BUDGET` and
-/// `CS_REVERSE_EXPAND_EXPAND_BUDGET` from the environment; fall back to
-/// `REVERSE_EXPAND_TOTAL_BUDGET` / `REVERSE_EXPAND_EXPAND_BUDGET`
-/// constants if unset or unparseable. Lets the cs-benchmark panel
-/// ablate budget without rebuilding the binary — issue #96 step 1.
-pub(crate) fn resolve_total_budget() -> usize {
-    std::env::var("CS_REVERSE_EXPAND_TOTAL_BUDGET")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(REVERSE_EXPAND_TOTAL_BUDGET)
+/// Read an env-var-overridable budget value, accepting a deprecated
+/// alias for one release cycle. New callers should set `primary`;
+/// `legacy` is logged at warn level when set so the user gets a
+/// pointer to the new name. Issue #96 / #95 rename.
+fn resolve_budget(primary: &str, legacy: &str, default: usize) -> usize {
+    if let Ok(v) = std::env::var(primary) {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    if let Ok(v) = std::env::var(legacy) {
+        tracing::warn!(
+            "{} is deprecated; use {} instead (will be removed)",
+            legacy,
+            primary
+        );
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    default
 }
+
+/// Read `CS_EXPAND_TOTAL_BUDGET` (or the deprecated
+/// `CS_REVERSE_EXPAND_TOTAL_BUDGET` alias) from the environment;
+/// fall back to the constant when unset or unparseable. Lets the
+/// cs-benchmark panel ablate budget without rebuilding the binary —
+/// issue #96 step 1.
+pub(crate) fn resolve_total_budget() -> usize {
+    resolve_budget(
+        "CS_EXPAND_TOTAL_BUDGET",
+        "CS_REVERSE_EXPAND_TOTAL_BUDGET",
+        EXPAND_TOTAL_BUDGET,
+    )
+}
+
+/// Read `CS_EXPAND_GRAPH_BUDGET` (or the deprecated
+/// `CS_REVERSE_EXPAND_EXPAND_BUDGET` alias) from the environment.
 pub(crate) fn resolve_expand_budget() -> usize {
-    std::env::var("CS_REVERSE_EXPAND_EXPAND_BUDGET")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(REVERSE_EXPAND_EXPAND_BUDGET)
+    resolve_budget(
+        "CS_EXPAND_GRAPH_BUDGET",
+        "CS_REVERSE_EXPAND_EXPAND_BUDGET",
+        EXPAND_GRAPH_BUDGET,
+    )
 }
 
 /// Per-hop fan-out policy for `reverse_expand_from_anchors`. The historical
-/// default (`Fixed(REVERSE_EXPAND_FAN_OUT)`) explores top-N callers
+/// default (`Fixed(EXPAND_FAN_OUT)`) explores top-N callers
 /// uniformly across hops. `DensityScaled` lets dense seeds spend more
 /// budget than sparse ones — see issue #69 option 2.
 #[derive(Debug, Clone, Copy)]
@@ -196,7 +224,7 @@ impl FanOutPolicy {
 /// Reverse-edge expansion strategy. Resolved once per engine call from
 /// `CS_REVERSE_EXPAND_STRATEGY` (default `V2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReverseExpandStrategy {
+pub enum ExpandStrategy {
     /// Skip reverse-expand entirely. Equivalent to `reverse_expand_anchors=false`.
     None,
     /// #67 only. Fixed fan_out=5, no query-term overlap, no semantic.
@@ -219,7 +247,7 @@ pub enum ReverseExpandStrategy {
     /// where BFS's uniform fan-out wastes budget. Issue #69 option 3.
     V3a,
     /// `V3a` + UCB exploration bonus on the parent-seed subtree. Adds
-    /// `REVERSE_EXPAND_UCB_C * sqrt(ln(N) / n)` to each candidate's
+    /// `EXPAND_UCB_C * sqrt(ln(N) / n)` to each candidate's
     /// priority, where `N` is total expansions in the walk and `n` is
     /// expansions within the candidate's seed subtree. Pulls the walk
     /// toward under-sampled subtrees when the per-candidate signal is
@@ -228,13 +256,25 @@ pub enum ReverseExpandStrategy {
     V3b,
 }
 
-impl ReverseExpandStrategy {
-    /// Read `CS_REVERSE_EXPAND_STRATEGY` from the environment. Unset or
-    /// unrecognized → `V2` (current main behavior). Logged at warn level
-    /// so misconfigured benchmark runs don't silently fall back.
+impl ExpandStrategy {
+    /// Read `CS_EXPAND_STRATEGY` (or the deprecated alias
+    /// `CS_REVERSE_EXPAND_STRATEGY`) from the environment. Unset or
+    /// unrecognized → `V2` (current main behavior). Logged at warn
+    /// level so misconfigured benchmark runs don't silently fall back.
     pub fn from_env() -> Self {
-        match std::env::var("CS_REVERSE_EXPAND_STRATEGY")
-            .ok()
+        let (name, raw) = match std::env::var("CS_EXPAND_STRATEGY") {
+            Ok(v) => ("CS_EXPAND_STRATEGY", Some(v)),
+            Err(_) => match std::env::var("CS_REVERSE_EXPAND_STRATEGY") {
+                Ok(v) => {
+                    tracing::warn!(
+                        "CS_REVERSE_EXPAND_STRATEGY is deprecated; use CS_EXPAND_STRATEGY instead"
+                    );
+                    ("CS_REVERSE_EXPAND_STRATEGY", Some(v))
+                }
+                Err(_) => ("CS_EXPAND_STRATEGY", None),
+            },
+        };
+        match raw
             .as_deref()
             .map(str::trim)
             .map(str::to_ascii_lowercase)
@@ -249,10 +289,7 @@ impl ReverseExpandStrategy {
             Some("v3a") => Self::V3a,
             Some("v3b") => Self::V3b,
             Some(other) => {
-                tracing::warn!(
-                    "CS_REVERSE_EXPAND_STRATEGY={:?} unrecognized, falling back to v2",
-                    other
-                );
+                tracing::warn!("{}={:?} unrecognized, falling back to v2", name, other);
                 Self::V2
             }
         }
@@ -261,11 +298,11 @@ impl ReverseExpandStrategy {
     pub(crate) fn fan_out_policy(&self) -> FanOutPolicy {
         match self {
             Self::V1a | Self::V1ab => FanOutPolicy::DensityScaled {
-                floor: REVERSE_EXPAND_FAN_OUT,
-                cap: REVERSE_EXPAND_FAN_OUT_CAP,
-                divisor: REVERSE_EXPAND_FAN_OUT_DIVISOR,
+                floor: EXPAND_FAN_OUT,
+                cap: EXPAND_FAN_OUT_CAP,
+                divisor: EXPAND_FAN_OUT_DIVISOR,
             },
-            _ => FanOutPolicy::Fixed(REVERSE_EXPAND_FAN_OUT),
+            _ => FanOutPolicy::Fixed(EXPAND_FAN_OUT),
         }
     }
 
@@ -548,7 +585,7 @@ pub(crate) fn is_trivial_exception_pivot(sym: &Symbol) -> bool {
 /// `None` for a given id) falls back to pure term-overlap + centrality —
 /// this is the behaviour on no-embeddings builds and on symbols with no
 /// indexed body (e.g. synthetic `Import` entries, already filtered). The
-/// weight is `REVERSE_EXPAND_SEMANTIC_WEIGHT`. See issue #69 v2.
+/// weight is `EXPAND_SEMANTIC_WEIGHT`. See issue #69 v2.
 ///
 /// The return order is BFS order (depth-ascending), preserved for RRF.
 pub(crate) fn reverse_expand_from_anchors(
@@ -677,7 +714,7 @@ fn expand_from_anchors_directional(
                     .clamp(0.0, 1.0);
                 (
                     s.id,
-                    overlap + REVERSE_EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1,
+                    overlap + EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1,
                 )
             })
             .collect();
@@ -719,9 +756,9 @@ fn expand_from_anchors_directional(
 /// - Seeds enter the queue at infinite priority so they're popped first.
 /// - On each pop we score *all* unvisited dependents of the popped node
 ///   using the same mixed signal as the BFS variant (lex overlap +
-///   `REVERSE_EXPAND_SEMANTIC_WEIGHT * sim` − `0.1 * centrality`).
+///   `EXPAND_SEMANTIC_WEIGHT * sim` − `0.1 * centrality`).
 /// - When `exploration_bonus` is true (`v3b`), each candidate's priority
-///   gets an additional `REVERSE_EXPAND_UCB_C * sqrt(ln(N) / n)` term,
+///   gets an additional `EXPAND_UCB_C * sqrt(ln(N) / n)` term,
 ///   where `N` is the running total of expansions and `n` is expansions
 ///   that originated from the same parent seed. Pulls the walk toward
 ///   under-sampled subtrees when the per-candidate signal is noisy.
@@ -883,13 +920,12 @@ fn expand_best_first_directional(
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
 
-            let mut priority =
-                overlap + REVERSE_EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1;
+            let mut priority = overlap + EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1;
 
             if exploration_bonus {
                 let n_sub = (*subtree_visits.get(&item.parent_seed).unwrap_or(&0)).max(1) as f32;
                 let n_total = total_expansions.max(1) as f32;
-                let bonus = REVERSE_EXPAND_UCB_C * (n_total.ln() / n_sub).sqrt();
+                let bonus = EXPAND_UCB_C * (n_total.ln() / n_sub).sqrt();
                 priority += bonus;
             }
 
@@ -1571,27 +1607,50 @@ mod tests {
 
     #[test]
     fn resolve_total_and_expand_budget_env_overrides() {
-        // Default (unset) → constants.
-        std::env::remove_var("CS_REVERSE_EXPAND_TOTAL_BUDGET");
-        std::env::remove_var("CS_REVERSE_EXPAND_EXPAND_BUDGET");
-        assert_eq!(resolve_total_budget(), REVERSE_EXPAND_TOTAL_BUDGET);
-        assert_eq!(resolve_expand_budget(), REVERSE_EXPAND_EXPAND_BUDGET);
+        let all_vars = [
+            "CS_EXPAND_TOTAL_BUDGET",
+            "CS_EXPAND_GRAPH_BUDGET",
+            "CS_REVERSE_EXPAND_TOTAL_BUDGET",
+            "CS_REVERSE_EXPAND_EXPAND_BUDGET",
+        ];
+        for v in all_vars {
+            std::env::remove_var(v);
+        }
 
-        // Set → parsed value wins.
-        std::env::set_var("CS_REVERSE_EXPAND_TOTAL_BUDGET", "200");
-        std::env::set_var("CS_REVERSE_EXPAND_EXPAND_BUDGET", "1000");
+        // Default (unset) → constants.
+        assert_eq!(resolve_total_budget(), EXPAND_TOTAL_BUDGET);
+        assert_eq!(resolve_expand_budget(), EXPAND_GRAPH_BUDGET);
+
+        // New names win.
+        std::env::set_var("CS_EXPAND_TOTAL_BUDGET", "200");
+        std::env::set_var("CS_EXPAND_GRAPH_BUDGET", "1000");
         assert_eq!(resolve_total_budget(), 200);
         assert_eq!(resolve_expand_budget(), 1000);
 
-        // Unparseable → falls back to constants without panicking.
-        std::env::set_var("CS_REVERSE_EXPAND_TOTAL_BUDGET", "not-a-number");
-        std::env::set_var("CS_REVERSE_EXPAND_EXPAND_BUDGET", "");
-        assert_eq!(resolve_total_budget(), REVERSE_EXPAND_TOTAL_BUDGET);
-        assert_eq!(resolve_expand_budget(), REVERSE_EXPAND_EXPAND_BUDGET);
+        // New names take precedence over deprecated aliases when both
+        // are set.
+        std::env::set_var("CS_REVERSE_EXPAND_TOTAL_BUDGET", "999");
+        std::env::set_var("CS_REVERSE_EXPAND_EXPAND_BUDGET", "9999");
+        assert_eq!(resolve_total_budget(), 200);
+        assert_eq!(resolve_expand_budget(), 1000);
 
-        // Cleanup so other tests in the binary don't pick up these vars.
+        // Without new names, deprecated aliases are read (with a warn).
+        std::env::remove_var("CS_EXPAND_TOTAL_BUDGET");
+        std::env::remove_var("CS_EXPAND_GRAPH_BUDGET");
+        assert_eq!(resolve_total_budget(), 999);
+        assert_eq!(resolve_expand_budget(), 9999);
+
+        // Unparseable → falls back to constants.
+        std::env::set_var("CS_EXPAND_TOTAL_BUDGET", "not-a-number");
+        std::env::set_var("CS_EXPAND_GRAPH_BUDGET", "");
         std::env::remove_var("CS_REVERSE_EXPAND_TOTAL_BUDGET");
         std::env::remove_var("CS_REVERSE_EXPAND_EXPAND_BUDGET");
+        assert_eq!(resolve_total_budget(), EXPAND_TOTAL_BUDGET);
+        assert_eq!(resolve_expand_budget(), EXPAND_GRAPH_BUDGET);
+
+        for v in all_vars {
+            std::env::remove_var(v);
+        }
     }
 
     #[test]

@@ -22,11 +22,10 @@ use crate::ranking::{
     is_trivial_exception_pivot, query_terms_for_reverse_expand, resolve_adjacents,
     resolve_expand_budget, resolve_total_budget, reverse_expand_best_first,
     reverse_expand_from_anchors, rrf_merge_ks, select_adjacents, EffectiveDirection,
-    ExpandDirection, ReverseExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET,
-    ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST,
-    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES,
-    REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
-    STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
+    ExpandDirection, ExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF,
+    ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, EXPAND_CANDIDATES,
+    EXPAND_MAX_DEPTH, EXPAND_RRF_K, EXPAND_SEED_FANOUT_LIMIT, GRAPH_CANDIDATES,
+    MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2653,7 +2652,7 @@ impl CoreEngine {
         // - `CS_EXPAND_DIRECTION` chooses where to walk from each anchor
         //   (auto/forward/reverse/both). Default auto — per-anchor
         //   classifier reads off kind + fan-out ratio. Issue #95.
-        let strategy = ReverseExpandStrategy::from_env();
+        let strategy = ExpandStrategy::from_env();
         let direction = ExpandDirection::from_env();
         if strategy.is_unimplemented() {
             tracing::warn!(
@@ -2663,7 +2662,7 @@ impl CoreEngine {
         }
 
         let reverse_results: Vec<(u64, f32)> = if !self.config.reverse_expand_anchors
-            || strategy == ReverseExpandStrategy::None
+            || strategy == ExpandStrategy::None
             || strategy.is_unimplemented()
         {
             Vec::new()
@@ -2691,12 +2690,12 @@ impl CoreEngine {
                     matches!(dir, EffectiveDirection::Forward | EffectiveDirection::Both);
                 let do_reverse =
                     matches!(dir, EffectiveDirection::Reverse | EffectiveDirection::Both);
-                if do_forward && graph.dependencies(*id).len() <= REVERSE_EXPAND_SEED_MAX_CALLERS {
+                if do_forward && graph.dependencies(*id).len() <= EXPAND_SEED_FANOUT_LIMIT {
                     forward_seeds.push(*id);
                 }
                 if do_reverse
                     && is_reverse_expand_seed(sym)
-                    && graph.dependents(*id).len() <= REVERSE_EXPAND_SEED_MAX_CALLERS
+                    && graph.dependents(*id).len() <= EXPAND_SEED_FANOUT_LIMIT
                 {
                     reverse_seeds.push(*id);
                 }
@@ -2734,8 +2733,8 @@ impl CoreEngine {
 
                 // Split budget proportionally when both directions are active.
                 // When only one direction has seeds, that direction gets the
-                // full budget. `CS_REVERSE_EXPAND_TOTAL_BUDGET` and
-                // `CS_REVERSE_EXPAND_EXPAND_BUDGET` env vars override the
+                // full budget. `CS_EXPAND_TOTAL_BUDGET` and
+                // `CS_EXPAND_GRAPH_BUDGET` env vars override the
                 // constants — issue #96 step 1 (ablate budget without
                 // rebuilding the binary).
                 let total_budget = resolve_total_budget();
@@ -2761,7 +2760,7 @@ impl CoreEngine {
                             &graph,
                             &forward_seeds,
                             &terms_owned,
-                            REVERSE_EXPAND_MAX_DEPTH,
+                            EXPAND_MAX_DEPTH,
                             fwd_total,
                             fwd_expand,
                             semantic_ref,
@@ -2770,15 +2769,15 @@ impl CoreEngine {
                     } else {
                         let policy = strategy.fan_out_policy();
                         let cap = if rev_total == 0 {
-                            REVERSE_EXPAND_CANDIDATES
+                            EXPAND_CANDIDATES
                         } else {
-                            REVERSE_EXPAND_CANDIDATES / 2
+                            EXPAND_CANDIDATES / 2
                         };
                         forward_expand_from_anchors(
                             &graph,
                             &forward_seeds,
                             &terms_owned,
-                            REVERSE_EXPAND_MAX_DEPTH,
+                            EXPAND_MAX_DEPTH,
                             policy,
                             cap,
                             semantic_ref,
@@ -2793,7 +2792,7 @@ impl CoreEngine {
                             &graph,
                             &reverse_seeds,
                             &terms_owned,
-                            REVERSE_EXPAND_MAX_DEPTH,
+                            EXPAND_MAX_DEPTH,
                             rev_total,
                             rev_expand,
                             semantic_ref,
@@ -2802,15 +2801,15 @@ impl CoreEngine {
                     } else {
                         let policy = strategy.fan_out_policy();
                         let cap = if fwd_total == 0 {
-                            REVERSE_EXPAND_CANDIDATES
+                            EXPAND_CANDIDATES
                         } else {
-                            REVERSE_EXPAND_CANDIDATES / 2
+                            EXPAND_CANDIDATES / 2
                         };
                         reverse_expand_from_anchors(
                             &graph,
                             &reverse_seeds,
                             &terms_owned,
-                            REVERSE_EXPAND_MAX_DEPTH,
+                            EXPAND_MAX_DEPTH,
                             policy,
                             cap,
                             semantic_ref,
@@ -2856,7 +2855,7 @@ impl CoreEngine {
         // lost the target to body-field noise. Traceback frames sit at the
         // most aggressive `k` (TRACEBACK_RRF_K). Reverse/forward expansion
         // sits between anchors and the default retrievers
-        // (`REVERSE_EXPAND_RRF_K`).
+        // (`EXPAND_RRF_K`).
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
@@ -2866,7 +2865,7 @@ impl CoreEngine {
                 (&ann_results, RRF_K),
                 (&anchor_results, ANCHOR_RRF_K),
                 (&traceback_results, TRACEBACK_RRF_K),
-                (&reverse_results, REVERSE_EXPAND_RRF_K),
+                (&reverse_results, EXPAND_RRF_K),
             ])
         };
         #[cfg(not(feature = "embeddings"))]
@@ -2875,7 +2874,7 @@ impl CoreEngine {
             (&graph_results, RRF_K),
             (&anchor_results, ANCHOR_RRF_K),
             (&traceback_results, TRACEBACK_RRF_K),
-            (&reverse_results, REVERSE_EXPAND_RRF_K),
+            (&reverse_results, EXPAND_RRF_K),
         ]);
 
         let graph = self.graph.read();
