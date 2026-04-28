@@ -156,6 +156,24 @@ pub struct EngineConfig {
     /// to opt into the pre-#72 behaviour. Explicit `save_observation` calls
     /// (agent-attested memory) are unaffected.
     pub auto_observations: bool,
+
+    /// Percentile of the raw-degree distribution (`in*2 + out`) used to derive
+    /// the smoothing constant `k` in `CodeGraph::centrality_score`. The value
+    /// at this percentile becomes `k`, so the symbol at that percentile scores
+    /// 0.5. Default: 0.5 (median).
+    ///
+    /// Set via `[ranking] centrality_k_percentile = 0.75` in `config.toml`.
+    /// Range `[0.0, 1.0]`; out-of-range values are clamped.
+    /// Ignored when `centrality_k_override` is set.
+    pub centrality_k_percentile: f32,
+
+    /// Optional explicit override for the centrality smoothing constant `k`.
+    /// When `Some(k)`, the percentile derivation is skipped and `k` is pinned.
+    /// Useful for reproducing pre-#82 behaviour (`Some(15.0)`) or for ablation
+    /// studies. Default: `None` (corpus-derived).
+    ///
+    /// Set via `[ranking] centrality_k = 15.0` in `config.toml`.
+    pub centrality_k_override: Option<f32>,
 }
 
 /// Controls adjacent-symbol body fraction in context capsules.
@@ -215,6 +233,8 @@ impl EngineConfig {
             token_rate_usd: 0.000003,
             reverse_expand_anchors: true,
             auto_observations: false,
+            centrality_k_percentile: crate::graph::DEFAULT_CENTRALITY_K_PERCENTILE,
+            centrality_k_override: None,
         }
     }
 
@@ -271,6 +291,17 @@ pub struct IndexStats {
     pub manifest_file_count: Option<u64>,
     /// ISO-8601 timestamp from the manifest's `updated_at` field, if present.
     pub manifest_updated_at: Option<String>,
+    /// Smoothing constant currently in use by `CodeGraph::centrality_score`.
+    /// Either derived from the corpus degree distribution at index time, or
+    /// pinned via `[ranking] centrality_k` in `config.toml`. Reported so the
+    /// chosen value is observable from `index_status` / `get_stats`.
+    pub centrality_k: f32,
+    /// Percentile of the raw-degree distribution used to derive `centrality_k`.
+    /// Reflects the configured value; ignored at runtime when an override is set.
+    pub centrality_k_percentile: f32,
+    /// True when `[ranking] centrality_k` pinned the value, bypassing the
+    /// corpus-derived percentile.
+    pub centrality_k_overridden: bool,
 }
 
 /// Return value of `get_session_context`.
@@ -391,6 +422,16 @@ impl CoreEngine {
         let graph = Arc::new(RwLock::new(CodeGraph::new()));
         let search = Arc::new(Mutex::new(SearchIndex::new()?));
 
+        // Apply caller-supplied ranking config to the freshly-built graph
+        // before any `warm_caches()` call. (Workspace-level overrides from
+        // `.codesurgeon/config.toml` are applied a few lines below, after
+        // `IndexingConfig` is loaded.)
+        {
+            let mut g = graph.write();
+            g.set_centrality_k_percentile(config.centrality_k_percentile);
+            g.set_centrality_k_override(config.centrality_k_override);
+        }
+
         // Load optional configs from .codesurgeon/config.toml
         let config_path = config
             .workspace_root
@@ -426,6 +467,19 @@ impl CoreEngine {
         }
         if indexing_config.auto_observations {
             config.auto_observations = true;
+        }
+        if let Some(p) = indexing_config.centrality_k_percentile {
+            config.centrality_k_percentile = p;
+        }
+        if let Some(k) = indexing_config.centrality_k_override {
+            config.centrality_k_override = Some(k);
+        }
+        // Re-apply ranking config to the graph in case the workspace TOML
+        // overrode the caller-supplied defaults above.
+        {
+            let mut g = graph.write();
+            g.set_centrality_k_percentile(config.centrality_k_percentile);
+            g.set_centrality_k_override(config.centrality_k_override);
         }
 
         // Write .codesurgeon/.gitignore if absent, excluding index.db always
@@ -1744,6 +1798,7 @@ impl CoreEngine {
     pub fn index_stats(&self) -> Result<IndexStats> {
         let db = self.db.lock();
         let manifest = self.read_manifest();
+        let centrality_k = self.graph.read().centrality_k();
         Ok(IndexStats {
             symbol_count: db.symbol_count()?,
             edge_count: db.edge_count()?,
@@ -1754,6 +1809,9 @@ impl CoreEngine {
             xcode_mcp_available: detect_xcode_mcp(),
             manifest_file_count: manifest.as_ref().map(|m| m.files.len() as u64),
             manifest_updated_at: manifest.map(|m| m.updated_at),
+            centrality_k,
+            centrality_k_percentile: self.config.centrality_k_percentile,
+            centrality_k_overridden: self.config.centrality_k_override.is_some(),
         })
     }
 

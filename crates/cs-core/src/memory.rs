@@ -155,6 +155,17 @@ pub struct IndexingConfig {
     /// restore the pre-#72 behaviour. Explicit `save_observation` calls are
     /// unaffected — they remain the agent-attested memory path.
     pub auto_observations: bool,
+
+    /// Percentile of the raw-degree distribution used to derive the centrality
+    /// smoothing constant `k` (see `CodeGraph::warm_caches`).
+    /// Set via `[ranking] centrality_k_percentile = 0.5` in `config.toml`.
+    /// Default: None (engine uses 0.5 = median).
+    pub centrality_k_percentile: Option<f32>,
+
+    /// Explicit override for the centrality smoothing constant. When set,
+    /// bypasses percentile-based derivation and pins `k` to this value.
+    /// Set via `[ranking] centrality_k = 15.0` in `config.toml`. Default: None.
+    pub centrality_k_override: Option<f32>,
 }
 
 impl IndexingConfig {
@@ -200,6 +211,19 @@ impl IndexingConfig {
             }
             if let Some(v) = obs.get("auto_observations").and_then(|v| v.as_bool()) {
                 cfg.auto_observations = v;
+            }
+        }
+        if let Some(ranking) = table.get("ranking").and_then(|v| v.as_table()) {
+            if let Some(v) = ranking
+                .get("centrality_k_percentile")
+                .and_then(|v| v.as_float())
+            {
+                cfg.centrality_k_percentile = Some(v as f32);
+            }
+            if let Some(v) = ranking.get("centrality_k").and_then(|v| v.as_float()) {
+                cfg.centrality_k_override = Some(v as f32);
+            } else if let Some(v) = ranking.get("centrality_k").and_then(|v| v.as_integer()) {
+                cfg.centrality_k_override = Some(v as f32);
             }
         }
         // CS_TRACK_MANIFEST env var overrides config.toml
@@ -249,6 +273,12 @@ impl IndexingConfig {
             }
             if ws.auto_observations {
                 cfg.auto_observations = true;
+            }
+            if ws.centrality_k_percentile.is_some() {
+                cfg.centrality_k_percentile = ws.centrality_k_percentile;
+            }
+            if ws.centrality_k_override.is_some() {
+                cfg.centrality_k_override = ws.centrality_k_override;
             }
         }
 
