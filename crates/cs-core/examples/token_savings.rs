@@ -13,6 +13,10 @@
 //!
 //! Usage:
 //!     cargo run --release --example token_savings -p cs-core
+//!
+//! Honoured env vars (see README §"Environment variables"):
+//!   - `CS_BENCH_CENTRALITY_K` — pin the centrality smoothing constant `k`
+//!     (e.g. `15.0` reproduces pre-#82 behaviour for A/B comparison).
 
 use std::fs;
 use std::path::{Path, PathBuf};
