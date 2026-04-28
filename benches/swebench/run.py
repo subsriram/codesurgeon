@@ -35,7 +35,9 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import shutil
@@ -43,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -825,28 +828,98 @@ def cache_is_valid(cache_dir: Path) -> bool:
     return all((cache_dir / f).exists() for f in required)
 
 
+_STAGING_PREFIX_TOKEN = ".staging-"
+
+
+@contextlib.contextmanager
+def _cache_key_lock(cache_dir: Path):
+    """Exclusive flock on `<cache_dir>.lock` — serializes populate_cache_from
+    across processes/threads for one (repo, base_commit). The lockfile lives
+    next to the cache dir so it survives staging directory churn.
+    """
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir.parent / f"{cache_dir.name}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _parse_staging_pid(name: str) -> int | None:
+    """Extract the owning PID from `.<key>.staging-<pid>-<uuid>`. Returns
+    None if unparseable.
+    """
+    idx = name.find(_STAGING_PREFIX_TOKEN)
+    if idx < 0:
+        return None
+    suffix = name[idx + len(_STAGING_PREFIX_TOKEN):]
+    pid_token = suffix.split("-", 1)[0]
+    try:
+        return int(pid_token)
+    except ValueError:
+        return None
+
+
+def sweep_stale_staging(root: Path = INDEX_CACHE_DIR) -> int:
+    """Remove orphaned `.<name>.staging-<pid>-<uuid>` directories left by
+    crashed populators. Run once at harness startup. Conservative: only
+    sweeps stagings whose owning PID is no longer running, so a parallel
+    `run.py` mid-copy is left alone.
+    """
+    if not root.exists():
+        return 0
+    removed = 0
+    for slug_dir in root.iterdir():
+        if not slug_dir.is_dir():
+            continue
+        for entry in slug_dir.iterdir():
+            if not (entry.is_dir() and entry.name.startswith(".") and _STAGING_PREFIX_TOKEN in entry.name):
+                continue
+            pid = _parse_staging_pid(entry.name)
+            if pid and pid > 0:
+                try:
+                    os.kill(pid, 0)
+                    continue  # still alive — leave it
+                except OSError:
+                    pass  # not running — fall through to remove
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 def populate_cache_from(src_cs_dir: Path, task: dict) -> None:
     """Copy a freshly-built `.codesurgeon/` directory into the per-task cache.
 
-    Writes to a staging path and renames on completion so partial copies
-    never become visible. If another process won the race, drop our copy
-    and keep theirs.
+    Atomicity: copies into a per-call `staging-<pid>-<uuid>` dir outside the
+    lock (slow, parallelisable), then takes an exclusive flock on the cache
+    key for the short publication window — re-check / cleanup / rename /
+    READY-touch all happen under the lock so concurrent populators of the
+    same key cannot race past `cache_dir.exists()` and double-rename. The
+    uuid suffix prevents collisions when multiple threads in the same
+    process populate the same key (PID alone isn't unique).
     """
     cache_dir = cache_path_for(task)
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging = cache_dir.parent / f".{cache_dir.name}.staging-{os.getpid()}"
-    if staging.exists():
+    staging = cache_dir.parent / f".{cache_dir.name}{_STAGING_PREFIX_TOKEN}{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        shutil.copytree(src_cs_dir, staging)
+    except OSError:
         shutil.rmtree(staging, ignore_errors=True)
-    shutil.copytree(src_cs_dir, staging)
-    if cache_is_valid(cache_dir):
-        # Another process won the race AND finished cleanly. Keep theirs.
-        shutil.rmtree(staging, ignore_errors=True)
-        return
-    if cache_dir.exists():
-        # Stale or partial entry from a prior crash — replace it.
-        shutil.rmtree(cache_dir, ignore_errors=True)
-    staging.rename(cache_dir)
-    (cache_dir / "READY").touch()
+        raise
+
+    with _cache_key_lock(cache_dir):
+        if cache_is_valid(cache_dir):
+            # Another populator finished cleanly while we were copying.
+            shutil.rmtree(staging, ignore_errors=True)
+            return
+        if cache_dir.exists():
+            # Stale or partial entry from a prior crash — replace it.
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        staging.rename(cache_dir)
+        (cache_dir / "READY").touch()
 
 
 def restore_cache_into(cache_dir: Path, workdir: Path) -> None:
@@ -1594,6 +1667,22 @@ def main() -> int:
         help="skip (task, arm) pairs already in results.jsonl — use to continue an interrupted run",
     )
     parser.add_argument(
+        "--prefetch",
+        action="store_true",
+        default=True,
+        help=(
+            "while task N's claude runs, pre-warm the (repo, base_commit) index cache for "
+            "task N+1 on a background thread. Helps multi-task runs where later tasks share "
+            "a base_commit with earlier ones. Safe: each cache entry is published atomically."
+        ),
+    )
+    parser.add_argument(
+        "--no-prefetch",
+        dest="prefetch",
+        action="store_false",
+        help="disable background cache prefetch (see --prefetch)",
+    )
+    parser.add_argument(
         "--inject-claude-md",
         action="store_true",
         help=(
@@ -1715,45 +1804,157 @@ def main() -> int:
             stream_json=args.stream_json,
         )
 
-    for task in tasks:
-        for arm in arms:
-            if (task["instance_id"], arm) in done:
-                continue
-            result = _do_run(task, arm)
+    # Flatten to (task, arm) pairs so prefetch can look ahead by index.
+    all_pairs: list[tuple[dict, str]] = [
+        (t, a) for t in tasks for a in arms if (t["instance_id"], a) not in done
+    ]
 
-            # Transient-error retry: if the run looks like a quota/auth
-            # blip (fast exit, no work done), wait for the rate-limit
-            # window to roll over and retry. probe_claude_auth before
-            # each retry avoids spending a clone+index+run cycle on a
-            # still-dead token. Up to QUOTA_MAX_RETRIES retries — each
-            # successful retry resets the budget for the *next* task.
-            for retry in range(1, QUOTA_MAX_RETRIES + 1):
-                stderr_text = _read_stderr_for(results_dir, arm, task["instance_id"])
-                if not looks_like_transient_error(result, stderr_text):
-                    break
-                print(
-                    f"  ⏳ transient error on {task['instance_id']}/{arm} "
-                    f"— retry {retry}/{QUOTA_MAX_RETRIES} after {QUOTA_WAIT_S // 60}min",
-                    file=sys.stderr,
-                    flush=True,
+    # Background prefetch executor — pre-warms the (repo, base_commit) index
+    # cache for the next "with"-arm task while the foreground task's claude
+    # runs. Single worker; tasks enqueue serially.
+    from concurrent.futures import Future, ThreadPoolExecutor
+    prefetch_pool: ThreadPoolExecutor | None = None
+    prefetch_future: Future | None = None
+    # Tracked as (repo, base_commit) — multiple instances can share a base,
+    # so the foreground task's cache key (not its instance_id) is what
+    # decides whether to wait or to keep the prefetch running in parallel.
+    prefetch_for_key: tuple[str, str] | None = None
+    if args.prefetch and not args.dry_run:
+        prefetch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cs-prefetch")
+        INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        swept = sweep_stale_staging()
+        if swept:
+            print(f"  ↳ swept {swept} stale staging dir(s) from prior runs", file=sys.stderr)
+
+    def prefetch_next(task: dict) -> str:
+        """Ensure the cache is populated for a task's (repo, base_commit).
+
+        Runs on a background thread. Clones into a tempdir, indexes, copies
+        `.codesurgeon/` into the shared cache, then cleans up the tempdir.
+        Safe to call repeatedly — cache_is_valid() short-circuits.
+        """
+        cache_dir = cache_path_for(task)
+        if cache_is_valid(cache_dir):
+            return "cache-hit"
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"cs-prefetch-{task['instance_id']}-") as tmp_s:
+                work = Path(tmp_s) / "repo"
+                clone_task_repo(task, work)
+                proc = subprocess.run(
+                    [str(cs_bin), "index", "--workspace", str(work)],
+                    env={**os.environ, "CS_WORKSPACE": str(work)},
+                    capture_output=True,
+                    text=True,
+                    timeout=INDEX_TIMEOUT_S,
                 )
-                while True:
-                    time.sleep(QUOTA_WAIT_S)
-                    if probe_claude_auth(claude_bin):
-                        print(
-                            f"  ✓ claude auth OK — retrying {task['instance_id']}/{arm}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        break
+                if proc.returncode != 0:
+                    return f"index-fail: {proc.stderr[-200:]}"
+                populate_cache_from(work / ".codesurgeon", task)
+            return "populated"
+        except subprocess.TimeoutExpired:
+            return "timeout"
+        except Exception as e:  # noqa: BLE001 — best-effort prefetch
+            return f"err: {e}"
+
+    for i, (task, arm) in enumerate(all_pairs):
+        task_key = _cache_key(task)
+
+        # Resolve any in-flight prefetch before starting this pair.
+        if prefetch_future is not None:
+            this_needs_prefetch = (
+                arm == "with"
+                and not args.dry_run
+                and not cache_is_valid(cache_path_for(task))
+            )
+            if this_needs_prefetch and prefetch_for_key == task_key:
+                # In-flight prefetch is for *our* cache key — block on it
+                # so we don't run a second concurrent indexer for the same key.
+                try:
+                    status = prefetch_future.result(timeout=INDEX_TIMEOUT_S)
+                    print(f"  ↳ prefetch done: {status}", file=sys.stderr)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ↳ prefetch wait error: {type(e).__name__}: {e}", file=sys.stderr)
+                prefetch_future = None
+                prefetch_for_key = None
+            elif prefetch_future.done():
+                try:
+                    status = prefetch_future.result(timeout=0)
+                    print(f"  ↳ prefetch done: {status}", file=sys.stderr)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ↳ prefetch error: {type(e).__name__}: {e}", file=sys.stderr)
+                prefetch_future = None
+                prefetch_for_key = None
+            # else: prefetch in flight for a different cache key — let it run.
+
+        # Kick off a background prefetch for the NEXT "with" task whose
+        # cache key isn't already being built. Skip:
+        #   - keys already cached
+        #   - the foreground task's own key (it'll populate that itself)
+        #   - any prefetch already in flight (max_workers=1)
+        if prefetch_pool is not None and prefetch_future is None:
+            for j in range(i + 1, len(all_pairs)):
+                nxt_task, nxt_arm = all_pairs[j]
+                if nxt_arm != "with":
+                    continue
+                nxt_key = _cache_key(nxt_task)
+                if nxt_key == task_key:
+                    continue
+                if cache_is_valid(cache_path_for(nxt_task)):
+                    continue
+                prefetch_future = prefetch_pool.submit(prefetch_next, nxt_task)
+                prefetch_for_key = nxt_key
+                print(
+                    f"  ↳ prefetching index for {nxt_task['instance_id']} "
+                    f"({nxt_task['repo']}@{nxt_task['base_commit'][:8]})",
+                    file=sys.stderr,
+                )
+                break  # one prefetch in flight at a time
+
+        result = _do_run(task, arm)
+
+        # Transient-error retry: if the run looks like a quota/auth blip
+        # (fast exit, no work done), wait for the rate-limit window to roll
+        # over and retry. probe_claude_auth before each retry avoids spending
+        # a clone+index+run cycle on a still-dead token. Up to
+        # QUOTA_MAX_RETRIES retries — each successful retry resets the
+        # budget for the *next* task.
+        for retry in range(1, QUOTA_MAX_RETRIES + 1):
+            stderr_text = _read_stderr_for(results_dir, arm, task["instance_id"])
+            if not looks_like_transient_error(result, stderr_text):
+                break
+            print(
+                f"  ⏳ transient error on {task['instance_id']}/{arm} "
+                f"— retry {retry}/{QUOTA_MAX_RETRIES} after {QUOTA_WAIT_S // 60}min",
+                file=sys.stderr,
+                flush=True,
+            )
+            while True:
+                time.sleep(QUOTA_WAIT_S)
+                if probe_claude_auth(claude_bin):
                     print(
-                        f"  … still down, waiting another {QUOTA_WAIT_S // 60}min",
+                        f"  ✓ claude auth OK — retrying {task['instance_id']}/{arm}",
                         file=sys.stderr,
                         flush=True,
                     )
-                result = _do_run(task, arm)
+                    break
+                print(
+                    f"  … still down, waiting another {QUOTA_WAIT_S // 60}min",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            result = _do_run(task, arm)
 
-            append_result(args.results, result)
+        append_result(args.results, result)
+
+    # Drain any in-flight prefetch on shutdown so its result hits the cache
+    # for the next harness invocation.
+    if prefetch_future is not None:
+        try:
+            prefetch_future.result(timeout=INDEX_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            pass
+    if prefetch_pool is not None:
+        prefetch_pool.shutdown(wait=False, cancel_futures=True)
 
     print(f"done → {args.results}", file=sys.stderr)
     return 0

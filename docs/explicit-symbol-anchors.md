@@ -235,6 +235,34 @@ candidates (replaces surface-text term overlap), traceback parsing on
 `context` (high-precision signal when tracebacks are present),
 reproducer-test awareness (swebench-specific).
 
+### Rejected: WIP fenced-blocks-in-`task` prompt format
+
+A pre-`context`-split prompt design lived on the
+`swebench-resilience-and-index-cache` branch (commit `fa87f8f`):
+agent writes a one-line summary in `task=` then pastes only the fenced
+code blocks from the problem statement, inline, wrapped in triple
+backticks. Author-stated motivation: "without the fenced code blocks
+the capsule often ranks the wrong file."
+
+Rejected post-`context`-split (2026-04-27). Three reasons:
+
+1. **Schema obsolete.** The premise — single `task` field forces the
+   agent to filter — is gone. `5b`'s `context` parameter delivers the
+   verbatim problem statement through a dedicated channel, no agent
+   judgment required.
+2. **Agent extraction is unreliable.** Phase 5's pattern (5e/5f/5h —
+   "agent infers anchors") regressed across the board. "Agent extracts
+   only the fenced blocks" is the same shape: discretionary work the
+   agent can fail at. `5b`'s mechanical "paste everything" is robust.
+3. **Adds prompt content.** The WIP added ~40 lines of prompt-prefix
+   instruction. The 0/134/2,781-char dose-response says any addition
+   to the prefix is presumed-harmful until proven otherwise.
+
+The one residual hypothesis worth keeping is "fenced-only `context`
+beats full-prose `context`" (signal-density argument). If pursued, do
+it as a `5l` nudge variant on the existing two-field schema, not as a
+schema rewrite. Not currently planned.
+
 ### Harness / measurement infrastructure — stable baseline
 
 Workflow to reproduce any of the rows in the table above:
