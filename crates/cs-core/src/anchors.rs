@@ -190,7 +190,7 @@ fn traceback_frame_re() -> &'static Regex {
 }
 
 /// Extracted anchors, in order of discovery.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Anchors {
     /// Symbol names to try looking up exactly (deduplicated, in order).
     pub symbol_names: Vec<String>,

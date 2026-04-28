@@ -83,6 +83,142 @@ pub(crate) const REVERSE_EXPAND_SEED_MAX_CALLERS: usize = 500;
 /// embedding lookup is provided to `reverse_expand_from_anchors`.
 pub(crate) const REVERSE_EXPAND_SEMANTIC_WEIGHT: f32 = 2.0;
 
+/// Density-aware fan-out parameters (issue #69 v1, originally landed in
+/// `0f35b33` and reverted in `5516865`). Re-introduced behind the
+/// `CS_REVERSE_EXPAND_STRATEGY` env-var gate so the cs-benchmark diagnostic
+/// panel can score it on a stratified panel without making it the default
+/// — see `docs/reverse_expand_panel.md` in the cs-benchmark repo.
+pub(crate) const REVERSE_EXPAND_FAN_OUT_CAP: usize = 25;
+pub(crate) const REVERSE_EXPAND_FAN_OUT_DIVISOR: usize = 5;
+
+/// Per-hop fan-out policy for `reverse_expand_from_anchors`. The historical
+/// default (`Fixed(REVERSE_EXPAND_FAN_OUT)`) explores top-N callers
+/// uniformly across hops. `DensityScaled` lets dense seeds spend more
+/// budget than sparse ones — see issue #69 option 2.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FanOutPolicy {
+    Fixed(usize),
+    DensityScaled {
+        floor: usize,
+        cap: usize,
+        divisor: usize,
+    },
+}
+
+impl FanOutPolicy {
+    /// Select fan-out for one BFS hop given the seed's caller count.
+    pub(crate) fn for_hop(&self, dependents_len: usize) -> usize {
+        match *self {
+            FanOutPolicy::Fixed(n) => n,
+            FanOutPolicy::DensityScaled {
+                floor,
+                cap,
+                divisor,
+            } => {
+                let scaled = dependents_len / divisor.max(1);
+                scaled.clamp(floor, cap)
+            }
+        }
+    }
+}
+
+// ── Reverse-expand strategy gate (cs-benchmark diagnostic harness) ───────────
+//
+// `CS_REVERSE_EXPAND_STRATEGY` selects which combination of ranking signals
+// drives reverse-edge expansion. Default (`v2`) matches the current main
+// behavior — query-term overlap + semantic embedding similarity. The other
+// variants exist so the cs-benchmark panel can score them on a stratified
+// task panel without making any one of them the default.
+
+/// Reverse-edge expansion strategy. Resolved once per engine call from
+/// `CS_REVERSE_EXPAND_STRATEGY` (default `V2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReverseExpandStrategy {
+    /// Skip reverse-expand entirely. Equivalent to `reverse_expand_anchors=false`.
+    None,
+    /// #67 only. Fixed fan_out=5, no query-term overlap, no semantic.
+    /// Pure centrality-driven beam search.
+    V0,
+    /// Density-aware fan-out alone (no query-term overlap, no semantic).
+    V1a,
+    /// Query-term-overlap fan-out alone (fixed fan_out=5, no semantic).
+    V1b,
+    /// Density-aware + query-term-overlap (no semantic). v1 as originally
+    /// landed in `0f35b33`.
+    V1ab,
+    /// Current default. Query-term-overlap + semantic embedding similarity.
+    /// Per #69 v2 (PR #83).
+    V2,
+    /// Total-node-budget + best-first. Not yet implemented.
+    V3a,
+    /// `V3a` + UCB exploration bonus. Not yet implemented.
+    V3b,
+}
+
+impl ReverseExpandStrategy {
+    /// Read `CS_REVERSE_EXPAND_STRATEGY` from the environment. Unset or
+    /// unrecognized → `V2` (current main behavior). Logged at warn level
+    /// so misconfigured benchmark runs don't silently fall back.
+    pub fn from_env() -> Self {
+        match std::env::var("CS_REVERSE_EXPAND_STRATEGY")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("") | Some("v2") => Self::V2,
+            Some("none") | Some("off") => Self::None,
+            Some("v0") => Self::V0,
+            Some("v1a") => Self::V1a,
+            Some("v1b") => Self::V1b,
+            Some("v1ab") | Some("v1") => Self::V1ab,
+            Some("v3a") => Self::V3a,
+            Some("v3b") => Self::V3b,
+            Some(other) => {
+                tracing::warn!(
+                    "CS_REVERSE_EXPAND_STRATEGY={:?} unrecognized, falling back to v2",
+                    other
+                );
+                Self::V2
+            }
+        }
+    }
+
+    pub(crate) fn fan_out_policy(&self) -> FanOutPolicy {
+        match self {
+            Self::V1a | Self::V1ab => FanOutPolicy::DensityScaled {
+                floor: REVERSE_EXPAND_FAN_OUT,
+                cap: REVERSE_EXPAND_FAN_OUT_CAP,
+                divisor: REVERSE_EXPAND_FAN_OUT_DIVISOR,
+            },
+            _ => FanOutPolicy::Fixed(REVERSE_EXPAND_FAN_OUT),
+        }
+    }
+
+    /// Whether to feed query-term overlap into per-hop ranking. False → caller
+    /// scoring degenerates to centrality-only.
+    pub(crate) fn use_query_terms(&self) -> bool {
+        matches!(self, Self::V1b | Self::V1ab | Self::V2)
+    }
+
+    /// Whether to feed semantic body-embedding similarity into per-hop
+    /// ranking. False → no `semantic_scorer` is passed to the BFS. Only
+    /// referenced under `feature = "embeddings"`; without that feature the
+    /// engine never has a scorer to gate.
+    #[allow(dead_code)]
+    pub(crate) fn use_semantic(&self) -> bool {
+        matches!(self, Self::V2)
+    }
+
+    /// True for variants that are not yet implemented. The engine treats
+    /// these as "skip reverse-expand" but logs a warning so a misconfigured
+    /// benchmark variant is visible in stderr.
+    pub(crate) fn is_unimplemented(&self) -> bool {
+        matches!(self, Self::V3a | Self::V3b)
+    }
+}
+
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 
 /// RRF rank fusion constant (k=60 from the original paper).
@@ -222,13 +358,17 @@ pub(crate) fn reverse_expand_from_anchors(
     seed_ids: &[u64],
     query_terms: &[String],
     max_depth: u32,
-    fan_out: usize,
+    fan_out: FanOutPolicy,
     max_total: usize,
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
 ) -> Vec<(u64, f32)> {
     use std::collections::VecDeque;
 
-    if max_depth == 0 || fan_out == 0 || max_total == 0 || seed_ids.is_empty() {
+    let fan_out_floor = match fan_out {
+        FanOutPolicy::Fixed(n) => n,
+        FanOutPolicy::DensityScaled { floor, .. } => floor,
+    };
+    if max_depth == 0 || fan_out_floor == 0 || max_total == 0 || seed_ids.is_empty() {
         return Vec::new();
     }
 
@@ -242,6 +382,10 @@ pub(crate) fn reverse_expand_from_anchors(
         }
         let dependents = graph.dependents(id);
         if dependents.is_empty() {
+            continue;
+        }
+        let hop_fan_out = fan_out.for_hop(dependents.len());
+        if hop_fan_out == 0 {
             continue;
         }
 
@@ -291,7 +435,7 @@ pub(crate) fn reverse_expand_from_anchors(
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        for (cid, _) in scored.into_iter().take(fan_out) {
+        for (cid, _) in scored.into_iter().take(hop_fan_out) {
             if visited.insert(cid) {
                 let score = 1.0 / (depth as f32 + 2.0);
                 out.push((cid, score));
@@ -601,7 +745,15 @@ mod tests {
                 Some(0.3)
             }
         };
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
+        let out = reverse_expand_from_anchors(
+            &g,
+            &[seed_id],
+            &terms,
+            3,
+            FanOutPolicy::Fixed(1),
+            1,
+            Some(&scorer),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].0, aligned,
@@ -624,7 +776,15 @@ mod tests {
                 Some(0.1)
             }
         };
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
+        let out = reverse_expand_from_anchors(
+            &g,
+            &[seed_id],
+            &terms,
+            3,
+            FanOutPolicy::Fixed(1),
+            1,
+            Some(&scorer),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, target);
     }
@@ -666,7 +826,15 @@ mod tests {
             }
         };
 
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
+        let out = reverse_expand_from_anchors(
+            &g,
+            &[seed_id],
+            &terms,
+            3,
+            FanOutPolicy::Fixed(1),
+            1,
+            Some(&scorer),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].0, lexical_id,
@@ -696,7 +864,8 @@ mod tests {
         g.warm_caches();
 
         let terms: Vec<String> = vec!["substitution".into()];
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, None);
+        let out =
+            reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, FanOutPolicy::Fixed(1), 1, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, winner_id);
     }

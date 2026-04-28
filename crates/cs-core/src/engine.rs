@@ -20,11 +20,10 @@ use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
     is_reverse_expand_seed, is_trivial_exception_pivot, query_terms_for_reverse_expand,
     resolve_adjacents, reverse_expand_from_anchors, rrf_merge_ks, select_adjacents,
-    ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE,
-    ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
-    MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT,
-    REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
-    STUB_SCORE_WEIGHT,
+    ReverseExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF,
+    ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
+    MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_MAX_DEPTH,
+    REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -1331,6 +1330,37 @@ impl CoreEngine {
         language: Option<&str>,
         file_hint: Option<&str>,
     ) -> Result<String> {
+        let capsule =
+            self.run_pipeline_capsule_with_context(task, context, budget, language, file_hint)?;
+        let mut out = format_capsule(&capsule);
+        let has_swift = capsule
+            .pivots
+            .iter()
+            .any(|p| p.file_path.ends_with(".swift"))
+            || capsule
+                .skeletons
+                .iter()
+                .any(|s| s.file_path.ends_with(".swift"));
+        if has_swift {
+            out.push_str(&swift_enrichment_hint(detect_xcode_mcp()));
+        }
+        Ok(out)
+    }
+
+    /// Same as `run_pipeline_with_context` but returns the structured `Capsule`
+    /// instead of a markdown-formatted string. Used by tooling that needs to
+    /// inspect pivots/skeletons programmatically (cs-benchmark diagnostic
+    /// harness, etc.). Side effects — auto-observation and query logging — are
+    /// identical to the formatted variant; the only thing the formatted path
+    /// adds on top is the markdown rendering and the Swift enrichment hint.
+    pub fn run_pipeline_capsule_with_context(
+        &self,
+        task: &str,
+        context: Option<&str>,
+        budget: Option<u32>,
+        language: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<Capsule> {
         let t0 = Instant::now();
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(task);
@@ -1346,22 +1376,6 @@ impl CoreEngine {
             task, budget, &intent, language, file_hint, None, None, context,
         )?;
         let latency_ms = t0.elapsed().as_millis() as u64;
-        let mut out = format_capsule(&capsule);
-
-        // Append Swift enrichment hint when Swift symbols appear in results.
-        // Points agents toward Xcode MCP if available, or documents the fallback
-        // so they don't assume the tree-sitter results are complete.
-        let has_swift = capsule
-            .pivots
-            .iter()
-            .any(|p| p.file_path.ends_with(".swift"))
-            || capsule
-                .skeletons
-                .iter()
-                .any(|s| s.file_path.ends_with(".swift"));
-        if has_swift {
-            out.push_str(&swift_enrichment_hint(detect_xcode_mcp()));
-        }
 
         // Auto-capture this tool call as an observation for cross-session memory.
         // Gated on `config.auto_observations` (default false). See the field doc
@@ -1422,7 +1436,7 @@ impl CoreEngine {
             tracing::warn!("query log failed: {}", e);
         }
 
-        Ok(out)
+        Ok(capsule)
     }
 
     /// Get context capsule for a query.
@@ -2583,7 +2597,24 @@ impl CoreEngine {
         let re_emb_lookup: Option<std::collections::HashMap<u64, &[f32]>> =
             re_emb_guard.as_ref().map(|g| g.iter().collect());
 
-        let reverse_results: Vec<(u64, f32)> = if self.config.reverse_expand_anchors {
+        // Resolve reverse-expand strategy from `CS_REVERSE_EXPAND_STRATEGY`.
+        // Default `V2` matches current main behaviour. The cs-benchmark
+        // diagnostic harness drives the other variants — see
+        // `docs/reverse_expand_panel.md` in cs-benchmark.
+        let strategy = ReverseExpandStrategy::from_env();
+        if strategy.is_unimplemented() {
+            tracing::warn!(
+                "CS_REVERSE_EXPAND_STRATEGY={:?} is not implemented yet; skipping reverse-expand",
+                strategy
+            );
+        }
+
+        let reverse_results: Vec<(u64, f32)> = if !self.config.reverse_expand_anchors
+            || strategy == ReverseExpandStrategy::None
+            || strategy.is_unimplemented()
+        {
+            Vec::new()
+        } else {
             let graph = self.graph.read();
             let seed_ids: Vec<u64> = anchor_results
                 .iter()
@@ -2604,7 +2635,11 @@ impl CoreEngine {
             if seed_ids.is_empty() {
                 Vec::new()
             } else {
-                let terms = query_terms_for_reverse_expand(&anchor_source);
+                let terms_owned = if strategy.use_query_terms() {
+                    query_terms_for_reverse_expand(&anchor_source)
+                } else {
+                    Vec::new()
+                };
 
                 #[cfg(feature = "embeddings")]
                 let semantic_closure = |id: u64| -> Option<f32> {
@@ -2613,7 +2648,8 @@ impl CoreEngine {
                     Some(cosine_similarity(qv, v).clamp(0.0, 1.0))
                 };
                 #[cfg(feature = "embeddings")]
-                let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = if re_query_vec.is_some()
+                let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = if strategy.use_semantic()
+                    && re_query_vec.is_some()
                     && re_emb_lookup
                         .as_ref()
                         .map(|m| !m.is_empty())
@@ -2626,27 +2662,28 @@ impl CoreEngine {
                 #[cfg(not(feature = "embeddings"))]
                 let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = None;
 
+                let policy = strategy.fan_out_policy();
                 let out = reverse_expand_from_anchors(
                     &graph,
                     &seed_ids,
-                    &terms,
+                    &terms_owned,
                     REVERSE_EXPAND_MAX_DEPTH,
-                    REVERSE_EXPAND_FAN_OUT,
+                    policy,
                     REVERSE_EXPAND_CANDIDATES,
                     semantic_ref,
                 );
                 tracing::debug!(
-                    "reverse-expand: {} seeds → {} candidates (depth={}, fan_out={}, semantic={})",
+                    "reverse-expand: strategy={:?} {} seeds → {} candidates (depth={}, policy={:?}, terms={}, semantic={})",
+                    strategy,
                     seed_ids.len(),
                     out.len(),
                     REVERSE_EXPAND_MAX_DEPTH,
-                    REVERSE_EXPAND_FAN_OUT,
+                    policy,
+                    terms_owned.len(),
                     semantic_ref.is_some()
                 );
                 out
             }
-        } else {
-            Vec::new()
         };
 
         // ANN semantic retrieval + RRF fusion across all sources.
