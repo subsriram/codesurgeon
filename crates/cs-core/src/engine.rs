@@ -24,8 +24,8 @@ use crate::ranking::{
     reverse_expand_from_anchors, rrf_merge_ks, select_adjacents, EffectiveDirection,
     ExpandDirection, ExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF,
     ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, EXPAND_CANDIDATES,
-    EXPAND_MAX_DEPTH, EXPAND_RRF_K, EXPAND_SEED_FANOUT_LIMIT, GRAPH_CANDIDATES,
-    MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
+    EXPAND_MAX_DEPTH, EXPAND_RRF_K, EXPAND_SEED_FANOUT_LIMIT, EXPAND_SEED_PER_NAME_LIMIT,
+    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2669,19 +2669,48 @@ impl CoreEngine {
         } else {
             let graph = self.graph.read();
 
-            // Partition anchor seeds by walk direction. Eligibility differs
-            // per direction:
-            //   - Forward: any anchor with at most SEED_MAX_CALLERS dependencies.
-            //     No `is_reverse_expand_seed` kind gate — forward walks are
-            //     interesting from any anchor with a callee tree (public APIs
-            //     the user invoked → fix in implementation, etc.).
+            // Build the seed-candidate pool. Issue #96: anchor_candidates
+            // truncates to top-K-per-name with a prefer_module sort, which
+            // can drop legitimate seed targets when a wrapper sibling out-
+            // ranks them — observed on matplotlib-24177 where `pyplot::hist`
+            // displaced `Axes::hist` (the actual implementation). For seed
+            // selection we want every distinct exact-name match per anchor
+            // so each subtree gets walk budget independently. Hub guard
+            // (`EXPAND_SEED_FANOUT_LIMIT`) still applies — a public API
+            // with thousands of callees is a flood risk regardless.
+            let anchors_for_seeding = crate::anchors::extract(&anchor_source);
+            let mut seed_candidate_ids: HashSet<u64> = HashSet::new();
+            {
+                let db = self.db.lock();
+                for name in &anchors_for_seeding.symbol_names {
+                    let lookup = name.rsplit('.').next().unwrap_or(name);
+                    if let Ok(ids) = db.symbols_by_exact_name(lookup, EXPAND_SEED_PER_NAME_LIMIT) {
+                        for id in ids {
+                            seed_candidate_ids.insert(id);
+                        }
+                    }
+                }
+            }
+            // Also include anchor_results so any BM25-resolved match (which
+            // wouldn't show up via exact-name lookup) still becomes a seed.
+            for (id, _) in &anchor_results {
+                seed_candidate_ids.insert(*id);
+            }
+
+            // Partition seeds by walk direction. Eligibility differs:
+            //   - Forward: any anchor with at most SEED_FANOUT_LIMIT
+            //     dependencies. No `is_reverse_expand_seed` kind gate —
+            //     forward walks are interesting from any anchor with a
+            //     callee tree (public APIs the user invoked → fix in
+            //     implementation, etc.).
             //   - Reverse: must be a reverse-expand seed (exception/error/
-            //     warning class) AND at most SEED_MAX_CALLERS direct callers.
-            //     This preserves existing #67 behaviour — without the kind
-            //     gate, walking reverse from a generic anchor floods the capsule.
+            //     warning class) AND at most SEED_FANOUT_LIMIT direct
+            //     callers. This preserves existing #67 behaviour — without
+            //     the kind gate, walking reverse from a generic anchor
+            //     floods the capsule.
             let mut forward_seeds: Vec<u64> = Vec::new();
             let mut reverse_seeds: Vec<u64> = Vec::new();
-            for (id, _) in &anchor_results {
+            for id in &seed_candidate_ids {
                 let Some(sym) = graph.get_symbol(*id) else {
                     continue;
                 };
@@ -2699,6 +2728,26 @@ impl CoreEngine {
                 {
                     reverse_seeds.push(*id);
                 }
+            }
+            // Stable order across runs — HashSet iteration is non-deterministic.
+            forward_seeds.sort_unstable();
+            reverse_seeds.sort_unstable();
+
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let fmt_fqns = |ids: &[u64]| -> String {
+                    ids.iter()
+                        .filter_map(|id| graph.get_symbol(*id).map(|s| s.fqn.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                tracing::debug!(
+                    "expand seeds: {} forward = [{}]; {} reverse = [{}] (candidates considered: {})",
+                    forward_seeds.len(),
+                    fmt_fqns(&forward_seeds),
+                    reverse_seeds.len(),
+                    fmt_fqns(&reverse_seeds),
+                    seed_candidate_ids.len()
+                );
             }
 
             if forward_seeds.is_empty() && reverse_seeds.is_empty() {

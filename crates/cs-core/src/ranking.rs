@@ -69,6 +69,17 @@ pub(crate) const EXPAND_RRF_K: f32 = 30.0;
 /// dozens-to-low-hundreds of raisers; this caps the seed set but the per-hop
 /// `EXPAND_FAN_OUT` still bounds each walk.
 pub(crate) const EXPAND_SEED_FANOUT_LIMIT: usize = 500;
+/// Per-anchor-name cap on exact-match lookups during seed promotion.
+/// Higher than `ANCHOR_ROWS_PER_NAME` (5) because seed promotion needs
+/// the whole population, not the top-K-by-prefer-module-sort that
+/// `anchor_candidates` produces for ranking. Set generously enough that
+/// realistic anchor names (e.g. `hist` in matplotlib — 5+ distinct
+/// classes have a `hist` method) all become seeds, but capped so a
+/// truly common name like `where` or `get` doesn't seed thousands.
+/// Issue #96 — `Axes::hist` was being dropped from forward seeds because
+/// `pyplot::hist` (1-segment fqn) outranked it under the prefer_module
+/// sort + 5-row truncate.
+pub(crate) const EXPAND_SEED_PER_NAME_LIMIT: usize = 25;
 /// Weight applied to body-text semantic similarity when ranking per-hop
 /// callers inside the reverse-expand walk (issue #69 v2). Multiplies the
 /// `[0, 1]` cosine similarity between the query embedding and each caller's
