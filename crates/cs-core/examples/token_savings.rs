@@ -93,7 +93,15 @@ fn main() {
         .expect("tempdir");
     copy_dir(&corpus_source(), &tmp.path().join("src"));
 
-    let cfg = EngineConfig::new(tmp.path()).without_embedder();
+    let mut cfg = EngineConfig::new(tmp.path()).without_embedder();
+    // A/B knob: set CS_BENCH_CENTRALITY_K=15.0 to pin the smoothing constant
+    // and reproduce pre-#82 behaviour for comparison runs. Unset → corpus
+    // median (issue #82 default).
+    if let Ok(s) = std::env::var("CS_BENCH_CENTRALITY_K") {
+        if let Ok(k) = s.parse::<f32>() {
+            cfg.centrality_k_override = Some(k);
+        }
+    }
     let engine = CoreEngine::new(cfg).expect("engine");
     engine.index_workspace().expect("index");
 
