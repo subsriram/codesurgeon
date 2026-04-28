@@ -126,6 +126,30 @@ pub(crate) enum FanOutPolicy {
     },
 }
 
+/// Which direction the anchor walk traverses. `Reverse` walks edges *into*
+/// the anchor (callers/raisers/importers) — the original behaviour, used
+/// when the user names a symptom and the fix is upstream. `Forward` walks
+/// edges *out of* the anchor (callees) — used when the user names a
+/// public API they invoked and the fix lives in its implementation tree.
+/// Issue #95.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkDirection {
+    Forward,
+    Reverse,
+}
+
+impl WalkDirection {
+    /// Return the unvisited neighbours of `id` for this walk direction.
+    /// `Reverse` → `graph.dependents(id)` (callers).
+    /// `Forward` → `graph.dependencies(id)` (callees).
+    pub(crate) fn neighbours<'a>(&self, graph: &'a CodeGraph, id: u64) -> Vec<&'a Symbol> {
+        match self {
+            WalkDirection::Reverse => graph.dependents(id),
+            WalkDirection::Forward => graph.dependencies(id),
+        }
+    }
+}
+
 impl FanOutPolicy {
     /// Select fan-out for one BFS hop given the seed's caller count.
     pub(crate) fn for_hop(&self, dependents_len: usize) -> usize {
@@ -262,6 +286,113 @@ impl ReverseExpandStrategy {
     }
 }
 
+// ── Direction routing (issue #95) ────────────────────────────────────────────
+//
+// Ranking strategy (`CS_REVERSE_EXPAND_STRATEGY`) and walk direction
+// (`CS_EXPAND_DIRECTION`) are orthogonal axes: a variant says *how* to
+// rank candidates, a direction says *where* to walk for them.
+//
+// `Auto` is the default — a per-anchor classifier reads off the index
+// (kind, fan-out ratio) and picks Forward/Reverse/Both. Override with
+// `CS_EXPAND_DIRECTION ∈ {auto, forward, reverse, both}` for the
+// cs-benchmark panel.
+
+/// Effective expansion direction for one anchor seed (after classifier
+/// runs / env-var override applies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffectiveDirection {
+    Forward,
+    Reverse,
+    Both,
+}
+
+/// User-facing expansion-direction setting from `CS_EXPAND_DIRECTION`.
+/// `Auto` defers to the per-anchor classifier; the others force a
+/// uniform direction across all anchors (used by the panel to compare
+/// `forward-only` vs `reverse-only` vs `both` against `auto`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandDirection {
+    Auto,
+    Forward,
+    Reverse,
+    Both,
+}
+
+impl ExpandDirection {
+    /// Read `CS_EXPAND_DIRECTION` from the environment. Unset or
+    /// unrecognized → `Auto`. Logged at warn level on unrecognized
+    /// values so misconfigured benchmark runs don't silently fall back.
+    pub fn from_env() -> Self {
+        match std::env::var("CS_EXPAND_DIRECTION")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("") | Some("auto") => Self::Auto,
+            Some("forward") | Some("fwd") => Self::Forward,
+            Some("reverse") | Some("rev") => Self::Reverse,
+            Some("both") | Some("bidirectional") => Self::Both,
+            Some(other) => {
+                tracing::warn!(
+                    "CS_EXPAND_DIRECTION={:?} unrecognized, falling back to auto",
+                    other
+                );
+                Self::Auto
+            }
+        }
+    }
+
+    /// Resolve to a concrete direction for one anchor. Forward/Reverse/Both
+    /// pass through unchanged; Auto delegates to `classify_direction`.
+    pub(crate) fn resolve_for(&self, graph: &CodeGraph, seed: &Symbol) -> EffectiveDirection {
+        match self {
+            Self::Forward => EffectiveDirection::Forward,
+            Self::Reverse => EffectiveDirection::Reverse,
+            Self::Both => EffectiveDirection::Both,
+            Self::Auto => classify_direction(graph, seed),
+        }
+    }
+}
+
+/// Per-anchor walk-direction classifier. Reads kind + fan-out ratio
+/// off the indexed graph — no embeddings, no LLM. Issue #95 layer 3.
+///
+/// Rules (in order of priority):
+/// 1. Exception classes / errors / warnings → reverse only. They are
+///    typically named as a *symptom*; the fix lives in the code that
+///    raises or handles them, which is upstream.
+/// 2. Modules → forward only. The user named a module they imported;
+///    the fix is in its tree, not in the modules that import it.
+/// 3. Forward fan-out ≫ reverse fan-out → forward. The anchor is a
+///    public entry point with a deep implementation tree.
+/// 4. Reverse fan-out ≫ forward fan-out → reverse. The anchor is a
+///    private leaf utility; the bug is in what calls into it.
+/// 5. Otherwise → bidirectional with split budget.
+///
+/// The 3× ratio is the simplest threshold that sorts SWE-bench
+/// Verified anchors empirically. Tunable later if the panel shows a
+/// per-language preference.
+pub(crate) fn classify_direction(graph: &CodeGraph, seed: &Symbol) -> EffectiveDirection {
+    if is_reverse_expand_seed(seed) {
+        return EffectiveDirection::Reverse;
+    }
+    if seed.kind == SymbolKind::Module {
+        return EffectiveDirection::Forward;
+    }
+    let fwd = graph.dependencies(seed.id).len();
+    let rev = graph.dependents(seed.id).len();
+    let ratio = 3;
+    if fwd > ratio * rev.max(1) {
+        return EffectiveDirection::Forward;
+    }
+    if rev > ratio * fwd.max(1) {
+        return EffectiveDirection::Reverse;
+    }
+    EffectiveDirection::Both
+}
+
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 
 /// RRF rank fusion constant (k=60 from the original paper).
@@ -272,6 +403,12 @@ pub(crate) const RRF_K: f32 = 60.0;
 /// Safe because anchor extraction is precision-first: most noise is filtered
 /// out by the stop-word list and the exact-match gate in `anchor_candidates`.
 pub(crate) const ANCHOR_RRF_K: f32 = 15.0;
+/// RRF k for symbols resolved from Python traceback frames. Even more
+/// aggressive than `ANCHOR_RRF_K` because tracebacks carry **both** the
+/// file path and the function name — the resolution is precision-first
+/// by construction, and a frame in the traceback IS a member of the
+/// call chain that produced the bug. Issue #95 layer 1.
+pub(crate) const TRACEBACK_RRF_K: f32 = 8.0;
 /// Structural injection: score multiplier for injected hub types.
 pub(crate) const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
 /// Centrality boost multiplier applied to BM25 score.
@@ -405,6 +542,55 @@ pub(crate) fn reverse_expand_from_anchors(
     max_total: usize,
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
 ) -> Vec<(u64, f32)> {
+    expand_from_anchors_directional(
+        graph,
+        seed_ids,
+        query_terms,
+        max_depth,
+        fan_out,
+        max_total,
+        semantic_scorer,
+        WalkDirection::Reverse,
+    )
+}
+
+/// Forward sibling of `reverse_expand_from_anchors` — walks edges *out of*
+/// the anchor (callees) instead of into it (callers). Same scoring formula
+/// and same fan-out controls; only the neighbour-direction differs.
+/// Issue #95 layer 2.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_expand_from_anchors(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    fan_out: FanOutPolicy,
+    max_total: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+) -> Vec<(u64, f32)> {
+    expand_from_anchors_directional(
+        graph,
+        seed_ids,
+        query_terms,
+        max_depth,
+        fan_out,
+        max_total,
+        semantic_scorer,
+        WalkDirection::Forward,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_from_anchors_directional(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    fan_out: FanOutPolicy,
+    max_total: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+    direction: WalkDirection,
+) -> Vec<(u64, f32)> {
     use std::collections::VecDeque;
 
     let fan_out_floor = match fan_out {
@@ -423,16 +609,16 @@ pub(crate) fn reverse_expand_from_anchors(
         if depth >= max_depth {
             continue;
         }
-        let dependents = graph.dependents(id);
-        if dependents.is_empty() {
+        let neighbours = direction.neighbours(graph, id);
+        if neighbours.is_empty() {
             continue;
         }
-        let hop_fan_out = fan_out.for_hop(dependents.len());
+        let hop_fan_out = fan_out.for_hop(neighbours.len());
         if hop_fan_out == 0 {
             continue;
         }
 
-        // Score each caller by:
+        // Score each neighbour by:
         //   + `overlap` — count of query-term matches in name / fqn
         //   + `SEMANTIC_WEIGHT * sim` — cosine of body embedding vs query embedding
         //   − `0.1 * centrality` — small penalty so leaf callers beat utility hubs
@@ -450,7 +636,7 @@ pub(crate) fn reverse_expand_from_anchors(
         // statement symbols have no body, no callees beyond the imported
         // names, and no agent-useful content; when they win pivot slots
         // they push the agent into unrelated files.
-        let mut scored: Vec<(u64, f32)> = dependents
+        let mut scored: Vec<(u64, f32)> = neighbours
             .iter()
             .filter(|s| !s.is_stub)
             .filter(|s| s.kind != SymbolKind::Import)
@@ -528,6 +714,56 @@ pub(crate) fn reverse_expand_best_first(
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
     exploration_bonus: bool,
 ) -> Vec<(u64, f32)> {
+    expand_best_first_directional(
+        graph,
+        seed_ids,
+        query_terms,
+        max_depth,
+        total_budget,
+        expand_budget,
+        semantic_scorer,
+        exploration_bonus,
+        WalkDirection::Reverse,
+    )
+}
+
+/// Forward sibling of `reverse_expand_best_first`. Issue #95 layer 2.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_expand_best_first(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    total_budget: usize,
+    expand_budget: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+    exploration_bonus: bool,
+) -> Vec<(u64, f32)> {
+    expand_best_first_directional(
+        graph,
+        seed_ids,
+        query_terms,
+        max_depth,
+        total_budget,
+        expand_budget,
+        semantic_scorer,
+        exploration_bonus,
+        WalkDirection::Forward,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_best_first_directional(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    total_budget: usize,
+    expand_budget: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+    exploration_bonus: bool,
+    direction: WalkDirection,
+) -> Vec<(u64, f32)> {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
 
@@ -583,13 +819,13 @@ pub(crate) fn reverse_expand_best_first(
         if item.depth >= max_depth {
             continue;
         }
-        let dependents = graph.dependents(item.id);
-        if dependents.is_empty() {
+        let neighbours = direction.neighbours(graph, item.id);
+        if neighbours.is_empty() {
             continue;
         }
         total_expansions += 1;
 
-        for s in dependents
+        for s in neighbours
             .iter()
             .filter(|s| !s.is_stub)
             .filter(|s| s.kind != SymbolKind::Import)
@@ -1173,5 +1409,138 @@ mod tests {
                 score
             );
         }
+    }
+
+    // ── Forward expansion + direction classifier (issue #95) ────────────
+
+    /// Build a small graph for forward-expand: one anchor with `n` direct
+    /// callees. Returns `(graph, anchor_id, callee_ids)`.
+    fn graph_with_anonymous_callees(n: usize) -> (CodeGraph, u64, Vec<u64>) {
+        let mut g = CodeGraph::new();
+        let anchor = mk("api.py", "public_api", SymbolKind::Function);
+        let anchor_id = anchor.id;
+        g.add_symbol(anchor);
+        let mut callee_ids = Vec::new();
+        for i in 0..n {
+            let c = mk(
+                &format!("impl_{i}.py"),
+                &format!("anon_{i}"),
+                SymbolKind::Function,
+            );
+            callee_ids.push(c.id);
+            g.add_symbol(c);
+        }
+        // Anchor → callee (anchor depends on callee).
+        for &cid in &callee_ids {
+            g.add_edge(anchor_id, cid, EdgeKind::Calls);
+        }
+        g.warm_caches();
+        (g, anchor_id, callee_ids)
+    }
+
+    #[test]
+    fn forward_expand_walks_callees_not_callers() {
+        // Anchor has 3 callees and zero callers. Reverse walk returns
+        // nothing; forward walk returns all 3.
+        let (g, anchor_id, callee_ids) = graph_with_anonymous_callees(3);
+        let rev =
+            reverse_expand_from_anchors(&g, &[anchor_id], &[], 3, FanOutPolicy::Fixed(5), 10, None);
+        assert!(rev.is_empty(), "no callers → reverse should be empty");
+        let fwd =
+            forward_expand_from_anchors(&g, &[anchor_id], &[], 3, FanOutPolicy::Fixed(5), 10, None);
+        assert_eq!(fwd.len(), 3);
+        let ids: HashSet<u64> = fwd.iter().map(|(id, _)| *id).collect();
+        for cid in &callee_ids {
+            assert!(ids.contains(cid));
+        }
+    }
+
+    #[test]
+    fn forward_best_first_walks_callees() {
+        // The best-first variant must also dispatch to dependencies()
+        // when direction is forward — smoke-test the wiring.
+        let (g, anchor_id, _callee_ids) = graph_with_anonymous_callees(4);
+        let fwd = forward_expand_best_first(&g, &[anchor_id], &[], 3, 4, 50, None, false);
+        assert_eq!(fwd.len(), 4);
+    }
+
+    #[test]
+    fn classify_direction_exception_class_is_reverse() {
+        let mut g = CodeGraph::new();
+        let exc = mk("err.py", "PolynomialError", SymbolKind::Class);
+        let exc_id = exc.id;
+        g.add_symbol(exc);
+        // Add a few raisers so reverse fan-out > 0.
+        for i in 0..3 {
+            let r = mk(
+                &format!("r{i}.py"),
+                &format!("raiser_{i}"),
+                SymbolKind::Function,
+            );
+            let rid = r.id;
+            g.add_symbol(r);
+            g.add_edge(rid, exc_id, EdgeKind::Calls);
+        }
+        g.warm_caches();
+        let sym = g.get_symbol(exc_id).unwrap();
+        assert_eq!(classify_direction(&g, sym), EffectiveDirection::Reverse);
+    }
+
+    #[test]
+    fn classify_direction_high_fanout_function_is_forward() {
+        // Anchor has 10 callees, 1 caller — forward-shaped (3× ratio met).
+        let mut g = CodeGraph::new();
+        let anchor = mk("api.py", "do_thing", SymbolKind::Function);
+        let anchor_id = anchor.id;
+        g.add_symbol(anchor);
+        for i in 0..10 {
+            let cal = mk(
+                &format!("c{i}.py"),
+                &format!("step_{i}"),
+                SymbolKind::Function,
+            );
+            let cal_id = cal.id;
+            g.add_symbol(cal);
+            g.add_edge(anchor_id, cal_id, EdgeKind::Calls);
+        }
+        let caller = mk("user.py", "user", SymbolKind::Function);
+        let caller_id = caller.id;
+        g.add_symbol(caller);
+        g.add_edge(caller_id, anchor_id, EdgeKind::Calls);
+        g.warm_caches();
+        let sym = g.get_symbol(anchor_id).unwrap();
+        assert_eq!(classify_direction(&g, sym), EffectiveDirection::Forward);
+    }
+
+    #[test]
+    fn classify_direction_balanced_anchor_is_both() {
+        // Symmetric fan-out → ambiguous → Both.
+        let mut g = CodeGraph::new();
+        let anchor = mk("mid.py", "intermediary", SymbolKind::Function);
+        let anchor_id = anchor.id;
+        g.add_symbol(anchor);
+        for i in 0..3 {
+            let cal = mk(
+                &format!("c{i}.py"),
+                &format!("callee_{i}"),
+                SymbolKind::Function,
+            );
+            let cal_id = cal.id;
+            g.add_symbol(cal);
+            g.add_edge(anchor_id, cal_id, EdgeKind::Calls);
+        }
+        for i in 0..3 {
+            let r = mk(
+                &format!("r{i}.py"),
+                &format!("caller_{i}"),
+                SymbolKind::Function,
+            );
+            let r_id = r.id;
+            g.add_symbol(r);
+            g.add_edge(r_id, anchor_id, EdgeKind::Calls);
+        }
+        g.warm_caches();
+        let sym = g.get_symbol(anchor_id).unwrap();
+        assert_eq!(classify_direction(&g, sym), EffectiveDirection::Both);
     }
 }

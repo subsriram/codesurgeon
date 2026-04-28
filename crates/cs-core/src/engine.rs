@@ -17,14 +17,16 @@ use crate::module_docs::{detect_xcode_mcp, swift_enrichment_hint};
 use crate::pyright_enrich::run_pyright_enrichment;
 use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
-    apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
-    is_reverse_expand_seed, is_trivial_exception_pivot, query_terms_for_reverse_expand,
-    resolve_adjacents, reverse_expand_best_first, reverse_expand_from_anchors, rrf_merge_ks,
-    select_adjacents, ReverseExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET,
-    ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST,
-    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES,
-    REVERSE_EXPAND_EXPAND_BUDGET, REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K,
-    REVERSE_EXPAND_SEED_MAX_CALLERS, REVERSE_EXPAND_TOTAL_BUDGET, RRF_K, STUB_SCORE_WEIGHT,
+    apply_structural_resort, dedup_by_fqn, forward_expand_best_first, forward_expand_from_anchors,
+    graph_candidates, inject_structural_candidates, is_reverse_expand_seed,
+    is_trivial_exception_pivot, query_terms_for_reverse_expand, resolve_adjacents,
+    reverse_expand_best_first, reverse_expand_from_anchors, rrf_merge_ks, select_adjacents,
+    EffectiveDirection, ExpandDirection, ReverseExpandStrategy, ANCHOR_CANDIDATES,
+    ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME,
+    ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS,
+    REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_EXPAND_BUDGET, REVERSE_EXPAND_MAX_DEPTH,
+    REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, REVERSE_EXPAND_TOTAL_BUDGET, RRF_K,
+    STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2269,6 +2271,53 @@ impl CoreEngine {
     ///
     /// Returns `(symbol_id, 1.0)` pairs in extraction order. RRF fusion
     /// handles rank-based blending with BM25 / graph / ANN.
+    /// Resolve Python traceback frames in `query` to symbol IDs.
+    ///
+    /// Each frame carries `(file_path, function_name)` — enough for a
+    /// precision-first lookup that doesn't go through BM25/embeddings.
+    /// The traceback IS the call chain; every frame is a member of the
+    /// bug's code path. Issue #95 layer 1.
+    ///
+    /// Returns `(symbol_id, 1.0)` pairs in frame order (most-recent call
+    /// first, the typical Python traceback convention). RRF fusion at
+    /// `TRACEBACK_RRF_K` ensures rank-1 frames dominate any single
+    /// BM25/ANN hit.
+    ///
+    /// File-path matching is suffix-based: a traceback frame
+    /// `astropy/io/registry.py` matches an indexed symbol whose
+    /// `file_path` ends with that string. This tolerates absolute paths
+    /// in tracebacks vs. workspace-relative paths in the index.
+    fn traceback_candidates(&self, query: &str) -> Vec<(u64, f32)> {
+        let anchors = crate::anchors::extract(query);
+        if anchors.traceback_frames.is_empty() {
+            return Vec::new();
+        }
+        let graph = self.graph.read();
+        let mut out: Vec<(u64, f32)> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        for frame in &anchors.traceback_frames {
+            // Function name may be dotted (`Class.method`); resolver-side
+            // we use the last segment for symbol-name matching.
+            let func = frame
+                .function_name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&frame.function_name);
+            for sym in graph.all_symbols() {
+                if sym.name != func {
+                    continue;
+                }
+                if !sym.file_path.ends_with(&frame.file_path) {
+                    continue;
+                }
+                if seen.insert(sym.id) {
+                    out.push((sym.id, 1.0));
+                }
+            }
+        }
+        out
+    }
+
     fn anchor_candidates(&self, query: &str, limit: usize) -> (Vec<(u64, f32)>, AnchorStats) {
         let anchors = crate::anchors::extract(query);
         if anchors.symbol_names.is_empty() {
@@ -2598,11 +2647,14 @@ impl CoreEngine {
         let re_emb_lookup: Option<std::collections::HashMap<u64, &[f32]>> =
             re_emb_guard.as_ref().map(|g| g.iter().collect());
 
-        // Resolve reverse-expand strategy from `CS_REVERSE_EXPAND_STRATEGY`.
-        // Default `V2` matches current main behaviour. The cs-benchmark
-        // diagnostic harness drives the other variants — see
-        // `docs/reverse_expand_panel.md` in cs-benchmark.
+        // Resolve reverse-expand strategy and direction from env.
+        // - `CS_REVERSE_EXPAND_STRATEGY` chooses the per-walk ranking
+        //   variant (v0/v1a/v1b/v1ab/v2/v3a/v3b/none). Default v2.
+        // - `CS_EXPAND_DIRECTION` chooses where to walk from each anchor
+        //   (auto/forward/reverse/both). Default auto — per-anchor
+        //   classifier reads off kind + fan-out ratio. Issue #95.
         let strategy = ReverseExpandStrategy::from_env();
+        let direction = ExpandDirection::from_env();
         if strategy.is_unimplemented() {
             tracing::warn!(
                 "CS_REVERSE_EXPAND_STRATEGY={:?} is not implemented yet; skipping reverse-expand",
@@ -2617,23 +2669,40 @@ impl CoreEngine {
             Vec::new()
         } else {
             let graph = self.graph.read();
-            let seed_ids: Vec<u64> = anchor_results
-                .iter()
-                .filter_map(|(id, _)| {
-                    let sym = graph.get_symbol(*id)?;
-                    if !is_reverse_expand_seed(sym) {
-                        return None;
-                    }
-                    // Hub guard: skip seeds with more than
-                    // REVERSE_EXPAND_SEED_MAX_CALLERS direct callers — their
-                    // reverse set is too broad to rank usefully.
-                    if graph.dependents(*id).len() > REVERSE_EXPAND_SEED_MAX_CALLERS {
-                        return None;
-                    }
-                    Some(*id)
-                })
-                .collect();
-            if seed_ids.is_empty() {
+
+            // Partition anchor seeds by walk direction. Eligibility differs
+            // per direction:
+            //   - Forward: any anchor with at most SEED_MAX_CALLERS dependencies.
+            //     No `is_reverse_expand_seed` kind gate — forward walks are
+            //     interesting from any anchor with a callee tree (public APIs
+            //     the user invoked → fix in implementation, etc.).
+            //   - Reverse: must be a reverse-expand seed (exception/error/
+            //     warning class) AND at most SEED_MAX_CALLERS direct callers.
+            //     This preserves existing #67 behaviour — without the kind
+            //     gate, walking reverse from a generic anchor floods the capsule.
+            let mut forward_seeds: Vec<u64> = Vec::new();
+            let mut reverse_seeds: Vec<u64> = Vec::new();
+            for (id, _) in &anchor_results {
+                let Some(sym) = graph.get_symbol(*id) else {
+                    continue;
+                };
+                let dir = direction.resolve_for(&graph, sym);
+                let do_forward =
+                    matches!(dir, EffectiveDirection::Forward | EffectiveDirection::Both);
+                let do_reverse =
+                    matches!(dir, EffectiveDirection::Reverse | EffectiveDirection::Both);
+                if do_forward && graph.dependencies(*id).len() <= REVERSE_EXPAND_SEED_MAX_CALLERS {
+                    forward_seeds.push(*id);
+                }
+                if do_reverse
+                    && is_reverse_expand_seed(sym)
+                    && graph.dependents(*id).len() <= REVERSE_EXPAND_SEED_MAX_CALLERS
+                {
+                    reverse_seeds.push(*id);
+                }
+            }
+
+            if forward_seeds.is_empty() && reverse_seeds.is_empty() {
                 Vec::new()
             } else {
                 let terms_owned = if strategy.use_query_terms() {
@@ -2663,35 +2732,109 @@ impl CoreEngine {
                 #[cfg(not(feature = "embeddings"))]
                 let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = None;
 
-                let out = if strategy.use_best_first() {
-                    reverse_expand_best_first(
-                        &graph,
-                        &seed_ids,
-                        &terms_owned,
-                        REVERSE_EXPAND_MAX_DEPTH,
-                        REVERSE_EXPAND_TOTAL_BUDGET,
-                        REVERSE_EXPAND_EXPAND_BUDGET,
-                        semantic_ref,
-                        strategy.use_exploration_bonus(),
-                    )
-                } else {
-                    let policy = strategy.fan_out_policy();
-                    reverse_expand_from_anchors(
-                        &graph,
-                        &seed_ids,
-                        &terms_owned,
-                        REVERSE_EXPAND_MAX_DEPTH,
-                        policy,
-                        REVERSE_EXPAND_CANDIDATES,
-                        semantic_ref,
-                    )
-                };
+                // Split budget proportionally when both directions are active.
+                // When only one direction has seeds, that direction gets the
+                // full budget.
+                let (fwd_total, rev_total, fwd_expand, rev_expand) =
+                    match (!forward_seeds.is_empty(), !reverse_seeds.is_empty()) {
+                        (true, true) => (
+                            REVERSE_EXPAND_TOTAL_BUDGET / 2,
+                            REVERSE_EXPAND_TOTAL_BUDGET / 2,
+                            REVERSE_EXPAND_EXPAND_BUDGET / 2,
+                            REVERSE_EXPAND_EXPAND_BUDGET / 2,
+                        ),
+                        (true, false) => (
+                            REVERSE_EXPAND_TOTAL_BUDGET,
+                            0,
+                            REVERSE_EXPAND_EXPAND_BUDGET,
+                            0,
+                        ),
+                        (false, true) => (
+                            0,
+                            REVERSE_EXPAND_TOTAL_BUDGET,
+                            0,
+                            REVERSE_EXPAND_EXPAND_BUDGET,
+                        ),
+                        (false, false) => (0, 0, 0, 0),
+                    };
+
+                let mut out: Vec<(u64, f32)> = Vec::new();
+
+                if !forward_seeds.is_empty() {
+                    let fwd_out = if strategy.use_best_first() {
+                        forward_expand_best_first(
+                            &graph,
+                            &forward_seeds,
+                            &terms_owned,
+                            REVERSE_EXPAND_MAX_DEPTH,
+                            fwd_total,
+                            fwd_expand,
+                            semantic_ref,
+                            strategy.use_exploration_bonus(),
+                        )
+                    } else {
+                        let policy = strategy.fan_out_policy();
+                        let cap = if rev_total == 0 {
+                            REVERSE_EXPAND_CANDIDATES
+                        } else {
+                            REVERSE_EXPAND_CANDIDATES / 2
+                        };
+                        forward_expand_from_anchors(
+                            &graph,
+                            &forward_seeds,
+                            &terms_owned,
+                            REVERSE_EXPAND_MAX_DEPTH,
+                            policy,
+                            cap,
+                            semantic_ref,
+                        )
+                    };
+                    out.extend(fwd_out);
+                }
+
+                if !reverse_seeds.is_empty() {
+                    let rev_out = if strategy.use_best_first() {
+                        reverse_expand_best_first(
+                            &graph,
+                            &reverse_seeds,
+                            &terms_owned,
+                            REVERSE_EXPAND_MAX_DEPTH,
+                            rev_total,
+                            rev_expand,
+                            semantic_ref,
+                            strategy.use_exploration_bonus(),
+                        )
+                    } else {
+                        let policy = strategy.fan_out_policy();
+                        let cap = if fwd_total == 0 {
+                            REVERSE_EXPAND_CANDIDATES
+                        } else {
+                            REVERSE_EXPAND_CANDIDATES / 2
+                        };
+                        reverse_expand_from_anchors(
+                            &graph,
+                            &reverse_seeds,
+                            &terms_owned,
+                            REVERSE_EXPAND_MAX_DEPTH,
+                            policy,
+                            cap,
+                            semantic_ref,
+                        )
+                    };
+                    out.extend(rev_out);
+                }
+
+                // Dedup by id, preserving first occurrence (best-ranked).
+                let mut seen: HashSet<u64> = HashSet::new();
+                out.retain(|(id, _)| seen.insert(*id));
+
                 tracing::debug!(
-                    "reverse-expand: strategy={:?} {} seeds → {} candidates (depth={}, terms={}, semantic={})",
+                    "expand: strategy={:?} dir={:?} fwd_seeds={} rev_seeds={} → {} candidates (terms={}, semantic={})",
                     strategy,
-                    seed_ids.len(),
+                    direction,
+                    forward_seeds.len(),
+                    reverse_seeds.len(),
                     out.len(),
-                    REVERSE_EXPAND_MAX_DEPTH,
                     terms_owned.len(),
                     semantic_ref.is_some()
                 );
@@ -2699,11 +2842,26 @@ impl CoreEngine {
             }
         };
 
+        // Traceback shortcut (#95 layer 1): when `--context` contains a
+        // Python traceback, every frame's `(file, function)` resolves to a
+        // high-confidence pivot candidate. The traceback IS the call
+        // chain; we feed its frames into RRF at the most aggressive `k`
+        // so rank-1 frames dominate any single BM25/ANN hit.
+        let traceback_results = self.traceback_candidates(&anchor_source);
+        if !traceback_results.is_empty() {
+            tracing::debug!(
+                "traceback shortcut: {} frame symbols resolved",
+                traceback_results.len()
+            );
+        }
+
         // ANN semantic retrieval + RRF fusion across all sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
         // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
-        // lost the target to body-field noise. Reverse-expansion sits between
-        // anchors and the default retrievers (`REVERSE_EXPAND_RRF_K`).
+        // lost the target to body-field noise. Traceback frames sit at the
+        // most aggressive `k` (TRACEBACK_RRF_K). Reverse/forward expansion
+        // sits between anchors and the default retrievers
+        // (`REVERSE_EXPAND_RRF_K`).
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
@@ -2712,6 +2870,7 @@ impl CoreEngine {
                 (&graph_results, RRF_K),
                 (&ann_results, RRF_K),
                 (&anchor_results, ANCHOR_RRF_K),
+                (&traceback_results, TRACEBACK_RRF_K),
                 (&reverse_results, REVERSE_EXPAND_RRF_K),
             ])
         };
@@ -2720,6 +2879,7 @@ impl CoreEngine {
             (&bm25_results, RRF_K),
             (&graph_results, RRF_K),
             (&anchor_results, ANCHOR_RRF_K),
+            (&traceback_results, TRACEBACK_RRF_K),
             (&reverse_results, REVERSE_EXPAND_RRF_K),
         ]);
 
