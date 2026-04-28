@@ -8,10 +8,12 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/bench.yml"
-      - "scripts/bench_summary.py"
-      - "benches/baseline.json"
-      - "benches/token_baseline.json"
   workflow_dispatch:
+
+# Benchmark scripts and baselines live in a separate repo (cs-benchmark).
+# This workflow checks it out alongside the codesurgeon source so the
+# token-savings example output (in this repo's target/) can be diffed
+# against committed baselines (in cs-benchmark).
 
 permissions:
   contents: read
@@ -27,6 +29,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Check out cs-benchmark (sibling repo with baselines + summary script)
+        uses: actions/checkout@v6
+        with:
+          repository: subsriram/cs-benchmark
+          path: cs-benchmark
+          # Don't fail the bench job if cs-benchmark isn't published yet —
+          # the summary step skips when the script is missing.
+          continue-on-error: true
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -54,8 +65,11 @@ jobs:
 
       - name: Render summary
         id: summary
+        if: hashFiles('cs-benchmark/scripts/bench_summary.py') != ''
+        env:
+          CODESURGEON_DIR: ${{ github.workspace }}
         run: |
-          python3 scripts/bench_summary.py > bench-summary.md
+          python3 cs-benchmark/scripts/bench_summary.py > bench-summary.md
           cat bench-summary.md
           {
             echo 'body<<BENCHEOF'
@@ -64,7 +78,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Post PR comment
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.summary.outputs.body != ''
         uses: actions/github-script@v7
         env:
           SUMMARY_BODY: ${{ steps.summary.outputs.body }}

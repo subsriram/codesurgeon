@@ -267,12 +267,14 @@ schema rewrite. Not currently planned.
 Workflow to reproduce any of the rows in the table above:
 
 ```bash
-bash benches/swebench/prepare_workspace.sh sympy__sympy-21379
+# Benchmark harness lives in the cs-benchmark repo (~/projects/cs-benchmark).
+# CODESURGEON_DIR points run.py at the codesurgeon binaries built here.
+bash ~/projects/cs-benchmark/benches/swebench/prepare_workspace.sh sympy__sympy-21379
 
-uv run benches/swebench/run.py \
+CODESURGEON_DIR=$PWD uv run ~/projects/cs-benchmark/benches/swebench/run.py \
   --instance-ids sympy__sympy-21379 \
   --arms with \
-  --reuse-workdir target/swebench-warm/sympy__sympy-21379 \
+  --reuse-workdir ~/projects/cs-benchmark/target/swebench-warm/sympy__sympy-21379 \
   --max-budget-usd 3.00 \
   --timeout 600 \
   --nudge 5b \

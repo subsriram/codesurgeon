@@ -1,8 +1,0 @@
-{
-  "_comment": "Baseline medians for the indexing criterion bench on ubuntu-latest. Generated from GitHub Actions run 24431645924 on 2026-04-15. Regenerate by running `gh workflow run bench.yml --ref main`, then copy the medians from the log into this file. scripts/bench_summary.py reads this to compute Δ vs baseline for PR comments. Advisory only — no CI gate.",
-  "index_cold": { "median_ns": 109000000, "mean_ns": 110060000 },
-  "index_warm": { "median_ns": 2020000, "mean_ns": 2700000 },
-  "run_pipeline/fix retry logic": { "median_ns": 1460000, "mean_ns": 1460000 },
-  "run_pipeline/token budget assembly": { "median_ns": 1790000, "mean_ns": 1790000 },
-  "run_pipeline/how does BM25 search work": { "median_ns": 1970000, "mean_ns": 1980000 }
-}
