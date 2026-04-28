@@ -112,6 +112,24 @@ pub(crate) const REVERSE_EXPAND_EXPAND_BUDGET: usize = 200;
 /// the per-candidate signal.
 pub(crate) const REVERSE_EXPAND_UCB_C: f32 = 0.5;
 
+/// Read `CS_REVERSE_EXPAND_TOTAL_BUDGET` and
+/// `CS_REVERSE_EXPAND_EXPAND_BUDGET` from the environment; fall back to
+/// `REVERSE_EXPAND_TOTAL_BUDGET` / `REVERSE_EXPAND_EXPAND_BUDGET`
+/// constants if unset or unparseable. Lets the cs-benchmark panel
+/// ablate budget without rebuilding the binary — issue #96 step 1.
+pub(crate) fn resolve_total_budget() -> usize {
+    std::env::var("CS_REVERSE_EXPAND_TOTAL_BUDGET")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(REVERSE_EXPAND_TOTAL_BUDGET)
+}
+pub(crate) fn resolve_expand_budget() -> usize {
+    std::env::var("CS_REVERSE_EXPAND_EXPAND_BUDGET")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(REVERSE_EXPAND_EXPAND_BUDGET)
+}
+
 /// Per-hop fan-out policy for `reverse_expand_from_anchors`. The historical
 /// default (`Fixed(REVERSE_EXPAND_FAN_OUT)`) explores top-N callers
 /// uniformly across hops. `DensityScaled` lets dense seeds spend more
@@ -603,6 +621,7 @@ fn expand_from_anchors_directional(
 
     let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
     let mut out: Vec<(u64, f32)> = Vec::new();
+    let mut depth_emitted: [usize; 8] = [0; 8];
     let mut queue: VecDeque<(u64, u32)> = seed_ids.iter().map(|&id| (id, 0)).collect();
 
     while let Some((id, depth)) = queue.pop_front() {
@@ -667,14 +686,29 @@ fn expand_from_anchors_directional(
         for (cid, _) in scored.into_iter().take(hop_fan_out) {
             if visited.insert(cid) {
                 let score = 1.0 / (depth as f32 + 2.0);
+                let next_depth = depth + 1;
+                let bucket = (next_depth as usize).min(depth_emitted.len() - 1);
+                depth_emitted[bucket] += 1;
                 out.push((cid, score));
                 if out.len() >= max_total {
+                    tracing::debug!(
+                        "expand-bfs [{:?}]: emitted {} (cap), depth_dist={:?}",
+                        direction,
+                        out.len(),
+                        &depth_emitted[1..]
+                    );
                     return out;
                 }
-                queue.push_back((cid, depth + 1));
+                queue.push_back((cid, next_depth));
             }
         }
     }
+    tracing::debug!(
+        "expand-bfs [{:?}]: emitted {}, depth_dist={:?}",
+        direction,
+        out.len(),
+        &depth_emitted[1..]
+    );
     out
 }
 
@@ -799,6 +833,7 @@ fn expand_best_first_directional(
 
     let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
     let mut out: Vec<(u64, f32)> = Vec::new();
+    let mut depth_emitted: [usize; 8] = [0; 8];
     let mut pq: BinaryHeap<PqItem> = BinaryHeap::new();
     let mut subtree_visits: HashMap<u64, usize> = HashMap::new();
     let mut total_expansions: usize = 0;
@@ -860,10 +895,19 @@ fn expand_best_first_directional(
 
             let next_depth = item.depth + 1;
             let out_score = 1.0 / (next_depth as f32 + 1.0);
+            let bucket = (next_depth as usize).min(depth_emitted.len() - 1);
+            depth_emitted[bucket] += 1;
             out.push((s.id, out_score));
             *subtree_visits.entry(item.parent_seed).or_insert(0) += 1;
 
             if out.len() >= total_budget {
+                tracing::debug!(
+                    "expand-best-first [{:?}]: emitted {} (cap), expansions={}, depth_dist={:?}",
+                    direction,
+                    out.len(),
+                    total_expansions,
+                    &depth_emitted[1..]
+                );
                 return out;
             }
 
@@ -876,6 +920,13 @@ fn expand_best_first_directional(
         }
     }
 
+    tracing::debug!(
+        "expand-best-first [{:?}]: emitted {}, expansions={}, depth_dist={:?}",
+        direction,
+        out.len(),
+        total_expansions,
+        &depth_emitted[1..]
+    );
     out
 }
 

@@ -20,12 +20,12 @@ use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, forward_expand_best_first, forward_expand_from_anchors,
     graph_candidates, inject_structural_candidates, is_reverse_expand_seed,
     is_trivial_exception_pivot, query_terms_for_reverse_expand, resolve_adjacents,
-    reverse_expand_best_first, reverse_expand_from_anchors, rrf_merge_ks, select_adjacents,
-    EffectiveDirection, ExpandDirection, ReverseExpandStrategy, ANCHOR_CANDIDATES,
-    ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME,
-    ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS,
-    REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_EXPAND_BUDGET, REVERSE_EXPAND_MAX_DEPTH,
-    REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, REVERSE_EXPAND_TOTAL_BUDGET, RRF_K,
+    resolve_expand_budget, resolve_total_budget, reverse_expand_best_first,
+    reverse_expand_from_anchors, rrf_merge_ks, select_adjacents, EffectiveDirection,
+    ExpandDirection, ReverseExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET,
+    ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST,
+    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES,
+    REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
     STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
 };
 #[cfg(feature = "embeddings")]
@@ -2734,27 +2734,22 @@ impl CoreEngine {
 
                 // Split budget proportionally when both directions are active.
                 // When only one direction has seeds, that direction gets the
-                // full budget.
+                // full budget. `CS_REVERSE_EXPAND_TOTAL_BUDGET` and
+                // `CS_REVERSE_EXPAND_EXPAND_BUDGET` env vars override the
+                // constants — issue #96 step 1 (ablate budget without
+                // rebuilding the binary).
+                let total_budget = resolve_total_budget();
+                let expand_budget = resolve_expand_budget();
                 let (fwd_total, rev_total, fwd_expand, rev_expand) =
                     match (!forward_seeds.is_empty(), !reverse_seeds.is_empty()) {
                         (true, true) => (
-                            REVERSE_EXPAND_TOTAL_BUDGET / 2,
-                            REVERSE_EXPAND_TOTAL_BUDGET / 2,
-                            REVERSE_EXPAND_EXPAND_BUDGET / 2,
-                            REVERSE_EXPAND_EXPAND_BUDGET / 2,
+                            total_budget / 2,
+                            total_budget / 2,
+                            expand_budget / 2,
+                            expand_budget / 2,
                         ),
-                        (true, false) => (
-                            REVERSE_EXPAND_TOTAL_BUDGET,
-                            0,
-                            REVERSE_EXPAND_EXPAND_BUDGET,
-                            0,
-                        ),
-                        (false, true) => (
-                            0,
-                            REVERSE_EXPAND_TOTAL_BUDGET,
-                            0,
-                            REVERSE_EXPAND_EXPAND_BUDGET,
-                        ),
+                        (true, false) => (total_budget, 0, expand_budget, 0),
+                        (false, true) => (0, total_budget, 0, expand_budget),
                         (false, false) => (0, 0, 0, 0),
                     };
 
