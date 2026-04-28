@@ -235,14 +235,13 @@ candidates (replaces surface-text term overlap), traceback parsing on
 `context` (high-precision signal when tracebacks are present),
 reproducer-test awareness (swebench-specific).
 
-### Rejected: WIP fenced-blocks-in-`task` prompt format
+### Rejected: fenced-blocks-in-`task` prompt format
 
-A pre-`context`-split prompt design lived on the
-`swebench-resilience-and-index-cache` branch (commit `fa87f8f`):
-agent writes a one-line summary in `task=` then pastes only the fenced
-code blocks from the problem statement, inline, wrapped in triple
-backticks. Author-stated motivation: "without the fenced code blocks
-the capsule often ranks the wrong file."
+A pre-`context`-split prompt design was considered: agent writes a
+one-line summary in `task=` then pastes only the fenced code blocks
+from the problem statement, inline, wrapped in triple backticks.
+Stated motivation: "without the fenced code blocks the capsule often
+ranks the wrong file."
 
 Rejected post-`context`-split (2026-04-27). Three reasons:
 
