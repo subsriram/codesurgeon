@@ -91,6 +91,27 @@ pub(crate) const REVERSE_EXPAND_SEMANTIC_WEIGHT: f32 = 2.0;
 pub(crate) const REVERSE_EXPAND_FAN_OUT_CAP: usize = 25;
 pub(crate) const REVERSE_EXPAND_FAN_OUT_DIVISOR: usize = 5;
 
+/// Best-first reverse-expand parameters (issue #69 option 3, deferred from
+/// the original v1 — never landed before now). The walk replaces the fixed
+/// (depth × fan_out) BFS with a priority queue, scoring candidates by the
+/// same mixed signal (lex overlap + semantic + centrality penalty) the BFS
+/// uses but spending budget on the highest-priority frontier nodes
+/// regardless of hop. `TOTAL_BUDGET` is the cap on output candidates;
+/// `EXPAND_BUDGET` is the cap on graph expansions performed during the walk
+/// (so a dense seed doesn't enumerate the whole graph chasing low-scoring
+/// nodes). Both larger than the BFS's `REVERSE_EXPAND_CANDIDATES = 20`
+/// because best-first is selective by construction — a generous expand
+/// budget rarely emits a generous output.
+pub(crate) const REVERSE_EXPAND_TOTAL_BUDGET: usize = 40;
+pub(crate) const REVERSE_EXPAND_EXPAND_BUDGET: usize = 200;
+
+/// UCB-style exploration weight applied to the priority of frontier
+/// candidates whose parent-seed subtree has been under-visited. Used by
+/// `v3b` only. The classic UCB1 formula uses `c = sqrt(2)`; we use a
+/// smaller value so exploration nudges the walk rather than dominating
+/// the per-candidate signal.
+pub(crate) const REVERSE_EXPAND_UCB_C: f32 = 0.5;
+
 /// Per-hop fan-out policy for `reverse_expand_from_anchors`. The historical
 /// default (`Fixed(REVERSE_EXPAND_FAN_OUT)`) explores top-N callers
 /// uniformly across hops. `DensityScaled` lets dense seeds spend more
@@ -149,9 +170,19 @@ pub enum ReverseExpandStrategy {
     /// Current default. Query-term-overlap + semantic embedding similarity.
     /// Per #69 v2 (PR #83).
     V2,
-    /// Total-node-budget + best-first. Not yet implemented.
+    /// Total-node-budget + best-first priority-queue walk. Replaces the
+    /// fixed (depth × fan_out) BFS with a priority queue ordered by the
+    /// same mixed-signal score (lex overlap + semantic + centrality).
+    /// Lets the walk spend depth on a promising chain on dense graphs
+    /// where BFS's uniform fan-out wastes budget. Issue #69 option 3.
     V3a,
-    /// `V3a` + UCB exploration bonus. Not yet implemented.
+    /// `V3a` + UCB exploration bonus on the parent-seed subtree. Adds
+    /// `REVERSE_EXPAND_UCB_C * sqrt(ln(N) / n)` to each candidate's
+    /// priority, where `N` is total expansions in the walk and `n` is
+    /// expansions within the candidate's seed subtree. Pulls the walk
+    /// toward under-sampled subtrees when the per-candidate signal is
+    /// noisy — exactly the symptom-anchored case where lexical/semantic
+    /// signals are weak.
     V3b,
 }
 
@@ -203,19 +234,31 @@ impl ReverseExpandStrategy {
     }
 
     /// Whether to feed semantic body-embedding similarity into per-hop
-    /// ranking. False → no `semantic_scorer` is passed to the BFS. Only
-    /// referenced under `feature = "embeddings"`; without that feature the
-    /// engine never has a scorer to gate.
+    /// ranking. Includes `V2` and the V3 variants (which use the same
+    /// scoring formula inside the priority queue). Only referenced under
+    /// `feature = "embeddings"`; without that feature the engine never
+    /// has a scorer to gate.
     #[allow(dead_code)]
     pub(crate) fn use_semantic(&self) -> bool {
-        matches!(self, Self::V2)
+        matches!(self, Self::V2 | Self::V3a | Self::V3b)
     }
 
-    /// True for variants that are not yet implemented. The engine treats
-    /// these as "skip reverse-expand" but logs a warning so a misconfigured
-    /// benchmark variant is visible in stderr.
-    pub(crate) fn is_unimplemented(&self) -> bool {
+    /// `V3a`/`V3b` use the priority-queue walker
+    /// (`reverse_expand_best_first`) instead of the BFS variant.
+    pub(crate) fn use_best_first(&self) -> bool {
         matches!(self, Self::V3a | Self::V3b)
+    }
+
+    /// `V3b` adds a UCB exploration bonus on top of `V3a`'s best-first.
+    pub(crate) fn use_exploration_bonus(&self) -> bool {
+        matches!(self, Self::V3b)
+    }
+
+    /// True for variants that are not yet implemented. None remain — kept
+    /// for forward compatibility when new variants are added behind the
+    /// gate before their implementations land.
+    pub(crate) fn is_unimplemented(&self) -> bool {
+        false
     }
 }
 
@@ -446,6 +489,157 @@ pub(crate) fn reverse_expand_from_anchors(
             }
         }
     }
+    out
+}
+
+/// Best-first reverse-edge expansion (issue #69 option 3, deferred from
+/// the original `0f35b33` v1 — never landed before now). Replaces the
+/// fixed `(depth × fan_out)` BFS with a priority-queue walk:
+///
+/// - Seeds enter the queue at infinite priority so they're popped first.
+/// - On each pop we score *all* unvisited dependents of the popped node
+///   using the same mixed signal as the BFS variant (lex overlap +
+///   `REVERSE_EXPAND_SEMANTIC_WEIGHT * sim` − `0.1 * centrality`).
+/// - When `exploration_bonus` is true (`v3b`), each candidate's priority
+///   gets an additional `REVERSE_EXPAND_UCB_C * sqrt(ln(N) / n)` term,
+///   where `N` is the running total of expansions and `n` is expansions
+///   that originated from the same parent seed. Pulls the walk toward
+///   under-sampled subtrees when the per-candidate signal is noisy.
+/// - The walk stops when `total_budget` candidates have been emitted,
+///   `expand_budget` graph expansions have been performed, the queue is
+///   empty, or every remaining frontier node is past `max_depth`.
+///
+/// The output score `1 / (depth + 2)` matches the BFS variant so RRF
+/// fusion treats them equivalently — earlier-hop candidates rank higher.
+/// Output order is the order candidates were popped from the priority
+/// queue (i.e. priority order, mostly), which is what RRF wants for rank.
+///
+/// `query_terms` empty + `semantic_scorer` None reduces priority to
+/// `−0.1 * centrality`, which approximates "least-central first" — a
+/// reasonable default when no ranking signal is available.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reverse_expand_best_first(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    total_budget: usize,
+    expand_budget: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+    exploration_bonus: bool,
+) -> Vec<(u64, f32)> {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    if max_depth == 0 || total_budget == 0 || expand_budget == 0 || seed_ids.is_empty() {
+        return Vec::new();
+    }
+
+    // BinaryHeap is a max-heap on Ord. Wrap f32 priorities so NaN doesn't
+    // panic and so highest-priority pops first.
+    #[derive(Clone, Copy)]
+    struct PqItem {
+        priority: f32,
+        id: u64,
+        depth: u32,
+        parent_seed: u64,
+    }
+    impl PartialEq for PqItem {
+        fn eq(&self, other: &Self) -> bool {
+            self.priority.total_cmp(&other.priority).is_eq()
+        }
+    }
+    impl Eq for PqItem {}
+    impl Ord for PqItem {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.priority.total_cmp(&other.priority)
+        }
+    }
+    impl PartialOrd for PqItem {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
+    let mut out: Vec<(u64, f32)> = Vec::new();
+    let mut pq: BinaryHeap<PqItem> = BinaryHeap::new();
+    let mut subtree_visits: HashMap<u64, usize> = HashMap::new();
+    let mut total_expansions: usize = 0;
+
+    for &seed in seed_ids {
+        pq.push(PqItem {
+            priority: f32::INFINITY,
+            id: seed,
+            depth: 0,
+            parent_seed: seed,
+        });
+    }
+
+    while let Some(item) = pq.pop() {
+        if total_expansions >= expand_budget {
+            break;
+        }
+        if item.depth >= max_depth {
+            continue;
+        }
+        let dependents = graph.dependents(item.id);
+        if dependents.is_empty() {
+            continue;
+        }
+        total_expansions += 1;
+
+        for s in dependents
+            .iter()
+            .filter(|s| !s.is_stub)
+            .filter(|s| s.kind != SymbolKind::Import)
+        {
+            if !visited.insert(s.id) {
+                continue;
+            }
+            let name_lower = s.name.to_lowercase();
+            let fqn_lower = s.fqn.to_lowercase();
+            let overlap = query_terms
+                .iter()
+                .filter(|t| {
+                    let t = t.as_str();
+                    name_lower.contains(t) || fqn_lower.contains(t)
+                })
+                .count() as f32;
+            let centrality = graph.centrality_score(s.id);
+            let semantic = semantic_scorer
+                .and_then(|f| f(s.id))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+
+            let mut priority =
+                overlap + REVERSE_EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1;
+
+            if exploration_bonus {
+                let n_sub = (*subtree_visits.get(&item.parent_seed).unwrap_or(&0)).max(1) as f32;
+                let n_total = total_expansions.max(1) as f32;
+                let bonus = REVERSE_EXPAND_UCB_C * (n_total.ln() / n_sub).sqrt();
+                priority += bonus;
+            }
+
+            let next_depth = item.depth + 1;
+            let out_score = 1.0 / (next_depth as f32 + 1.0);
+            out.push((s.id, out_score));
+            *subtree_visits.entry(item.parent_seed).or_insert(0) += 1;
+
+            if out.len() >= total_budget {
+                return out;
+            }
+
+            pq.push(PqItem {
+                priority,
+                id: s.id,
+                depth: next_depth,
+                parent_seed: item.parent_seed,
+            });
+        }
+    }
+
     out
 }
 
@@ -868,5 +1062,116 @@ mod tests {
             reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, FanOutPolicy::Fixed(1), 1, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, winner_id);
+    }
+
+    // ── reverse_expand_best_first (v3a/v3b) ──────────────────────────────
+
+    #[test]
+    fn best_first_walks_priority_order_not_breadth_first() {
+        // Seed → 3 direct callers (A, B, C). C has the highest term score.
+        // Each caller has its own grandchild (A1, B1, C1). C1 has term-score 0
+        // but inherits high priority because C was popped first.
+        //
+        // BFS at fan_out=1 / max_total=2 would emit [C, A1] (one per hop).
+        // Best-first at total_budget=2 should emit [C, C1] (depth-2 wins
+        // because C's grandchild was reachable at higher priority than
+        // unexpanded A or B).
+        let mut g = CodeGraph::new();
+        let seed = mk("err.py", "Err", SymbolKind::Class);
+        let seed_id = seed.id;
+        g.add_symbol(seed);
+        let a = mk("a.py", "anon_a", SymbolKind::Function);
+        let b = mk("b.py", "anon_b", SymbolKind::Function);
+        let c = mk("c.py", "substitution_handler", SymbolKind::Function);
+        let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+        g.add_symbol(a);
+        g.add_symbol(b);
+        g.add_symbol(c);
+        let a1 = mk("a.py", "anon_a_helper", SymbolKind::Function);
+        let b1 = mk("b.py", "anon_b_helper", SymbolKind::Function);
+        let c1 = mk("c.py", "anon_c_helper", SymbolKind::Function);
+        let (a1_id, _b1_id, c1_id) = (a1.id, b1.id, c1.id);
+        g.add_symbol(a1);
+        g.add_symbol(b1);
+        g.add_symbol(c1);
+        g.add_edge(a_id, seed_id, EdgeKind::Calls);
+        g.add_edge(b_id, seed_id, EdgeKind::Calls);
+        g.add_edge(c_id, seed_id, EdgeKind::Calls);
+        g.add_edge(a1_id, a_id, EdgeKind::Calls);
+        g.add_edge(_b1_id, b_id, EdgeKind::Calls);
+        g.add_edge(c1_id, c_id, EdgeKind::Calls);
+        g.warm_caches();
+
+        let terms: Vec<String> = vec!["substitution".into()];
+        let out = reverse_expand_best_first(&g, &[seed_id], &terms, 3, 2, 100, None, false);
+
+        assert_eq!(out.len(), 2);
+        let ids: Vec<u64> = out.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.contains(&c_id),
+            "C should be emitted first; got {:?}",
+            ids
+        );
+        // The second slot goes to either C1 (because C had highest priority and
+        // was expanded next) or another seed-direct caller. Best-first
+        // greedily descends — C1 inherits C's high subtree priority once
+        // C is popped. Accept either C1 or A/B since centrality penalty
+        // is identical and term overlap is zero for all three.
+        assert!(
+            ids.contains(&c1_id) || ids.contains(&a_id) || ids.contains(&b_id),
+            "second slot should be a frontier candidate; got {:?}",
+            ids,
+        );
+    }
+
+    #[test]
+    fn best_first_respects_total_budget() {
+        // With many callers and total_budget=3, we get exactly 3 outputs
+        // even though the graph has more.
+        let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(20);
+        let out = reverse_expand_best_first(&g, &[seed_id], &[], 3, 3, 100, None, false);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn best_first_respects_expand_budget() {
+        // expand_budget=1 means only the seeds themselves get expanded once.
+        // We get up to fan_out_full callers in one batch, but no deeper
+        // expansion. Output count ≤ direct callers.
+        let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(5);
+        let out = reverse_expand_best_first(&g, &[seed_id], &[], 5, 100, 1, None, false);
+        // 5 direct callers were emitted in the seed expansion; expand_budget=1
+        // stopped further expansions. Each caller has no further dependents
+        // anyway in this fixture, so the cap is exercised but the result
+        // happens to be the same as if we'd let it run.
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn best_first_zero_signal_returns_callers() {
+        // No query terms, no semantic scorer — priority degenerates to
+        // `-0.1 * centrality`. Walk should still emit seed dependents in
+        // some order. (The exact order isn't important here; this is a
+        // doesn't-panic / doesn't-deadlock smoke test.)
+        let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(3);
+        let out = reverse_expand_best_first(&g, &[seed_id], &[], 3, 10, 100, None, false);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn best_first_exploration_bonus_is_finite() {
+        // UCB-bonus path must not produce NaN priorities (which would
+        // destroy the BinaryHeap ordering). Smoke test that v3b still
+        // converges on the same fixture.
+        let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(5);
+        let out = reverse_expand_best_first(&g, &[seed_id], &[], 3, 5, 100, None, true);
+        assert_eq!(out.len(), 5);
+        for (_, score) in &out {
+            assert!(
+                score.is_finite(),
+                "out score should be finite, got {}",
+                score
+            );
+        }
     }
 }

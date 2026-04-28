@@ -19,11 +19,12 @@ use crate::ranking::BM25_POOL_SIZE;
 use crate::ranking::{
     apply_structural_resort, dedup_by_fqn, graph_candidates, inject_structural_candidates,
     is_reverse_expand_seed, is_trivial_exception_pivot, query_terms_for_reverse_expand,
-    resolve_adjacents, reverse_expand_from_anchors, rrf_merge_ks, select_adjacents,
-    ReverseExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF,
-    ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
-    MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_MAX_DEPTH,
-    REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K, STUB_SCORE_WEIGHT,
+    resolve_adjacents, reverse_expand_best_first, reverse_expand_from_anchors, rrf_merge_ks,
+    select_adjacents, ReverseExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET,
+    ANCHOR_FUZZY_CUTOFF, ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST,
+    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES,
+    REVERSE_EXPAND_EXPAND_BUDGET, REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K,
+    REVERSE_EXPAND_SEED_MAX_CALLERS, REVERSE_EXPAND_TOTAL_BUDGET, RRF_K, STUB_SCORE_WEIGHT,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2662,23 +2663,35 @@ impl CoreEngine {
                 #[cfg(not(feature = "embeddings"))]
                 let semantic_ref: Option<&dyn Fn(u64) -> Option<f32>> = None;
 
-                let policy = strategy.fan_out_policy();
-                let out = reverse_expand_from_anchors(
-                    &graph,
-                    &seed_ids,
-                    &terms_owned,
-                    REVERSE_EXPAND_MAX_DEPTH,
-                    policy,
-                    REVERSE_EXPAND_CANDIDATES,
-                    semantic_ref,
-                );
+                let out = if strategy.use_best_first() {
+                    reverse_expand_best_first(
+                        &graph,
+                        &seed_ids,
+                        &terms_owned,
+                        REVERSE_EXPAND_MAX_DEPTH,
+                        REVERSE_EXPAND_TOTAL_BUDGET,
+                        REVERSE_EXPAND_EXPAND_BUDGET,
+                        semantic_ref,
+                        strategy.use_exploration_bonus(),
+                    )
+                } else {
+                    let policy = strategy.fan_out_policy();
+                    reverse_expand_from_anchors(
+                        &graph,
+                        &seed_ids,
+                        &terms_owned,
+                        REVERSE_EXPAND_MAX_DEPTH,
+                        policy,
+                        REVERSE_EXPAND_CANDIDATES,
+                        semantic_ref,
+                    )
+                };
                 tracing::debug!(
-                    "reverse-expand: strategy={:?} {} seeds → {} candidates (depth={}, policy={:?}, terms={}, semantic={})",
+                    "reverse-expand: strategy={:?} {} seeds → {} candidates (depth={}, terms={}, semantic={})",
                     strategy,
                     seed_ids.len(),
                     out.len(),
                     REVERSE_EXPAND_MAX_DEPTH,
-                    policy,
                     terms_owned.len(),
                     semantic_ref.is_some()
                 );
