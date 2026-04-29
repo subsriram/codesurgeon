@@ -2604,7 +2604,8 @@ impl CoreEngine {
             Some(ctx) if !ctx.is_empty() => format!("{query}\n{ctx}"),
             _ => query.to_string(),
         };
-        let (anchor_results, astats) = self.anchor_candidates(&anchor_source, ANCHOR_CANDIDATES);
+        let (mut anchor_results, astats) =
+            self.anchor_candidates(&anchor_source, ANCHOR_CANDIDATES);
         tracing::debug!(
             "anchor stats: {:?} (context bytes: {})",
             astats,
@@ -2753,7 +2754,26 @@ impl CoreEngine {
             forward_seeds.sort_unstable();
             reverse_seeds.sort_unstable();
 
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            // Seed-as-pivot guarantee (#96): the walker emits seeds'
+            // *children* but never the seeds themselves; meanwhile the
+            // anchor_candidates lookup is `name`-keyed, so seeds whose
+            // name has a `::` (class methods) don't enter anchor_results
+            // either. Without this injection, a freshly-promoted seed
+            // like `Axes::hist` walks its subtree but is itself absent
+            // from final pivots — observed on the matplotlib probe.
+            // Push seeds into anchor_results with anchor-grade score so
+            // they get the `ANCHOR_RRF_K` (precision-first) treatment
+            // in RRF fusion. Dedup against existing entries.
+            {
+                let existing: HashSet<u64> = anchor_results.iter().map(|(id, _)| *id).collect();
+                for &id in forward_seeds.iter().chain(reverse_seeds.iter()) {
+                    if !existing.contains(&id) {
+                        anchor_results.push((id, 1.0));
+                    }
+                }
+            }
+
+            if tracing::enabled!(target: "cs_core::ranking", tracing::Level::DEBUG) {
                 let fmt_fqns = |ids: &[u64]| -> String {
                     ids.iter()
                         .filter_map(|id| graph.get_symbol(*id).map(|s| s.fqn.as_str()))

@@ -110,11 +110,19 @@ pub(crate) const EXPAND_FAN_OUT_DIVISOR: usize = 5;
 /// regardless of hop. `TOTAL_BUDGET` is the cap on output candidates;
 /// `EXPAND_BUDGET` is the cap on graph expansions performed during the walk
 /// (so a dense seed doesn't enumerate the whole graph chasing low-scoring
-/// nodes). Both larger than the BFS's `EXPAND_CANDIDATES = 20`
-/// because best-first is selective by construction — a generous expand
-/// budget rarely emits a generous output.
-pub(crate) const EXPAND_TOTAL_BUDGET: usize = 40;
-pub(crate) const EXPAND_GRAPH_BUDGET: usize = 200;
+/// nodes).
+///
+/// Issue #96 — bumped from 40 → 200 / 200 → 1000 after the matplotlib
+/// probe showed default-budget runs only reached depth 1–2 in dense
+/// codebases (matplotlib `Axes::hist`'s implementation tree is
+/// 3 hops deep; default 40-output cap fired before depth 3 was even
+/// touched). The user's TOTAL=500 probe confirmed the chain
+/// `Axes::hist → fill → add_patch → _update_patch_limits` is
+/// reachable; default needed to be high enough for depth 3 in the
+/// common case. Walker overhead at TOTAL=500 was ~600 ms wall, so
+/// 200 is well under any latency budget.
+pub(crate) const EXPAND_TOTAL_BUDGET: usize = 200;
+pub(crate) const EXPAND_GRAPH_BUDGET: usize = 1000;
 
 /// UCB-style exploration weight applied to the priority of frontier
 /// candidates whose parent-seed subtree has been under-visited. Used by
