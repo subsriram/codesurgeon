@@ -483,6 +483,18 @@ pub(crate) const ANCHOR_RRF_K: f32 = 15.0;
 /// by construction, and a frame in the traceback IS a member of the
 /// call chain that produced the bug. Issue #95 layer 1.
 pub(crate) const TRACEBACK_RRF_K: f32 = 8.0;
+
+/// RRF k for **deep** expansion emissions (depth ≥ 2 from a seed).
+/// Smaller than `EXPAND_RRF_K = 30` so deep chain candidates compete
+/// with multi-seed-agreement nodes (e.g. `gca`, `gcf`) that accumulate
+/// RRF score by appearing in BM25 + anchor + ANN + expand lists. Without
+/// this split, a fix-site reachable only via a single seed's depth-3
+/// chain (e.g. matplotlib `Axes::hist → fill → add_patch → _update_patch_limits`)
+/// loses to "near to many anchors but unrelated" noise. Calibrated to
+/// `TRACEBACK_RRF_K` because traceback frames and seed-rooted chains
+/// share the same precision-first shape: a member of a verified call
+/// chain from a user-named anchor is on-bug by construction. Issue #96.
+pub(crate) const EXPAND_DEEP_RRF_K: f32 = 8.0;
 /// Structural injection: score multiplier for injected hub types.
 pub(crate) const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
 /// Centrality boost multiplier applied to BM25 score.

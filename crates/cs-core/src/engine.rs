@@ -24,8 +24,9 @@ use crate::ranking::{
     reverse_expand_from_anchors, rrf_merge_ks, select_adjacents, EffectiveDirection,
     ExpandDirection, ExpandStrategy, ANCHOR_CANDIDATES, ANCHOR_FILE_BUDGET, ANCHOR_FUZZY_CUTOFF,
     ANCHOR_FUZZY_PROBE, ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, EXPAND_CANDIDATES,
-    EXPAND_MAX_DEPTH, EXPAND_RRF_K, EXPAND_SEED_FANOUT_LIMIT, EXPAND_SEED_PER_NAME_LIMIT,
-    GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K, STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
+    EXPAND_DEEP_RRF_K, EXPAND_MAX_DEPTH, EXPAND_RRF_K, EXPAND_SEED_FANOUT_LIMIT,
+    EXPAND_SEED_PER_NAME_LIMIT, GRAPH_CANDIDATES, MARKDOWN_CENTRALITY_BYPASS, RRF_K,
+    STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2940,13 +2941,40 @@ impl CoreEngine {
             );
         }
 
+        // Split expand emissions by depth for RRF re-weighting (#96 item A).
+        // The walkers encode depth as `score = 1.0 / (depth + 1)`:
+        //   - score == 0.5  → depth-1 emission (direct neighbour)
+        //   - score <  0.5  → depth ≥ 2 emission (chain)
+        // Deep chain candidates compete poorly against multi-seed
+        // agreement (e.g. `gca`, `gcf` — graph-near to several anchors)
+        // when fused at the same RRF k as shallow ones. Splitting and
+        // fusing the deep list at the smaller `EXPAND_DEEP_RRF_K = 8`
+        // gives chain symbols a precision-first boost equivalent to
+        // traceback-frame priority — they're members of a verified
+        // single-seed call chain, on-bug by construction.
+        let (expand_shallow, expand_deep) = {
+            let (a, b): (Vec<_>, Vec<_>) =
+                reverse_results.into_iter().partition(|(_, s)| *s >= 0.45);
+            (a, b)
+        };
+        if tracing::enabled!(target: "cs_core::ranking", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "cs_core::ranking",
+                "expand fusion split: {} shallow (depth=1, k={}) + {} deep (depth≥2, k={})",
+                expand_shallow.len(),
+                EXPAND_RRF_K,
+                expand_deep.len(),
+                EXPAND_DEEP_RRF_K
+            );
+        }
+
         // ANN semantic retrieval + RRF fusion across all sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
         // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
-        // lost the target to body-field noise. Traceback frames sit at the
-        // most aggressive `k` (TRACEBACK_RRF_K). Reverse/forward expansion
-        // sits between anchors and the default retrievers
-        // (`EXPAND_RRF_K`).
+        // lost the target to body-field noise. Traceback frames and deep
+        // chain emissions sit at the most aggressive `k` (TRACEBACK_RRF_K /
+        // EXPAND_DEEP_RRF_K). Shallow expand sits between anchors and the
+        // default retrievers (`EXPAND_RRF_K`).
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
@@ -2956,7 +2984,8 @@ impl CoreEngine {
                 (&ann_results, RRF_K),
                 (&anchor_results, ANCHOR_RRF_K),
                 (&traceback_results, TRACEBACK_RRF_K),
-                (&reverse_results, EXPAND_RRF_K),
+                (&expand_shallow, EXPAND_RRF_K),
+                (&expand_deep, EXPAND_DEEP_RRF_K),
             ])
         };
         #[cfg(not(feature = "embeddings"))]
@@ -2965,7 +2994,8 @@ impl CoreEngine {
             (&graph_results, RRF_K),
             (&anchor_results, ANCHOR_RRF_K),
             (&traceback_results, TRACEBACK_RRF_K),
-            (&reverse_results, EXPAND_RRF_K),
+            (&expand_shallow, EXPAND_RRF_K),
+            (&expand_deep, EXPAND_DEEP_RRF_K),
         ]);
 
         let graph = self.graph.read();
@@ -3088,7 +3118,8 @@ impl CoreEngine {
         let pinning_candidates: Vec<(u64, f32)> = anchor_results
             .iter()
             .copied()
-            .chain(reverse_results.iter().copied())
+            .chain(expand_shallow.iter().copied())
+            .chain(expand_deep.iter().copied())
             .collect();
         let mut anchor_by_file: HashMap<String, Vec<u64>> = HashMap::new();
         for (id, _) in &pinning_candidates {
