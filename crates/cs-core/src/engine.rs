@@ -1331,6 +1331,37 @@ impl CoreEngine {
         language: Option<&str>,
         file_hint: Option<&str>,
     ) -> Result<String> {
+        let capsule =
+            self.run_pipeline_capsule_with_context(task, context, budget, language, file_hint)?;
+        let mut out = format_capsule(&capsule);
+        let has_swift = capsule
+            .pivots
+            .iter()
+            .any(|p| p.file_path.ends_with(".swift"))
+            || capsule
+                .skeletons
+                .iter()
+                .any(|s| s.file_path.ends_with(".swift"));
+        if has_swift {
+            out.push_str(&swift_enrichment_hint(detect_xcode_mcp()));
+        }
+        Ok(out)
+    }
+
+    /// Same as `run_pipeline_with_context` but returns the structured `Capsule`
+    /// instead of a markdown-formatted string. Used by tooling that needs to
+    /// inspect pivots/skeletons programmatically (e.g. `codesurgeon context
+    /// --json`). Side effects — auto-observation and query logging — are
+    /// identical to the formatted variant; the only thing the formatted path
+    /// adds on top is the markdown rendering and the Swift enrichment hint.
+    pub fn run_pipeline_capsule_with_context(
+        &self,
+        task: &str,
+        context: Option<&str>,
+        budget: Option<u32>,
+        language: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<Capsule> {
         let t0 = Instant::now();
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(task);
@@ -1346,22 +1377,6 @@ impl CoreEngine {
             task, budget, &intent, language, file_hint, None, None, context,
         )?;
         let latency_ms = t0.elapsed().as_millis() as u64;
-        let mut out = format_capsule(&capsule);
-
-        // Append Swift enrichment hint when Swift symbols appear in results.
-        // Points agents toward Xcode MCP if available, or documents the fallback
-        // so they don't assume the tree-sitter results are complete.
-        let has_swift = capsule
-            .pivots
-            .iter()
-            .any(|p| p.file_path.ends_with(".swift"))
-            || capsule
-                .skeletons
-                .iter()
-                .any(|s| s.file_path.ends_with(".swift"));
-        if has_swift {
-            out.push_str(&swift_enrichment_hint(detect_xcode_mcp()));
-        }
 
         // Auto-capture this tool call as an observation for cross-session memory.
         // Gated on `config.auto_observations` (default false). See the field doc
@@ -1422,7 +1437,7 @@ impl CoreEngine {
             tracing::warn!("query log failed: {}", e);
         }
 
-        Ok(out)
+        Ok(capsule)
     }
 
     /// Get context capsule for a query.
