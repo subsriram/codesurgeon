@@ -2301,8 +2301,13 @@ impl CoreEngine {
                 .rsplit('.')
                 .next()
                 .unwrap_or(&frame.function_name);
+            // Match on leaf-of-name (last `::`-segment) so class methods
+            // stored with `name = "Class::method"` resolve when the
+            // traceback frame says `in method`. Top-level functions
+            // (where leaf == name) also match — leaf is a superset of name
+            // for the comparison purposes.
             for sym in graph.all_symbols() {
-                if sym.name != func {
+                if crate::db::leaf_of_name(&sym.name) != func {
                     continue;
                 }
                 if !sym.file_path.ends_with(&frame.file_path) {
@@ -2349,7 +2354,12 @@ impl CoreEngine {
             } else {
                 ANCHOR_ROWS_PER_NAME
             };
-            let exact_ids = match db.symbols_by_exact_name(lookup, fetch) {
+            // Match by `leaf_name` so class methods (stored with
+            // `name = "Class::method"`) are reachable via their bare
+            // `method` lookup. The `prefer_module` sort still applies —
+            // it prefers fewer-`::` fqns, so module-level functions
+            // sort ahead of methods within the truncated top-K.
+            let exact_ids = match db.symbols_by_leaf_name(lookup, fetch) {
                 Ok(mut ids) => {
                     if prefer_module {
                         ids.sort_by_key(|id| {

@@ -111,6 +111,44 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE symbols ADD COLUMN resolved_type TEXT", []);
+        // `leaf_name` — last `::`-segment of the qualified `name`. Class
+        // methods are stored with `name = "Class::method"` (the indexer
+        // convention), so a direct lookup like `WHERE name = "method"`
+        // misses them. The leaf column lets `symbols_by_leaf_name` find
+        // both top-level functions (where leaf == name) and class methods
+        // (where leaf is the trailing segment) with a single indexed
+        // lookup. Used by `anchor_candidates` and `traceback_candidates`
+        // so anchor extraction and Python traceback frame resolution
+        // catch class methods.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE symbols ADD COLUMN leaf_name TEXT", []);
+        let _ = self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_symbols_leaf_name ON symbols(leaf_name);",
+        );
+        // Populate leaf_name for rows that pre-date this migration.
+        // SQLite has no native rsplit, so compute in Rust and write back.
+        // One-shot at startup; idempotent because we only touch NULL rows.
+        let pending: Vec<(i64, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, name FROM symbols WHERE leaf_name IS NULL")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            rows.flatten().collect()
+        };
+        if !pending.is_empty() {
+            self.conn.execute_batch("BEGIN")?;
+            {
+                let mut update = self
+                    .conn
+                    .prepare("UPDATE symbols SET leaf_name = ?1 WHERE id = ?2")?;
+                for (id, name) in &pending {
+                    let leaf = leaf_of_name(name);
+                    let _ = update.execute(params![leaf, id]);
+                }
+            }
+            self.conn.execute_batch("COMMIT")?;
+        }
         let _ = self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS macro_expand_cache \
              (file_path TEXT PRIMARY KEY, source_hash TEXT NOT NULL);",
@@ -175,8 +213,8 @@ impl Database {
             r#"INSERT OR REPLACE INTO symbols
                (id, fqn, name, kind, file_path, start_line, end_line,
                 signature, docstring, body, language, content_hash, is_stub, source,
-                resolved_type)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"#,
+                resolved_type, leaf_name)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"#,
             params![
                 sym.id as i64,
                 sym.fqn,
@@ -193,6 +231,7 @@ impl Database {
                 sym.is_stub as i64,
                 sym.source,
                 sym.resolved_type,
+                leaf_of_name(&sym.name),
             ],
         )?;
         // Keep FTS in sync
@@ -255,6 +294,25 @@ impl Database {
             .prepare_cached("SELECT id FROM symbols WHERE name = ?1 LIMIT ?2")?;
         let ids = stmt
             .query_map(params![name, limit as i64], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .map(|id| id as u64)
+            .collect();
+        Ok(ids)
+    }
+
+    /// Match by the *leaf* of the qualified `name` — the segment after the
+    /// last `::`. Class methods are indexed with `name = "Class::method"`
+    /// so `symbols_by_exact_name("method")` misses them; this lookup
+    /// catches both top-level functions (where leaf == name) and class
+    /// methods (where leaf is the trailing `::`-segment). Used by
+    /// `anchor_candidates` and `traceback_candidates` so anchor extraction
+    /// and Python traceback frame resolution catch class methods.
+    pub fn symbols_by_leaf_name(&self, leaf: &str, limit: usize) -> Result<Vec<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM symbols WHERE leaf_name = ?1 LIMIT ?2")?;
+        let ids = stmt
+            .query_map(params![leaf, limit as i64], |row| row.get::<_, i64>(0))?
             .filter_map(|r| r.ok())
             .map(|id| id as u64)
             .collect();
@@ -1036,6 +1094,16 @@ impl Language {
     }
 }
 
+/// Compute the leaf segment of a qualified `name`. Symbols stored with
+/// `name = "Class::method"` (the indexer convention for class methods)
+/// resolve to leaf `"method"`. Symbols stored with `name = "function"`
+/// (top-level functions) resolve to themselves. Used by both
+/// `symbols_by_leaf_name` and the `leaf_name` column populated at
+/// `upsert_symbol` time.
+pub fn leaf_of_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,6 +1112,108 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("test.db")).unwrap();
         (db, dir)
+    }
+
+    #[test]
+    fn leaf_of_name_extracts_trailing_segment() {
+        // Top-level functions: leaf == name.
+        assert_eq!(leaf_of_name("hist"), "hist");
+        // Class methods: stored as `Class::method`, leaf is the method name.
+        assert_eq!(leaf_of_name("Axes::hist"), "hist");
+        // Nested: deepest segment wins.
+        assert_eq!(leaf_of_name("Outer::Inner::method"), "method");
+        // Defensive: empty name returns empty.
+        assert_eq!(leaf_of_name(""), "");
+    }
+
+    #[test]
+    fn symbols_by_leaf_name_finds_class_methods() {
+        // `Axes::hist` is stored with `name = "Axes::hist"` so
+        // `WHERE name = "hist"` (the existing exact-name lookup) misses
+        // it. The leaf-name lookup must catch both top-level functions
+        // (where leaf == name) and class methods (where leaf is the
+        // trailing `::`-segment).
+        let (db, _dir) = open_temp_db();
+        let top_level = Symbol::new(
+            "lib/foo.py",
+            "hist",
+            SymbolKind::Function,
+            1,
+            10,
+            "def hist(): ...".to_string(),
+            None,
+            "def hist(): pass".to_string(),
+            Language::Python,
+        );
+        let method = Symbol::new(
+            "lib/bar.py",
+            "Axes::hist",
+            SymbolKind::Method,
+            5,
+            20,
+            "def hist(self): ...".to_string(),
+            None,
+            "def hist(self): pass".to_string(),
+            Language::Python,
+        );
+        db.upsert_symbol(&top_level).unwrap();
+        db.upsert_symbol(&method).unwrap();
+
+        // Old behaviour: `name`-only lookup misses the method.
+        let by_name = db.symbols_by_exact_name("hist", 10).unwrap();
+        assert_eq!(by_name.len(), 1, "exact-name should miss Class::method");
+        assert_eq!(by_name[0], top_level.id);
+
+        // New behaviour: leaf-name lookup catches both.
+        let by_leaf = db.symbols_by_leaf_name("hist", 10).unwrap();
+        assert_eq!(
+            by_leaf.len(),
+            2,
+            "leaf-name should catch top-level + method"
+        );
+        assert!(by_leaf.contains(&top_level.id));
+        assert!(by_leaf.contains(&method.id));
+    }
+
+    #[test]
+    fn leaf_name_migration_backfills_existing_rows() {
+        // Existing `.codesurgeon` workspaces have rows with `leaf_name =
+        // NULL` from before the column was added. The schema setup runs
+        // a one-shot UPDATE to populate them. Verify by simulating an
+        // "old" DB: open once to create the schema, null out the
+        // leaf_name column for an existing row, close, reopen — the
+        // migration should re-populate.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        {
+            let db = Database::open(&db_path).unwrap();
+            let method = Symbol::new(
+                "lib/bar.py",
+                "Axes::hist",
+                SymbolKind::Method,
+                5,
+                20,
+                "def hist(self): ...".to_string(),
+                None,
+                "def hist(self): pass".to_string(),
+                Language::Python,
+            );
+            db.upsert_symbol(&method).unwrap();
+        }
+        // Simulate the "pre-migration" state by nulling the leaf_name.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE symbols SET leaf_name = NULL", [])
+                .unwrap();
+        }
+        // Reopen — `create_schema` should backfill leaf_name.
+        let db = Database::open(&db_path).unwrap();
+        let by_leaf = db.symbols_by_leaf_name("hist", 10).unwrap();
+        assert_eq!(
+            by_leaf.len(),
+            1,
+            "migration should have backfilled leaf_name = 'hist' for the method"
+        );
     }
 
     /// `log_query` must not error, and `query_log_rows` must return the inserted row.
