@@ -9,14 +9,19 @@
 //! has uncommitted changes — important for benchmark reproducibility,
 //! since a `+dirty` build doesn't correspond to any merged commit.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    // Re-run when HEAD moves (commit, branch switch). The .git path is
-    // resolved relative to the workspace root; cs-core lives at
-    // `crates/cs-core/` so we go up two levels.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
+    // Re-run when HEAD moves (commit, branch switch). Resolve the git dir
+    // via `git rev-parse --git-dir` rather than hardcoding `../../.git/HEAD`
+    // — in a worktree the top-level `.git` is a *file* pointing to
+    // `<repo>/.git/worktrees/<name>`, so the hardcoded path doesn't exist
+    // and the rerun trigger silently fails.
+    if let Some(git_dir) = git_dir() {
+        println!("cargo:rerun-if-changed={}/HEAD", git_dir.display());
+        println!("cargo:rerun-if-changed={}/index", git_dir.display());
+    }
 
     let sha = git_short_sha().unwrap_or_else(|| "unknown".to_string());
     let dirty = git_is_dirty().unwrap_or(false);
@@ -26,6 +31,21 @@ fn main() {
 
     println!("cargo:rustc-env=CS_GIT_SHA={}", sha_full);
     println!("cargo:rustc-env=CS_BUILD_TIME={}", build_time);
+}
+
+fn git_dir() -> Option<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
 }
 
 fn git_short_sha() -> Option<String> {

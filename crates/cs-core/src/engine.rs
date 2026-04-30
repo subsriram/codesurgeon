@@ -24,7 +24,7 @@ use crate::ranking::{
     ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
     MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT,
     REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
-    STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
+    STUB_SCORE_WEIGHT, TRACEBACK_LEAF_PROBE, TRACEBACK_RRF_K,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2259,16 +2259,6 @@ impl CoreEngine {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    /// Stage 1: explicit symbol-name anchors.
-    ///
-    /// Extracts identifier-shaped tokens from the query (prose, imports, and
-    /// code-block API calls) and looks them up by exact name in the symbol
-    /// table. Unlike BM25, this is a precision-first signal: if a task names
-    /// `parse_latex` or calls `xr.where(...)`, we want that symbol promoted
-    /// directly regardless of how many other files mention the word.
-    ///
-    /// Returns `(symbol_id, 1.0)` pairs in extraction order. RRF fusion
-    /// handles rank-based blending with BM25 / graph / ANN.
     /// Resolve Python traceback frames in `query` to symbol IDs.
     ///
     /// Each frame carries `(file_path, function_name)` — enough for a
@@ -2285,11 +2275,11 @@ impl CoreEngine {
     /// `astropy/io/registry.py` matches an indexed symbol whose
     /// `file_path` ends with that string. This tolerates absolute paths
     /// in tracebacks vs. workspace-relative paths in the index.
-    fn traceback_candidates(&self, query: &str) -> Vec<(u64, f32)> {
-        let anchors = crate::anchors::extract(query);
+    fn traceback_candidates(&self, anchors: &crate::anchors::Anchors) -> Vec<(u64, f32)> {
         if anchors.traceback_frames.is_empty() {
             return Vec::new();
         }
+        let db = self.db.lock();
         let graph = self.graph.read();
         let mut out: Vec<(u64, f32)> = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
@@ -2301,15 +2291,20 @@ impl CoreEngine {
                 .rsplit('.')
                 .next()
                 .unwrap_or(&frame.function_name);
-            // Match on leaf-of-name (last `::`-segment) so class methods
-            // stored with `name = "Class::method"` resolve when the
-            // traceback frame says `in method`. Top-level functions
-            // (where leaf == name) also match — leaf is a superset of name
-            // for the comparison purposes.
-            for sym in graph.all_symbols() {
-                if crate::db::leaf_of_name(&sym.name) != func {
+            // Use the `leaf_name` index to fetch only symbols whose leaf
+            // matches `func` — avoids the O(|graph|) walk per frame.
+            // A reasonable cap: a single leaf-name almost never has more
+            // than a handful of definitions across a workspace; if it does
+            // (e.g. `__init__`), we only care about ones in this frame's
+            // file, which the suffix filter below selects.
+            let ids = match db.symbols_by_leaf_name(func, TRACEBACK_LEAF_PROBE) {
+                Ok(ids) => ids,
+                Err(_) => continue,
+            };
+            for id in ids {
+                let Some(sym) = graph.get_symbol(id) else {
                     continue;
-                }
+                };
                 if !sym.file_path.ends_with(&frame.file_path) {
                     continue;
                 }
@@ -2321,8 +2316,21 @@ impl CoreEngine {
         out
     }
 
-    fn anchor_candidates(&self, query: &str, limit: usize) -> (Vec<(u64, f32)>, AnchorStats) {
-        let anchors = crate::anchors::extract(query);
+    /// Stage 1: explicit symbol-name anchors.
+    ///
+    /// Extracts identifier-shaped tokens from the query (prose, imports, and
+    /// code-block API calls) and looks them up by exact name in the symbol
+    /// table. Unlike BM25, this is a precision-first signal: if a task names
+    /// `parse_latex` or calls `xr.where(...)`, we want that symbol promoted
+    /// directly regardless of how many other files mention the word.
+    ///
+    /// Returns `(symbol_id, 1.0)` pairs in extraction order. RRF fusion
+    /// handles rank-based blending with BM25 / graph / ANN.
+    fn anchor_candidates(
+        &self,
+        anchors: &crate::anchors::Anchors,
+        limit: usize,
+    ) -> (Vec<(u64, f32)>, AnchorStats) {
         if anchors.symbol_names.is_empty() {
             return (vec![], AnchorStats::default());
         }
@@ -2613,7 +2621,9 @@ impl CoreEngine {
             Some(ctx) if !ctx.is_empty() => format!("{query}\n{ctx}"),
             _ => query.to_string(),
         };
-        let (anchor_results, astats) = self.anchor_candidates(&anchor_source, ANCHOR_CANDIDATES);
+        // Extract once, reuse for both anchor_candidates and traceback_candidates.
+        let extracted = crate::anchors::extract(&anchor_source);
+        let (anchor_results, astats) = self.anchor_candidates(&extracted, ANCHOR_CANDIDATES);
         tracing::debug!(
             "anchor stats: {:?} (context bytes: {})",
             astats,
@@ -2727,7 +2737,7 @@ impl CoreEngine {
         // frames into RRF at the most aggressive `k` (`TRACEBACK_RRF_K`)
         // so rank-1 frames dominate any single BM25/ANN hit. Empty when
         // no Python traceback is present in the query/context.
-        let traceback_results = self.traceback_candidates(&anchor_source);
+        let traceback_results = self.traceback_candidates(&extracted);
         if !traceback_results.is_empty() {
             tracing::debug!(
                 "traceback shortcut: {} frame symbols resolved",

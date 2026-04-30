@@ -446,6 +446,103 @@ fn context_without_task_exits_nonzero() {
     );
 }
 
+/// `context --json` must emit valid serde-parseable JSON on stdout.
+/// This pins the contract that `--json` doesn't include trailing
+/// markdown / status text and stays a clean JSON document.
+#[test]
+fn context_json_emits_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("m.py"), "def foo():\n    return 1\n").unwrap();
+    // index first so the capsule has something to surface
+    let idx = run(&dir, &["index"]);
+    assert!(idx.status.success(), "index failed: {}", stderr(&idx));
+
+    let out = run(&dir, &["context", "fix foo", "--json"]);
+    assert!(
+        out.status.success(),
+        "context --json failed: {}",
+        stderr(&out)
+    );
+    let s = stdout(&out);
+    let _: serde_json::Value = serde_json::from_str(&s)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n--- stdout ---\n{s}"));
+}
+
+/// `impact --json` on a missing symbol must still emit valid JSON
+/// (the capsule shape is well-defined for the empty case).
+#[test]
+fn impact_json_emits_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("m.py"), "def foo():\n    return 1\n").unwrap();
+    let idx = run(&dir, &["index"]);
+    assert!(idx.status.success(), "index failed: {}", stderr(&idx));
+
+    let out = run(&dir, &["impact", "m.py::foo", "--json"]);
+    assert!(
+        out.status.success(),
+        "impact --json failed: {}",
+        stderr(&out)
+    );
+    let s = stdout(&out);
+    let _: serde_json::Value = serde_json::from_str(&s)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n--- stdout ---\n{s}"));
+}
+
+/// `anchors --json` must emit a valid JSON document, even with no symbols
+/// extracted (the empty-anchors object is still well-formed).
+#[test]
+fn anchors_json_emits_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&dir, &["anchors", "fix parse_latex bug"]);
+    // Without --json this is the human-readable view; smoke-check it works.
+    assert!(out.status.success(), "anchors failed: {}", stderr(&out));
+
+    let out = run(&dir, &["anchors", "fix parse_latex bug", "--json"]);
+    assert!(
+        out.status.success(),
+        "anchors --json failed: {}",
+        stderr(&out)
+    );
+    let s = stdout(&out);
+    let _: serde_json::Value = serde_json::from_str(&s)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n--- stdout ---\n{s}"));
+}
+
+/// With `CS_LOG=debug`, log output must go to stderr — never stdout.
+/// Critical for `--json` modes: any log line on stdout corrupts the JSON
+/// document. Also confirms that debug logging is actually wired up.
+#[test]
+fn logs_go_to_stderr_not_stdout_under_json() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("m.py"), "def foo():\n    return 1\n").unwrap();
+    let idx = run(&dir, &["index"]);
+    assert!(idx.status.success(), "index failed: {}", stderr(&idx));
+
+    let out = Command::new(BIN)
+        .env("CS_WORKSPACE", dir.path())
+        .env("CS_LOG", "debug")
+        .args(["context", "fix foo", "--json"])
+        .output()
+        .expect("failed to spawn codesurgeon");
+    assert!(
+        out.status.success(),
+        "context --json under CS_LOG=debug failed: {}",
+        stderr(&out)
+    );
+    let s_out = stdout(&out);
+    let s_err = stderr(&out);
+    // stdout must still be a single JSON document — no log noise.
+    let _: serde_json::Value = serde_json::from_str(&s_out).unwrap_or_else(|e| {
+        panic!("stdout not JSON under debug logging: {e}\n--- stdout ---\n{s_out}")
+    });
+    // stderr must contain *something* — proves the subscriber is wired and writing there.
+    // We don't pin a specific message because the exact debug lines may evolve.
+    assert!(
+        !s_err.trim().is_empty(),
+        "expected some debug output on stderr with CS_LOG=debug"
+    );
+}
+
 // ── config ───────────────────────────────────────────────────────────────────
 
 /// `config` on workspace without config file must exit zero and show defaults message.

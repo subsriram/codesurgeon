@@ -15,6 +15,9 @@ Stage 1: Candidate Retrieval
   ├── BM25 (Tantivy)           top-50 lexical matches
   ├── Graph neighbor expansion top-25 1-hop neighbors of BM25 seeds, by centrality
   ├── Explicit anchors         up to 20 exact symbol-name matches from the query
+  ├── Traceback frames         (file_path, function_name) frames extracted from a
+  │                            Python traceback in `context`; resolved via
+  │                            leaf-name + suffix-path match  [PR #97]
   ├── Reverse-edge expansion   up to 20 callers/raisers walked backward (≤3 hops)
   │                            from exception-class anchors  [issue #67]
   └── Semantic (flat scan)     top-25 semantic nearest neighbors  [embeddings build only]
@@ -498,8 +501,10 @@ identifies the coordinator. Requires `>= 2` owned seed types to avoid false posi
 | Anchor rows per distinct name | 5 | `ranking.rs:ANCHOR_ROWS_PER_NAME` |
 | Anchor fuzzy-fallback probe depth | 20 | `ranking.rs:ANCHOR_FUZZY_PROBE` |
 | Anchor fuzzy-fallback cutoff | 3 | `ranking.rs:ANCHOR_FUZZY_CUTOFF` |
+| Traceback per-frame leaf-name probe | 50 | `ranking.rs:TRACEBACK_LEAF_PROBE` |
 | RRF k (BM25 / graph / ANN) | 60 | `ranking.rs:RRF_K` |
 | RRF k (explicit anchors) | 15 | `ranking.rs:ANCHOR_RRF_K` |
+| RRF k (Python traceback frames) | 8 | `ranking.rs:TRACEBACK_RRF_K` |
 | RRF k (reverse expansion) | 30 | `ranking.rs:REVERSE_EXPAND_RRF_K` |
 | Reverse-expansion max depth | 3 | `ranking.rs:REVERSE_EXPAND_MAX_DEPTH` |
 | Reverse-expansion fan-out per hop | 5 | `ranking.rs:REVERSE_EXPAND_FAN_OUT` |

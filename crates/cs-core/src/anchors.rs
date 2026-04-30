@@ -190,7 +190,7 @@ fn traceback_frame_re() -> &'static Regex {
 }
 
 /// Extracted anchors, in order of discovery.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Anchors {
     /// Symbol names to try looking up exactly (deduplicated, in order).
     pub symbol_names: Vec<String>,
@@ -213,7 +213,7 @@ pub struct Anchors {
 }
 
 /// One frame of a Python traceback, captured by `traceback_frame_re`.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct TracebackFrame {
     /// File path as it appears in the traceback — relative or absolute.
     /// The graph lookup uses suffix matching to tolerate path differences.
