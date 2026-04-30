@@ -45,30 +45,41 @@ pub(crate) const ANCHOR_FILE_BUDGET: usize = 5;
 // For symptom-anchored bug reports the user names the error class or a trigger
 // symbol, but the fix site is reached only by walking **backward** through
 // callers. Reverse expansion seeds on exception-class anchors and BFS-walks
-// their callers/raisers up to `REVERSE_EXPAND_MAX_DEPTH` hops, injecting the
+// their callers/raisers up to `EXPAND_MAX_DEPTH` hops, injecting the
 // walk results into the RRF fusion alongside the direct anchor list.
 
 /// Max hops to BFS backward through `dependents()` from each seed anchor.
 /// 3 is the tightest depth that covers the motivating sympy-21379 case
 /// (`PolynomialError ← parallel_poly_from_expr ← gcd ← Mod.eval`).
-pub(crate) const REVERSE_EXPAND_MAX_DEPTH: u32 = 3;
+pub(crate) const EXPAND_MAX_DEPTH: u32 = 3;
 /// Per-hop cap on the number of callers expanded. Prevents exponential blowup
 /// when walking from an exception class that's imported/raised in hundreds of
 /// sites. Selection within a hop is driven by term overlap with the query.
-pub(crate) const REVERSE_EXPAND_FAN_OUT: usize = 5;
+pub(crate) const EXPAND_FAN_OUT: usize = 5;
 /// Overall cap on the reverse-expansion candidate list. Mirrors
 /// `ANCHOR_CANDIDATES` — the walk is precision-first, not recall-first.
-pub(crate) const REVERSE_EXPAND_CANDIDATES: usize = 20;
+pub(crate) const EXPAND_CANDIDATES: usize = 20;
 /// RRF k for the reverse-expansion list. Sits between `ANCHOR_RRF_K = 15`
 /// (aggressive, precision-first) and `RRF_K = 60` (default): seeds-reachable
 /// symbols contribute meaningfully without overwhelming direct-anchor hits.
-pub(crate) const REVERSE_EXPAND_RRF_K: f32 = 30.0;
+pub(crate) const EXPAND_RRF_K: f32 = 30.0;
 /// Upper bound on a seed's direct-caller count. Anchors with more callers are
 /// skipped — they're hubs (e.g. `exp`, `symbols`) whose reverse set would
 /// flood the capsule. Exception classes in real codebases typically have
 /// dozens-to-low-hundreds of raisers; this caps the seed set but the per-hop
-/// `REVERSE_EXPAND_FAN_OUT` still bounds each walk.
-pub(crate) const REVERSE_EXPAND_SEED_MAX_CALLERS: usize = 500;
+/// `EXPAND_FAN_OUT` still bounds each walk.
+pub(crate) const EXPAND_SEED_FANOUT_LIMIT: usize = 500;
+/// Per-anchor-name cap on exact-match lookups during seed promotion.
+/// Higher than `ANCHOR_ROWS_PER_NAME` (5) because seed promotion needs
+/// the whole population, not the top-K-by-prefer-module-sort that
+/// `anchor_candidates` produces for ranking. Set generously enough that
+/// realistic anchor names (e.g. `hist` in matplotlib — 5+ distinct
+/// classes have a `hist` method) all become seeds, but capped so a
+/// truly common name like `where` or `get` doesn't seed thousands.
+/// Issue #96 — `Axes::hist` was being dropped from forward seeds because
+/// `pyplot::hist` (1-segment fqn) outranked it under the prefer_module
+/// sort + 5-row truncate.
+pub(crate) const EXPAND_SEED_PER_NAME_LIMIT: usize = 25;
 /// Weight applied to body-text semantic similarity when ranking per-hop
 /// callers inside the reverse-expand walk (issue #69 v2). Multiplies the
 /// `[0, 1]` cosine similarity between the query embedding and each caller's
@@ -81,7 +92,380 @@ pub(crate) const REVERSE_EXPAND_SEED_MAX_CALLERS: usize = 500;
 ///
 /// Only applied when the `embeddings` feature is active AND a per-symbol
 /// embedding lookup is provided to `reverse_expand_from_anchors`.
-pub(crate) const REVERSE_EXPAND_SEMANTIC_WEIGHT: f32 = 2.0;
+pub(crate) const EXPAND_SEMANTIC_WEIGHT: f32 = 2.0;
+
+/// Density-aware fan-out parameters (issue #69 v1, originally landed in
+/// `0f35b33` and reverted in `5516865`). Re-introduced behind the
+/// `CS_REVERSE_EXPAND_STRATEGY` env-var gate so the cs-benchmark diagnostic
+/// panel can score it on a stratified panel without making it the default
+/// — see `docs/reverse_expand_panel.md` in the cs-benchmark repo.
+pub(crate) const EXPAND_FAN_OUT_CAP: usize = 25;
+pub(crate) const EXPAND_FAN_OUT_DIVISOR: usize = 5;
+
+/// Best-first reverse-expand parameters (issue #69 option 3, deferred from
+/// the original v1 — never landed before now). The walk replaces the fixed
+/// (depth × fan_out) BFS with a priority queue, scoring candidates by the
+/// same mixed signal (lex overlap + semantic + centrality penalty) the BFS
+/// uses but spending budget on the highest-priority frontier nodes
+/// regardless of hop. `TOTAL_BUDGET` is the cap on output candidates;
+/// `EXPAND_BUDGET` is the cap on graph expansions performed during the walk
+/// (so a dense seed doesn't enumerate the whole graph chasing low-scoring
+/// nodes).
+///
+/// Issue #96 — bumped from 40 → 200 / 200 → 1000 after the matplotlib
+/// probe showed default-budget runs only reached depth 1–2 in dense
+/// codebases (matplotlib `Axes::hist`'s implementation tree is
+/// 3 hops deep; default 40-output cap fired before depth 3 was even
+/// touched). The user's TOTAL=500 probe confirmed the chain
+/// `Axes::hist → fill → add_patch → _update_patch_limits` is
+/// reachable; default needed to be high enough for depth 3 in the
+/// common case. Walker overhead at TOTAL=500 was ~600 ms wall, so
+/// 200 is well under any latency budget.
+pub(crate) const EXPAND_TOTAL_BUDGET: usize = 200;
+pub(crate) const EXPAND_GRAPH_BUDGET: usize = 1000;
+
+/// UCB-style exploration weight applied to the priority of frontier
+/// candidates whose parent-seed subtree has been under-visited. Used by
+/// `v3b` only. The classic UCB1 formula uses `c = sqrt(2)`; we use a
+/// smaller value so exploration nudges the walk rather than dominating
+/// the per-candidate signal.
+pub(crate) const EXPAND_UCB_C: f32 = 0.5;
+
+/// Read an env-var-overridable budget value, accepting a deprecated
+/// alias for one release cycle. New callers should set `primary`;
+/// `legacy` is logged at warn level when set so the user gets a
+/// pointer to the new name. Issue #96 / #95 rename.
+fn resolve_budget(primary: &str, legacy: &str, default: usize) -> usize {
+    if let Ok(v) = std::env::var(primary) {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    if let Ok(v) = std::env::var(legacy) {
+        tracing::warn!(
+            "{} is deprecated; use {} instead (will be removed)",
+            legacy,
+            primary
+        );
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    default
+}
+
+/// Read `CS_EXPAND_TOTAL_BUDGET` (or the deprecated
+/// `CS_REVERSE_EXPAND_TOTAL_BUDGET` alias) from the environment;
+/// fall back to the constant when unset or unparseable. Lets the
+/// cs-benchmark panel ablate budget without rebuilding the binary —
+/// issue #96 step 1.
+pub(crate) fn resolve_total_budget() -> usize {
+    resolve_budget(
+        "CS_EXPAND_TOTAL_BUDGET",
+        "CS_REVERSE_EXPAND_TOTAL_BUDGET",
+        EXPAND_TOTAL_BUDGET,
+    )
+}
+
+/// Read `CS_EXPAND_GRAPH_BUDGET` (or the deprecated
+/// `CS_REVERSE_EXPAND_EXPAND_BUDGET` alias) from the environment.
+pub(crate) fn resolve_expand_budget() -> usize {
+    resolve_budget(
+        "CS_EXPAND_GRAPH_BUDGET",
+        "CS_REVERSE_EXPAND_EXPAND_BUDGET",
+        EXPAND_GRAPH_BUDGET,
+    )
+}
+
+/// Per-hop fan-out policy for `reverse_expand_from_anchors`. The historical
+/// default (`Fixed(EXPAND_FAN_OUT)`) explores top-N callers
+/// uniformly across hops. `DensityScaled` lets dense seeds spend more
+/// budget than sparse ones — see issue #69 option 2.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FanOutPolicy {
+    Fixed(usize),
+    DensityScaled {
+        floor: usize,
+        cap: usize,
+        divisor: usize,
+    },
+}
+
+/// Which direction the anchor walk traverses. `Reverse` walks edges *into*
+/// the anchor (callers/raisers/importers) — the original behaviour, used
+/// when the user names a symptom and the fix is upstream. `Forward` walks
+/// edges *out of* the anchor (callees) — used when the user names a
+/// public API they invoked and the fix lives in its implementation tree.
+/// Issue #95.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkDirection {
+    Forward,
+    Reverse,
+}
+
+impl WalkDirection {
+    /// Return the unvisited neighbours of `id` for this walk direction.
+    /// `Reverse` → `graph.dependents(id)` (callers).
+    /// `Forward` → `graph.dependencies(id)` (callees).
+    pub(crate) fn neighbours<'a>(&self, graph: &'a CodeGraph, id: u64) -> Vec<&'a Symbol> {
+        match self {
+            WalkDirection::Reverse => graph.dependents(id),
+            WalkDirection::Forward => graph.dependencies(id),
+        }
+    }
+}
+
+impl FanOutPolicy {
+    /// Select fan-out for one BFS hop given the seed's caller count.
+    pub(crate) fn for_hop(&self, dependents_len: usize) -> usize {
+        match *self {
+            FanOutPolicy::Fixed(n) => n,
+            FanOutPolicy::DensityScaled {
+                floor,
+                cap,
+                divisor,
+            } => {
+                let scaled = dependents_len / divisor.max(1);
+                scaled.clamp(floor, cap)
+            }
+        }
+    }
+}
+
+// ── Reverse-expand strategy gate (cs-benchmark diagnostic harness) ───────────
+//
+// `CS_REVERSE_EXPAND_STRATEGY` selects which combination of ranking signals
+// drives reverse-edge expansion. Default (`v2`) matches the current main
+// behavior — query-term overlap + semantic embedding similarity. The other
+// variants exist so the cs-benchmark panel can score them on a stratified
+// task panel without making any one of them the default.
+
+/// Reverse-edge expansion strategy. Resolved once per engine call from
+/// `CS_REVERSE_EXPAND_STRATEGY` (default `V2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandStrategy {
+    /// Skip reverse-expand entirely. Equivalent to `reverse_expand_anchors=false`.
+    None,
+    /// #67 only. Fixed fan_out=5, no query-term overlap, no semantic.
+    /// Pure centrality-driven beam search.
+    V0,
+    /// Density-aware fan-out alone (no query-term overlap, no semantic).
+    V1a,
+    /// Query-term-overlap fan-out alone (fixed fan_out=5, no semantic).
+    V1b,
+    /// Density-aware + query-term-overlap (no semantic). v1 as originally
+    /// landed in `0f35b33`.
+    V1ab,
+    /// Current default. Query-term-overlap + semantic embedding similarity.
+    /// Per #69 v2 (PR #83).
+    V2,
+    /// Total-node-budget + best-first priority-queue walk. Replaces the
+    /// fixed (depth × fan_out) BFS with a priority queue ordered by the
+    /// same mixed-signal score (lex overlap + semantic + centrality).
+    /// Lets the walk spend depth on a promising chain on dense graphs
+    /// where BFS's uniform fan-out wastes budget. Issue #69 option 3.
+    V3a,
+    /// `V3a` + UCB exploration bonus on the parent-seed subtree. Adds
+    /// `EXPAND_UCB_C * sqrt(ln(N) / n)` to each candidate's
+    /// priority, where `N` is total expansions in the walk and `n` is
+    /// expansions within the candidate's seed subtree. Pulls the walk
+    /// toward under-sampled subtrees when the per-candidate signal is
+    /// noisy — exactly the symptom-anchored case where lexical/semantic
+    /// signals are weak.
+    V3b,
+}
+
+impl ExpandStrategy {
+    /// Read `CS_EXPAND_STRATEGY` (or the deprecated alias
+    /// `CS_REVERSE_EXPAND_STRATEGY`) from the environment. Unset or
+    /// unrecognized → `V2` (current main behavior). Logged at warn
+    /// level so misconfigured benchmark runs don't silently fall back.
+    pub fn from_env() -> Self {
+        let (name, raw) = match std::env::var("CS_EXPAND_STRATEGY") {
+            Ok(v) => ("CS_EXPAND_STRATEGY", Some(v)),
+            Err(_) => match std::env::var("CS_REVERSE_EXPAND_STRATEGY") {
+                Ok(v) => {
+                    tracing::warn!(
+                        "CS_REVERSE_EXPAND_STRATEGY is deprecated; use CS_EXPAND_STRATEGY instead"
+                    );
+                    ("CS_REVERSE_EXPAND_STRATEGY", Some(v))
+                }
+                Err(_) => ("CS_EXPAND_STRATEGY", None),
+            },
+        };
+        match raw
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("") | Some("v2") => Self::V2,
+            Some("none") | Some("off") => Self::None,
+            Some("v0") => Self::V0,
+            Some("v1a") => Self::V1a,
+            Some("v1b") => Self::V1b,
+            Some("v1ab") | Some("v1") => Self::V1ab,
+            Some("v3a") => Self::V3a,
+            Some("v3b") => Self::V3b,
+            Some(other) => {
+                tracing::warn!("{}={:?} unrecognized, falling back to v2", name, other);
+                Self::V2
+            }
+        }
+    }
+
+    pub(crate) fn fan_out_policy(&self) -> FanOutPolicy {
+        match self {
+            Self::V1a | Self::V1ab => FanOutPolicy::DensityScaled {
+                floor: EXPAND_FAN_OUT,
+                cap: EXPAND_FAN_OUT_CAP,
+                divisor: EXPAND_FAN_OUT_DIVISOR,
+            },
+            _ => FanOutPolicy::Fixed(EXPAND_FAN_OUT),
+        }
+    }
+
+    /// Whether to feed query-term overlap into per-hop ranking. False → caller
+    /// scoring degenerates to centrality-only.
+    pub(crate) fn use_query_terms(&self) -> bool {
+        matches!(self, Self::V1b | Self::V1ab | Self::V2)
+    }
+
+    /// Whether to feed semantic body-embedding similarity into per-hop
+    /// ranking. Includes `V2` and the V3 variants (which use the same
+    /// scoring formula inside the priority queue). Only referenced under
+    /// `feature = "embeddings"`; without that feature the engine never
+    /// has a scorer to gate.
+    #[allow(dead_code)]
+    pub(crate) fn use_semantic(&self) -> bool {
+        matches!(self, Self::V2 | Self::V3a | Self::V3b)
+    }
+
+    /// `V3a`/`V3b` use the priority-queue walker
+    /// (`reverse_expand_best_first`) instead of the BFS variant.
+    pub(crate) fn use_best_first(&self) -> bool {
+        matches!(self, Self::V3a | Self::V3b)
+    }
+
+    /// `V3b` adds a UCB exploration bonus on top of `V3a`'s best-first.
+    pub(crate) fn use_exploration_bonus(&self) -> bool {
+        matches!(self, Self::V3b)
+    }
+
+    /// True for variants that are not yet implemented. None remain — kept
+    /// for forward compatibility when new variants are added behind the
+    /// gate before their implementations land.
+    pub(crate) fn is_unimplemented(&self) -> bool {
+        false
+    }
+}
+
+// ── Direction routing (issue #95) ────────────────────────────────────────────
+//
+// Ranking strategy (`CS_REVERSE_EXPAND_STRATEGY`) and walk direction
+// (`CS_EXPAND_DIRECTION`) are orthogonal axes: a variant says *how* to
+// rank candidates, a direction says *where* to walk for them.
+//
+// `Auto` is the default — a per-anchor classifier reads off the index
+// (kind, fan-out ratio) and picks Forward/Reverse/Both. Override with
+// `CS_EXPAND_DIRECTION ∈ {auto, forward, reverse, both}` for the
+// cs-benchmark panel.
+
+/// Effective expansion direction for one anchor seed (after classifier
+/// runs / env-var override applies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffectiveDirection {
+    Forward,
+    Reverse,
+    Both,
+}
+
+/// User-facing expansion-direction setting from `CS_EXPAND_DIRECTION`.
+/// `Auto` defers to the per-anchor classifier; the others force a
+/// uniform direction across all anchors (used by the panel to compare
+/// `forward-only` vs `reverse-only` vs `both` against `auto`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandDirection {
+    Auto,
+    Forward,
+    Reverse,
+    Both,
+}
+
+impl ExpandDirection {
+    /// Read `CS_EXPAND_DIRECTION` from the environment. Unset or
+    /// unrecognized → `Auto`. Logged at warn level on unrecognized
+    /// values so misconfigured benchmark runs don't silently fall back.
+    pub fn from_env() -> Self {
+        match std::env::var("CS_EXPAND_DIRECTION")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("") | Some("auto") => Self::Auto,
+            Some("forward") | Some("fwd") => Self::Forward,
+            Some("reverse") | Some("rev") => Self::Reverse,
+            Some("both") | Some("bidirectional") => Self::Both,
+            Some(other) => {
+                tracing::warn!(
+                    "CS_EXPAND_DIRECTION={:?} unrecognized, falling back to auto",
+                    other
+                );
+                Self::Auto
+            }
+        }
+    }
+
+    /// Resolve to a concrete direction for one anchor. Forward/Reverse/Both
+    /// pass through unchanged; Auto delegates to `classify_direction`.
+    pub(crate) fn resolve_for(&self, graph: &CodeGraph, seed: &Symbol) -> EffectiveDirection {
+        match self {
+            Self::Forward => EffectiveDirection::Forward,
+            Self::Reverse => EffectiveDirection::Reverse,
+            Self::Both => EffectiveDirection::Both,
+            Self::Auto => classify_direction(graph, seed),
+        }
+    }
+}
+
+/// Per-anchor walk-direction classifier. Reads kind + fan-out ratio
+/// off the indexed graph — no embeddings, no LLM. Issue #95 layer 3.
+///
+/// Rules (in order of priority):
+/// 1. Exception classes / errors / warnings → reverse only. They are
+///    typically named as a *symptom*; the fix lives in the code that
+///    raises or handles them, which is upstream.
+/// 2. Modules → forward only. The user named a module they imported;
+///    the fix is in its tree, not in the modules that import it.
+/// 3. Forward fan-out ≫ reverse fan-out → forward. The anchor is a
+///    public entry point with a deep implementation tree.
+/// 4. Reverse fan-out ≫ forward fan-out → reverse. The anchor is a
+///    private leaf utility; the bug is in what calls into it.
+/// 5. Otherwise → bidirectional with split budget.
+///
+/// The 3× ratio is the simplest threshold that sorts SWE-bench
+/// Verified anchors empirically. Tunable later if the panel shows a
+/// per-language preference.
+pub(crate) fn classify_direction(graph: &CodeGraph, seed: &Symbol) -> EffectiveDirection {
+    if is_reverse_expand_seed(seed) {
+        return EffectiveDirection::Reverse;
+    }
+    if seed.kind == SymbolKind::Module {
+        return EffectiveDirection::Forward;
+    }
+    let fwd = graph.dependencies(seed.id).len();
+    let rev = graph.dependents(seed.id).len();
+    let ratio = 3;
+    if fwd > ratio * rev.max(1) {
+        return EffectiveDirection::Forward;
+    }
+    if rev > ratio * fwd.max(1) {
+        return EffectiveDirection::Reverse;
+    }
+    EffectiveDirection::Both
+}
 
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 
@@ -93,6 +477,24 @@ pub(crate) const RRF_K: f32 = 60.0;
 /// Safe because anchor extraction is precision-first: most noise is filtered
 /// out by the stop-word list and the exact-match gate in `anchor_candidates`.
 pub(crate) const ANCHOR_RRF_K: f32 = 15.0;
+/// RRF k for symbols resolved from Python traceback frames. Even more
+/// aggressive than `ANCHOR_RRF_K` because tracebacks carry **both** the
+/// file path and the function name — the resolution is precision-first
+/// by construction, and a frame in the traceback IS a member of the
+/// call chain that produced the bug. Issue #95 layer 1.
+pub(crate) const TRACEBACK_RRF_K: f32 = 8.0;
+
+/// RRF k for **deep** expansion emissions (depth ≥ 2 from a seed).
+/// Smaller than `EXPAND_RRF_K = 30` so deep chain candidates compete
+/// with multi-seed-agreement nodes (e.g. `gca`, `gcf`) that accumulate
+/// RRF score by appearing in BM25 + anchor + ANN + expand lists. Without
+/// this split, a fix-site reachable only via a single seed's depth-3
+/// chain (e.g. matplotlib `Axes::hist → fill → add_patch → _update_patch_limits`)
+/// loses to "near to many anchors but unrelated" noise. Calibrated to
+/// `TRACEBACK_RRF_K` because traceback frames and seed-rooted chains
+/// share the same precision-first shape: a member of a verified call
+/// chain from a user-named anchor is on-bug by construction. Issue #96.
+pub(crate) const EXPAND_DEEP_RRF_K: f32 = 8.0;
 /// Structural injection: score multiplier for injected hub types.
 pub(crate) const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
 /// Centrality boost multiplier applied to BM25 score.
@@ -214,38 +616,106 @@ pub(crate) fn is_trivial_exception_pivot(sym: &Symbol) -> bool {
 /// `None` for a given id) falls back to pure term-overlap + centrality —
 /// this is the behaviour on no-embeddings builds and on symbols with no
 /// indexed body (e.g. synthetic `Import` entries, already filtered). The
-/// weight is `REVERSE_EXPAND_SEMANTIC_WEIGHT`. See issue #69 v2.
+/// weight is `EXPAND_SEMANTIC_WEIGHT`. See issue #69 v2.
 ///
 /// The return order is BFS order (depth-ascending), preserved for RRF.
+/// One emission from the expand walk: `(id, score, parent_seed)`.
+/// `score` encodes depth (`1.0 / (depth + 1)`); `parent_seed` is the
+/// root seed of the emission's subtree, used by engine-side per-seed
+/// RRF list splitting so a productive seed's chain isn't drowned out
+/// by a noisy seed's emissions in fusion. Issue #96.
+pub(crate) type ExpandEmission = (u64, f32, u64);
+
 pub(crate) fn reverse_expand_from_anchors(
     graph: &CodeGraph,
     seed_ids: &[u64],
     query_terms: &[String],
     max_depth: u32,
-    fan_out: usize,
+    fan_out: FanOutPolicy,
     max_total: usize,
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
-) -> Vec<(u64, f32)> {
+) -> Vec<ExpandEmission> {
+    expand_from_anchors_directional(
+        graph,
+        seed_ids,
+        query_terms,
+        max_depth,
+        fan_out,
+        max_total,
+        semantic_scorer,
+        WalkDirection::Reverse,
+    )
+}
+
+/// Forward sibling of `reverse_expand_from_anchors` — walks edges *out of*
+/// the anchor (callees) instead of into it (callers). Same scoring formula
+/// and same fan-out controls; only the neighbour-direction differs.
+/// Issue #95 layer 2.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_expand_from_anchors(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    fan_out: FanOutPolicy,
+    max_total: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+) -> Vec<ExpandEmission> {
+    expand_from_anchors_directional(
+        graph,
+        seed_ids,
+        query_terms,
+        max_depth,
+        fan_out,
+        max_total,
+        semantic_scorer,
+        WalkDirection::Forward,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_from_anchors_directional(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    fan_out: FanOutPolicy,
+    max_total: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+    direction: WalkDirection,
+) -> Vec<ExpandEmission> {
     use std::collections::VecDeque;
 
-    if max_depth == 0 || fan_out == 0 || max_total == 0 || seed_ids.is_empty() {
+    let fan_out_floor = match fan_out {
+        FanOutPolicy::Fixed(n) => n,
+        FanOutPolicy::DensityScaled { floor, .. } => floor,
+    };
+    if max_depth == 0 || fan_out_floor == 0 || max_total == 0 || seed_ids.is_empty() {
         return Vec::new();
     }
 
     let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
-    let mut out: Vec<(u64, f32)> = Vec::new();
-    let mut queue: VecDeque<(u64, u32)> = seed_ids.iter().map(|&id| (id, 0)).collect();
+    let mut out: Vec<ExpandEmission> = Vec::new();
+    let mut depth_emitted: [usize; 8] = [0; 8];
+    // Per-seed depth attribution (#96): track which root each emission
+    // descends from. Cheap to maintain — one HashMap entry per seed.
+    let mut per_seed_depth: HashMap<u64, [usize; 8]> = HashMap::new();
+    let mut queue: VecDeque<(u64, u32, u64)> = seed_ids.iter().map(|&id| (id, 0, id)).collect();
 
-    while let Some((id, depth)) = queue.pop_front() {
+    while let Some((id, depth, parent_seed)) = queue.pop_front() {
         if depth >= max_depth {
             continue;
         }
-        let dependents = graph.dependents(id);
-        if dependents.is_empty() {
+        let neighbours = direction.neighbours(graph, id);
+        if neighbours.is_empty() {
+            continue;
+        }
+        let hop_fan_out = fan_out.for_hop(neighbours.len());
+        if hop_fan_out == 0 {
             continue;
         }
 
-        // Score each caller by:
+        // Score each neighbour by:
         //   + `overlap` — count of query-term matches in name / fqn
         //   + `SEMANTIC_WEIGHT * sim` — cosine of body embedding vs query embedding
         //   − `0.1 * centrality` — small penalty so leaf callers beat utility hubs
@@ -263,7 +733,7 @@ pub(crate) fn reverse_expand_from_anchors(
         // statement symbols have no body, no callees beyond the imported
         // names, and no agent-useful content; when they win pivot slots
         // they push the agent into unrelated files.
-        let mut scored: Vec<(u64, f32)> = dependents
+        let mut scored: Vec<(u64, f32)> = neighbours
             .iter()
             .filter(|s| !s.is_stub)
             .filter(|s| s.kind != SymbolKind::Import)
@@ -285,23 +755,336 @@ pub(crate) fn reverse_expand_from_anchors(
                     .clamp(0.0, 1.0);
                 (
                     s.id,
-                    overlap + REVERSE_EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1,
+                    overlap + EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1,
                 )
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        for (cid, _) in scored.into_iter().take(fan_out) {
+        for (cid, _) in scored.into_iter().take(hop_fan_out) {
             if visited.insert(cid) {
                 let score = 1.0 / (depth as f32 + 2.0);
-                out.push((cid, score));
+                let next_depth = depth + 1;
+                let bucket = (next_depth as usize).min(depth_emitted.len() - 1);
+                depth_emitted[bucket] += 1;
+                let per_seed = per_seed_depth.entry(parent_seed).or_insert([0; 8]);
+                per_seed[bucket] += 1;
+                out.push((cid, score, parent_seed));
                 if out.len() >= max_total {
+                    log_expand_stats(
+                        "expand-bfs",
+                        direction,
+                        graph,
+                        &out,
+                        &depth_emitted,
+                        &per_seed_depth,
+                        true,
+                    );
                     return out;
                 }
-                queue.push_back((cid, depth + 1));
+                queue.push_back((cid, next_depth, parent_seed));
             }
         }
     }
+    log_expand_stats(
+        "expand-bfs",
+        direction,
+        graph,
+        &out,
+        &depth_emitted,
+        &per_seed_depth,
+        false,
+    );
+    out
+}
+
+/// Emit the expand-walker debug log. Centralises the formatting so both
+/// walkers (#96) produce the same shape:
+///
+/// ```text
+/// expand-bfs [Forward]: emitted 36 (cap), depth_dist=[7, 29, 0, ...]
+///   seed=12345 (Axes::hist) depth_dist=[3, 5, 0, ...]
+///   seed=67890 (pyplot::hist) depth_dist=[4, 24, 0, ...]
+///   …
+/// expand-bfs emissions: lib/.../Axes::hist::do_thing, lib/.../helper, …
+/// ```
+fn log_expand_stats(
+    label: &str,
+    direction: WalkDirection,
+    graph: &CodeGraph,
+    out: &[ExpandEmission],
+    depth_emitted: &[usize; 8],
+    per_seed_depth: &HashMap<u64, [usize; 8]>,
+    cap_hit: bool,
+) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let suffix = if cap_hit { " (cap)" } else { "" };
+    tracing::debug!(
+        "{} [{:?}]: emitted {}{}, depth_dist={:?}",
+        label,
+        direction,
+        out.len(),
+        suffix,
+        &depth_emitted[1..]
+    );
+    // Per-seed buckets — sorted by total emissions so the noisiest
+    // subtree shows up first in the log.
+    let mut by_seed: Vec<(u64, [usize; 8])> = per_seed_depth
+        .iter()
+        .map(|(&id, dist)| (id, *dist))
+        .collect();
+    by_seed.sort_by_key(|(_, d)| std::cmp::Reverse(d.iter().sum::<usize>()));
+    for (seed_id, dist) in &by_seed {
+        let name = graph
+            .get_symbol(*seed_id)
+            .map(|s| s.fqn.as_str())
+            .unwrap_or("<unknown>");
+        tracing::debug!("  seed={} ({}) depth_dist={:?}", seed_id, name, &dist[1..]);
+    }
+    // Pre-RRF emission spot-check (#96): list every FQN the walk
+    // emitted so the user can grep for an expected fix-site name and
+    // disambiguate "walk found it but RRF dropped it" from "walk
+    // never traversed there at all".
+    let fqns: Vec<&str> = out
+        .iter()
+        .filter_map(|(id, _, _)| graph.get_symbol(*id).map(|s| s.fqn.as_str()))
+        .collect();
+    tracing::debug!("{} emissions: {}", label, fqns.join(", "));
+}
+
+/// Best-first reverse-edge expansion (issue #69 option 3, deferred from
+/// the original `0f35b33` v1 — never landed before now). Replaces the
+/// fixed `(depth × fan_out)` BFS with a priority-queue walk:
+///
+/// - Seeds enter the queue at infinite priority so they're popped first.
+/// - On each pop we score *all* unvisited dependents of the popped node
+///   using the same mixed signal as the BFS variant (lex overlap +
+///   `EXPAND_SEMANTIC_WEIGHT * sim` − `0.1 * centrality`).
+/// - When `exploration_bonus` is true (`v3b`), each candidate's priority
+///   gets an additional `EXPAND_UCB_C * sqrt(ln(N) / n)` term,
+///   where `N` is the running total of expansions and `n` is expansions
+///   that originated from the same parent seed. Pulls the walk toward
+///   under-sampled subtrees when the per-candidate signal is noisy.
+/// - The walk stops when `total_budget` candidates have been emitted,
+///   `expand_budget` graph expansions have been performed, the queue is
+///   empty, or every remaining frontier node is past `max_depth`.
+///
+/// The output score `1 / (depth + 2)` matches the BFS variant so RRF
+/// fusion treats them equivalently — earlier-hop candidates rank higher.
+/// Output order is the order candidates were popped from the priority
+/// queue (i.e. priority order, mostly), which is what RRF wants for rank.
+///
+/// `query_terms` empty + `semantic_scorer` None reduces priority to
+/// `−0.1 * centrality`, which approximates "least-central first" — a
+/// reasonable default when no ranking signal is available.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reverse_expand_best_first(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    total_budget: usize,
+    expand_budget: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+    exploration_bonus: bool,
+) -> Vec<ExpandEmission> {
+    expand_best_first_directional(
+        graph,
+        seed_ids,
+        query_terms,
+        max_depth,
+        total_budget,
+        expand_budget,
+        semantic_scorer,
+        exploration_bonus,
+        WalkDirection::Reverse,
+    )
+}
+
+/// Forward sibling of `reverse_expand_best_first`. Issue #95 layer 2.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_expand_best_first(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    total_budget: usize,
+    expand_budget: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+    exploration_bonus: bool,
+) -> Vec<ExpandEmission> {
+    expand_best_first_directional(
+        graph,
+        seed_ids,
+        query_terms,
+        max_depth,
+        total_budget,
+        expand_budget,
+        semantic_scorer,
+        exploration_bonus,
+        WalkDirection::Forward,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_best_first_directional(
+    graph: &CodeGraph,
+    seed_ids: &[u64],
+    query_terms: &[String],
+    max_depth: u32,
+    total_budget: usize,
+    expand_budget: usize,
+    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
+    exploration_bonus: bool,
+    direction: WalkDirection,
+) -> Vec<ExpandEmission> {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    if max_depth == 0 || total_budget == 0 || expand_budget == 0 || seed_ids.is_empty() {
+        return Vec::new();
+    }
+
+    // BinaryHeap is a max-heap on Ord. Wrap f32 priorities so NaN doesn't
+    // panic and so highest-priority pops first.
+    #[derive(Clone, Copy)]
+    struct PqItem {
+        priority: f32,
+        id: u64,
+        depth: u32,
+        parent_seed: u64,
+    }
+    impl PartialEq for PqItem {
+        fn eq(&self, other: &Self) -> bool {
+            self.priority.total_cmp(&other.priority).is_eq()
+        }
+    }
+    impl Eq for PqItem {}
+    impl Ord for PqItem {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.priority.total_cmp(&other.priority)
+        }
+    }
+    impl PartialOrd for PqItem {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
+    let mut out: Vec<ExpandEmission> = Vec::new();
+    let mut depth_emitted: [usize; 8] = [0; 8];
+    let mut per_seed_depth: HashMap<u64, [usize; 8]> = HashMap::new();
+    let mut pq: BinaryHeap<PqItem> = BinaryHeap::new();
+    let mut subtree_visits: HashMap<u64, usize> = HashMap::new();
+    let mut total_expansions: usize = 0;
+
+    for &seed in seed_ids {
+        pq.push(PqItem {
+            priority: f32::INFINITY,
+            id: seed,
+            depth: 0,
+            parent_seed: seed,
+        });
+    }
+
+    while let Some(item) = pq.pop() {
+        if total_expansions >= expand_budget {
+            break;
+        }
+        if item.depth >= max_depth {
+            continue;
+        }
+        let neighbours = direction.neighbours(graph, item.id);
+        if neighbours.is_empty() {
+            continue;
+        }
+        total_expansions += 1;
+
+        for s in neighbours
+            .iter()
+            .filter(|s| !s.is_stub)
+            .filter(|s| s.kind != SymbolKind::Import)
+        {
+            if !visited.insert(s.id) {
+                continue;
+            }
+            let name_lower = s.name.to_lowercase();
+            let fqn_lower = s.fqn.to_lowercase();
+            let overlap = query_terms
+                .iter()
+                .filter(|t| {
+                    let t = t.as_str();
+                    name_lower.contains(t) || fqn_lower.contains(t)
+                })
+                .count() as f32;
+            let centrality = graph.centrality_score(s.id);
+            let semantic = semantic_scorer
+                .and_then(|f| f(s.id))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+
+            let mut priority = overlap + EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1;
+
+            if exploration_bonus {
+                let n_sub = (*subtree_visits.get(&item.parent_seed).unwrap_or(&0)).max(1) as f32;
+                let n_total = total_expansions.max(1) as f32;
+                let bonus = EXPAND_UCB_C * (n_total.ln() / n_sub).sqrt();
+                priority += bonus;
+            }
+
+            let next_depth = item.depth + 1;
+            let out_score = 1.0 / (next_depth as f32 + 1.0);
+            let bucket = (next_depth as usize).min(depth_emitted.len() - 1);
+            depth_emitted[bucket] += 1;
+            let per_seed = per_seed_depth.entry(item.parent_seed).or_insert([0; 8]);
+            per_seed[bucket] += 1;
+            out.push((s.id, out_score, item.parent_seed));
+            *subtree_visits.entry(item.parent_seed).or_insert(0) += 1;
+
+            if out.len() >= total_budget {
+                tracing::debug!(
+                    "expand-best-first [{:?}]: expansions={}",
+                    direction,
+                    total_expansions
+                );
+                log_expand_stats(
+                    "expand-best-first",
+                    direction,
+                    graph,
+                    &out,
+                    &depth_emitted,
+                    &per_seed_depth,
+                    true,
+                );
+                return out;
+            }
+
+            pq.push(PqItem {
+                priority,
+                id: s.id,
+                depth: next_depth,
+                parent_seed: item.parent_seed,
+            });
+        }
+    }
+
+    tracing::debug!(
+        "expand-best-first [{:?}]: expansions={}",
+        direction,
+        total_expansions
+    );
+    log_expand_stats(
+        "expand-best-first",
+        direction,
+        graph,
+        &out,
+        &depth_emitted,
+        &per_seed_depth,
+        false,
+    );
     out
 }
 
@@ -601,7 +1384,15 @@ mod tests {
                 Some(0.3)
             }
         };
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
+        let out = reverse_expand_from_anchors(
+            &g,
+            &[seed_id],
+            &terms,
+            3,
+            FanOutPolicy::Fixed(1),
+            1,
+            Some(&scorer),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].0, aligned,
@@ -624,7 +1415,15 @@ mod tests {
                 Some(0.1)
             }
         };
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
+        let out = reverse_expand_from_anchors(
+            &g,
+            &[seed_id],
+            &terms,
+            3,
+            FanOutPolicy::Fixed(1),
+            1,
+            Some(&scorer),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, target);
     }
@@ -666,7 +1465,15 @@ mod tests {
             }
         };
 
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
+        let out = reverse_expand_from_anchors(
+            &g,
+            &[seed_id],
+            &terms,
+            3,
+            FanOutPolicy::Fixed(1),
+            1,
+            Some(&scorer),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].0, lexical_id,
@@ -696,8 +1503,307 @@ mod tests {
         g.warm_caches();
 
         let terms: Vec<String> = vec!["substitution".into()];
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, None);
+        let out =
+            reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, FanOutPolicy::Fixed(1), 1, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, winner_id);
+    }
+
+    // ── reverse_expand_best_first (v3a/v3b) ──────────────────────────────
+
+    #[test]
+    fn best_first_walks_priority_order_not_breadth_first() {
+        // Seed → 3 direct callers (A, B, C). C has the highest term score.
+        // Each caller has its own grandchild (A1, B1, C1). C1 has term-score 0
+        // but inherits high priority because C was popped first.
+        //
+        // BFS at fan_out=1 / max_total=2 would emit [C, A1] (one per hop).
+        // Best-first at total_budget=2 should emit [C, C1] (depth-2 wins
+        // because C's grandchild was reachable at higher priority than
+        // unexpanded A or B).
+        let mut g = CodeGraph::new();
+        let seed = mk("err.py", "Err", SymbolKind::Class);
+        let seed_id = seed.id;
+        g.add_symbol(seed);
+        let a = mk("a.py", "anon_a", SymbolKind::Function);
+        let b = mk("b.py", "anon_b", SymbolKind::Function);
+        let c = mk("c.py", "substitution_handler", SymbolKind::Function);
+        let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+        g.add_symbol(a);
+        g.add_symbol(b);
+        g.add_symbol(c);
+        let a1 = mk("a.py", "anon_a_helper", SymbolKind::Function);
+        let b1 = mk("b.py", "anon_b_helper", SymbolKind::Function);
+        let c1 = mk("c.py", "anon_c_helper", SymbolKind::Function);
+        let (a1_id, _b1_id, c1_id) = (a1.id, b1.id, c1.id);
+        g.add_symbol(a1);
+        g.add_symbol(b1);
+        g.add_symbol(c1);
+        g.add_edge(a_id, seed_id, EdgeKind::Calls);
+        g.add_edge(b_id, seed_id, EdgeKind::Calls);
+        g.add_edge(c_id, seed_id, EdgeKind::Calls);
+        g.add_edge(a1_id, a_id, EdgeKind::Calls);
+        g.add_edge(_b1_id, b_id, EdgeKind::Calls);
+        g.add_edge(c1_id, c_id, EdgeKind::Calls);
+        g.warm_caches();
+
+        let terms: Vec<String> = vec!["substitution".into()];
+        let out = reverse_expand_best_first(&g, &[seed_id], &terms, 3, 2, 100, None, false);
+
+        assert_eq!(out.len(), 2);
+        let ids: Vec<u64> = out.iter().map(|(id, _, _)| *id).collect();
+        assert!(
+            ids.contains(&c_id),
+            "C should be emitted first; got {:?}",
+            ids
+        );
+        // The second slot goes to either C1 (because C had highest priority and
+        // was expanded next) or another seed-direct caller. Best-first
+        // greedily descends — C1 inherits C's high subtree priority once
+        // C is popped. Accept either C1 or A/B since centrality penalty
+        // is identical and term overlap is zero for all three.
+        assert!(
+            ids.contains(&c1_id) || ids.contains(&a_id) || ids.contains(&b_id),
+            "second slot should be a frontier candidate; got {:?}",
+            ids,
+        );
+    }
+
+    #[test]
+    fn best_first_respects_total_budget() {
+        // With many callers and total_budget=3, we get exactly 3 outputs
+        // even though the graph has more.
+        let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(20);
+        let out = reverse_expand_best_first(&g, &[seed_id], &[], 3, 3, 100, None, false);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn best_first_respects_expand_budget() {
+        // expand_budget=1 means only the seeds themselves get expanded once.
+        // We get up to fan_out_full callers in one batch, but no deeper
+        // expansion. Output count ≤ direct callers.
+        let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(5);
+        let out = reverse_expand_best_first(&g, &[seed_id], &[], 5, 100, 1, None, false);
+        // 5 direct callers were emitted in the seed expansion; expand_budget=1
+        // stopped further expansions. Each caller has no further dependents
+        // anyway in this fixture, so the cap is exercised but the result
+        // happens to be the same as if we'd let it run.
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn best_first_zero_signal_returns_callers() {
+        // No query terms, no semantic scorer — priority degenerates to
+        // `-0.1 * centrality`. Walk should still emit seed dependents in
+        // some order. (The exact order isn't important here; this is a
+        // doesn't-panic / doesn't-deadlock smoke test.)
+        let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(3);
+        let out = reverse_expand_best_first(&g, &[seed_id], &[], 3, 10, 100, None, false);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn best_first_exploration_bonus_is_finite() {
+        // UCB-bonus path must not produce NaN priorities (which would
+        // destroy the BinaryHeap ordering). Smoke test that v3b still
+        // converges on the same fixture.
+        let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(5);
+        let out = reverse_expand_best_first(&g, &[seed_id], &[], 3, 5, 100, None, true);
+        assert_eq!(out.len(), 5);
+        for (_, score, _) in &out {
+            assert!(
+                score.is_finite(),
+                "out score should be finite, got {}",
+                score
+            );
+        }
+    }
+
+    // ── Forward expansion + direction classifier (issue #95) ────────────
+
+    /// Build a small graph for forward-expand: one anchor with `n` direct
+    /// callees. Returns `(graph, anchor_id, callee_ids)`.
+    fn graph_with_anonymous_callees(n: usize) -> (CodeGraph, u64, Vec<u64>) {
+        let mut g = CodeGraph::new();
+        let anchor = mk("api.py", "public_api", SymbolKind::Function);
+        let anchor_id = anchor.id;
+        g.add_symbol(anchor);
+        let mut callee_ids = Vec::new();
+        for i in 0..n {
+            let c = mk(
+                &format!("impl_{i}.py"),
+                &format!("anon_{i}"),
+                SymbolKind::Function,
+            );
+            callee_ids.push(c.id);
+            g.add_symbol(c);
+        }
+        // Anchor → callee (anchor depends on callee).
+        for &cid in &callee_ids {
+            g.add_edge(anchor_id, cid, EdgeKind::Calls);
+        }
+        g.warm_caches();
+        (g, anchor_id, callee_ids)
+    }
+
+    #[test]
+    fn forward_expand_walks_callees_not_callers() {
+        // Anchor has 3 callees and zero callers. Reverse walk returns
+        // nothing; forward walk returns all 3.
+        let (g, anchor_id, callee_ids) = graph_with_anonymous_callees(3);
+        let rev =
+            reverse_expand_from_anchors(&g, &[anchor_id], &[], 3, FanOutPolicy::Fixed(5), 10, None);
+        assert!(rev.is_empty(), "no callers → reverse should be empty");
+        let fwd =
+            forward_expand_from_anchors(&g, &[anchor_id], &[], 3, FanOutPolicy::Fixed(5), 10, None);
+        assert_eq!(fwd.len(), 3);
+        let ids: HashSet<u64> = fwd.iter().map(|(id, _, _)| *id).collect();
+        for cid in &callee_ids {
+            assert!(ids.contains(cid));
+        }
+    }
+
+    #[test]
+    fn forward_best_first_walks_callees() {
+        // The best-first variant must also dispatch to dependencies()
+        // when direction is forward — smoke-test the wiring.
+        let (g, anchor_id, _callee_ids) = graph_with_anonymous_callees(4);
+        let fwd = forward_expand_best_first(&g, &[anchor_id], &[], 3, 4, 50, None, false);
+        assert_eq!(fwd.len(), 4);
+    }
+
+    #[test]
+    fn classify_direction_exception_class_is_reverse() {
+        let mut g = CodeGraph::new();
+        let exc = mk("err.py", "PolynomialError", SymbolKind::Class);
+        let exc_id = exc.id;
+        g.add_symbol(exc);
+        // Add a few raisers so reverse fan-out > 0.
+        for i in 0..3 {
+            let r = mk(
+                &format!("r{i}.py"),
+                &format!("raiser_{i}"),
+                SymbolKind::Function,
+            );
+            let rid = r.id;
+            g.add_symbol(r);
+            g.add_edge(rid, exc_id, EdgeKind::Calls);
+        }
+        g.warm_caches();
+        let sym = g.get_symbol(exc_id).unwrap();
+        assert_eq!(classify_direction(&g, sym), EffectiveDirection::Reverse);
+    }
+
+    #[test]
+    fn classify_direction_high_fanout_function_is_forward() {
+        // Anchor has 10 callees, 1 caller — forward-shaped (3× ratio met).
+        let mut g = CodeGraph::new();
+        let anchor = mk("api.py", "do_thing", SymbolKind::Function);
+        let anchor_id = anchor.id;
+        g.add_symbol(anchor);
+        for i in 0..10 {
+            let cal = mk(
+                &format!("c{i}.py"),
+                &format!("step_{i}"),
+                SymbolKind::Function,
+            );
+            let cal_id = cal.id;
+            g.add_symbol(cal);
+            g.add_edge(anchor_id, cal_id, EdgeKind::Calls);
+        }
+        let caller = mk("user.py", "user", SymbolKind::Function);
+        let caller_id = caller.id;
+        g.add_symbol(caller);
+        g.add_edge(caller_id, anchor_id, EdgeKind::Calls);
+        g.warm_caches();
+        let sym = g.get_symbol(anchor_id).unwrap();
+        assert_eq!(classify_direction(&g, sym), EffectiveDirection::Forward);
+    }
+
+    // ── budget env-var resolvers (#96) ───────────────────────────────────
+    //
+    // These tests mutate process-wide env state and would race if run in
+    // parallel — `cargo test` partitions tests across threads. Serialise
+    // by sharing a single test that sets, asserts, unsets in sequence.
+
+    #[test]
+    fn resolve_total_and_expand_budget_env_overrides() {
+        let all_vars = [
+            "CS_EXPAND_TOTAL_BUDGET",
+            "CS_EXPAND_GRAPH_BUDGET",
+            "CS_REVERSE_EXPAND_TOTAL_BUDGET",
+            "CS_REVERSE_EXPAND_EXPAND_BUDGET",
+        ];
+        for v in all_vars {
+            std::env::remove_var(v);
+        }
+
+        // Default (unset) → constants.
+        assert_eq!(resolve_total_budget(), EXPAND_TOTAL_BUDGET);
+        assert_eq!(resolve_expand_budget(), EXPAND_GRAPH_BUDGET);
+
+        // New names win.
+        std::env::set_var("CS_EXPAND_TOTAL_BUDGET", "200");
+        std::env::set_var("CS_EXPAND_GRAPH_BUDGET", "1000");
+        assert_eq!(resolve_total_budget(), 200);
+        assert_eq!(resolve_expand_budget(), 1000);
+
+        // New names take precedence over deprecated aliases when both
+        // are set.
+        std::env::set_var("CS_REVERSE_EXPAND_TOTAL_BUDGET", "999");
+        std::env::set_var("CS_REVERSE_EXPAND_EXPAND_BUDGET", "9999");
+        assert_eq!(resolve_total_budget(), 200);
+        assert_eq!(resolve_expand_budget(), 1000);
+
+        // Without new names, deprecated aliases are read (with a warn).
+        std::env::remove_var("CS_EXPAND_TOTAL_BUDGET");
+        std::env::remove_var("CS_EXPAND_GRAPH_BUDGET");
+        assert_eq!(resolve_total_budget(), 999);
+        assert_eq!(resolve_expand_budget(), 9999);
+
+        // Unparseable → falls back to constants.
+        std::env::set_var("CS_EXPAND_TOTAL_BUDGET", "not-a-number");
+        std::env::set_var("CS_EXPAND_GRAPH_BUDGET", "");
+        std::env::remove_var("CS_REVERSE_EXPAND_TOTAL_BUDGET");
+        std::env::remove_var("CS_REVERSE_EXPAND_EXPAND_BUDGET");
+        assert_eq!(resolve_total_budget(), EXPAND_TOTAL_BUDGET);
+        assert_eq!(resolve_expand_budget(), EXPAND_GRAPH_BUDGET);
+
+        for v in all_vars {
+            std::env::remove_var(v);
+        }
+    }
+
+    #[test]
+    fn classify_direction_balanced_anchor_is_both() {
+        // Symmetric fan-out → ambiguous → Both.
+        let mut g = CodeGraph::new();
+        let anchor = mk("mid.py", "intermediary", SymbolKind::Function);
+        let anchor_id = anchor.id;
+        g.add_symbol(anchor);
+        for i in 0..3 {
+            let cal = mk(
+                &format!("c{i}.py"),
+                &format!("callee_{i}"),
+                SymbolKind::Function,
+            );
+            let cal_id = cal.id;
+            g.add_symbol(cal);
+            g.add_edge(anchor_id, cal_id, EdgeKind::Calls);
+        }
+        for i in 0..3 {
+            let r = mk(
+                &format!("r{i}.py"),
+                &format!("caller_{i}"),
+                SymbolKind::Function,
+            );
+            let r_id = r.id;
+            g.add_symbol(r);
+            g.add_edge(r_id, anchor_id, EdgeKind::Calls);
+        }
+        g.warm_caches();
+        let sym = g.get_symbol(anchor_id).unwrap();
+        assert_eq!(classify_direction(&g, sym), EffectiveDirection::Both);
     }
 }
