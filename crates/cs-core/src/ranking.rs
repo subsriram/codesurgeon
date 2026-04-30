@@ -619,6 +619,13 @@ pub(crate) fn is_trivial_exception_pivot(sym: &Symbol) -> bool {
 /// weight is `EXPAND_SEMANTIC_WEIGHT`. See issue #69 v2.
 ///
 /// The return order is BFS order (depth-ascending), preserved for RRF.
+/// One emission from the expand walk: `(id, score, parent_seed)`.
+/// `score` encodes depth (`1.0 / (depth + 1)`); `parent_seed` is the
+/// root seed of the emission's subtree, used by engine-side per-seed
+/// RRF list splitting so a productive seed's chain isn't drowned out
+/// by a noisy seed's emissions in fusion. Issue #96.
+pub(crate) type ExpandEmission = (u64, f32, u64);
+
 pub(crate) fn reverse_expand_from_anchors(
     graph: &CodeGraph,
     seed_ids: &[u64],
@@ -627,7 +634,7 @@ pub(crate) fn reverse_expand_from_anchors(
     fan_out: FanOutPolicy,
     max_total: usize,
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
-) -> Vec<(u64, f32)> {
+) -> Vec<ExpandEmission> {
     expand_from_anchors_directional(
         graph,
         seed_ids,
@@ -653,7 +660,7 @@ pub(crate) fn forward_expand_from_anchors(
     fan_out: FanOutPolicy,
     max_total: usize,
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
-) -> Vec<(u64, f32)> {
+) -> Vec<ExpandEmission> {
     expand_from_anchors_directional(
         graph,
         seed_ids,
@@ -676,7 +683,7 @@ fn expand_from_anchors_directional(
     max_total: usize,
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
     direction: WalkDirection,
-) -> Vec<(u64, f32)> {
+) -> Vec<ExpandEmission> {
     use std::collections::VecDeque;
 
     let fan_out_floor = match fan_out {
@@ -688,7 +695,7 @@ fn expand_from_anchors_directional(
     }
 
     let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
-    let mut out: Vec<(u64, f32)> = Vec::new();
+    let mut out: Vec<ExpandEmission> = Vec::new();
     let mut depth_emitted: [usize; 8] = [0; 8];
     // Per-seed depth attribution (#96): track which root each emission
     // descends from. Cheap to maintain — one HashMap entry per seed.
@@ -762,7 +769,7 @@ fn expand_from_anchors_directional(
                 depth_emitted[bucket] += 1;
                 let per_seed = per_seed_depth.entry(parent_seed).or_insert([0; 8]);
                 per_seed[bucket] += 1;
-                out.push((cid, score));
+                out.push((cid, score, parent_seed));
                 if out.len() >= max_total {
                     log_expand_stats(
                         "expand-bfs",
@@ -805,7 +812,7 @@ fn log_expand_stats(
     label: &str,
     direction: WalkDirection,
     graph: &CodeGraph,
-    out: &[(u64, f32)],
+    out: &[ExpandEmission],
     depth_emitted: &[usize; 8],
     per_seed_depth: &HashMap<u64, [usize; 8]>,
     cap_hit: bool,
@@ -842,7 +849,7 @@ fn log_expand_stats(
     // never traversed there at all".
     let fqns: Vec<&str> = out
         .iter()
-        .filter_map(|(id, _)| graph.get_symbol(*id).map(|s| s.fqn.as_str()))
+        .filter_map(|(id, _, _)| graph.get_symbol(*id).map(|s| s.fqn.as_str()))
         .collect();
     tracing::debug!("{} emissions: {}", label, fqns.join(", "));
 }
@@ -882,7 +889,7 @@ pub(crate) fn reverse_expand_best_first(
     expand_budget: usize,
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
     exploration_bonus: bool,
-) -> Vec<(u64, f32)> {
+) -> Vec<ExpandEmission> {
     expand_best_first_directional(
         graph,
         seed_ids,
@@ -907,7 +914,7 @@ pub(crate) fn forward_expand_best_first(
     expand_budget: usize,
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
     exploration_bonus: bool,
-) -> Vec<(u64, f32)> {
+) -> Vec<ExpandEmission> {
     expand_best_first_directional(
         graph,
         seed_ids,
@@ -932,7 +939,7 @@ fn expand_best_first_directional(
     semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
     exploration_bonus: bool,
     direction: WalkDirection,
-) -> Vec<(u64, f32)> {
+) -> Vec<ExpandEmission> {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
 
@@ -967,7 +974,7 @@ fn expand_best_first_directional(
     }
 
     let mut visited: HashSet<u64> = seed_ids.iter().copied().collect();
-    let mut out: Vec<(u64, f32)> = Vec::new();
+    let mut out: Vec<ExpandEmission> = Vec::new();
     let mut depth_emitted: [usize; 8] = [0; 8];
     let mut per_seed_depth: HashMap<u64, [usize; 8]> = HashMap::new();
     let mut pq: BinaryHeap<PqItem> = BinaryHeap::new();
@@ -1034,7 +1041,7 @@ fn expand_best_first_directional(
             depth_emitted[bucket] += 1;
             let per_seed = per_seed_depth.entry(item.parent_seed).or_insert([0; 8]);
             per_seed[bucket] += 1;
-            out.push((s.id, out_score));
+            out.push((s.id, out_score, item.parent_seed));
             *subtree_visits.entry(item.parent_seed).or_insert(0) += 1;
 
             if out.len() >= total_budget {
@@ -1544,7 +1551,7 @@ mod tests {
         let out = reverse_expand_best_first(&g, &[seed_id], &terms, 3, 2, 100, None, false);
 
         assert_eq!(out.len(), 2);
-        let ids: Vec<u64> = out.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<u64> = out.iter().map(|(id, _, _)| *id).collect();
         assert!(
             ids.contains(&c_id),
             "C should be emitted first; got {:?}",
@@ -1604,7 +1611,7 @@ mod tests {
         let (g, seed_id, _caller_ids) = graph_with_anonymous_callers(5);
         let out = reverse_expand_best_first(&g, &[seed_id], &[], 3, 5, 100, None, true);
         assert_eq!(out.len(), 5);
-        for (_, score) in &out {
+        for (_, score, _) in &out {
             assert!(
                 score.is_finite(),
                 "out score should be finite, got {}",
@@ -1651,7 +1658,7 @@ mod tests {
         let fwd =
             forward_expand_from_anchors(&g, &[anchor_id], &[], 3, FanOutPolicy::Fixed(5), 10, None);
         assert_eq!(fwd.len(), 3);
-        let ids: HashSet<u64> = fwd.iter().map(|(id, _)| *id).collect();
+        let ids: HashSet<u64> = fwd.iter().map(|(id, _, _)| *id).collect();
         for cid in &callee_ids {
             assert!(ids.contains(cid));
         }

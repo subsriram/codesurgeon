@@ -2663,7 +2663,7 @@ impl CoreEngine {
             );
         }
 
-        let reverse_results: Vec<(u64, f32)> = if !self.config.reverse_expand_anchors
+        let reverse_results: Vec<(u64, f32, u64)> = if !self.config.reverse_expand_anchors
             || strategy == ExpandStrategy::None
             || strategy.is_unimplemented()
         {
@@ -2843,7 +2843,7 @@ impl CoreEngine {
                         (false, false) => (0, 0, 0, 0),
                     };
 
-                let mut out: Vec<(u64, f32)> = Vec::new();
+                let mut out: Vec<(u64, f32, u64)> = Vec::new();
 
                 if !forward_seeds.is_empty() {
                     let fwd_out = if strategy.use_best_first() {
@@ -2910,8 +2910,10 @@ impl CoreEngine {
                 }
 
                 // Dedup by id, preserving first occurrence (best-ranked).
+                // Keep the parent_seed of the first occurrence so per-seed
+                // RRF list split is stable across runs.
                 let mut seen: HashSet<u64> = HashSet::new();
-                out.retain(|(id, _)| seen.insert(*id));
+                out.retain(|(id, _, _)| seen.insert(*id));
 
                 tracing::debug!(
                     target: "cs_core::ranking",
@@ -2941,62 +2943,96 @@ impl CoreEngine {
             );
         }
 
-        // Split expand emissions by depth for RRF re-weighting (#96 item A).
-        // The walkers encode depth as `score = 1.0 / (depth + 1)`:
+        // Split expand emissions by depth AND by parent_seed for RRF
+        // re-weighting (#96 item A + per-seed list split). The walkers
+        // encode depth as `score = 1.0 / (depth + 1)`:
         //   - score == 0.5  → depth-1 emission (direct neighbour)
         //   - score <  0.5  → depth ≥ 2 emission (chain)
-        // Deep chain candidates compete poorly against multi-seed
-        // agreement (e.g. `gca`, `gcf` — graph-near to several anchors)
-        // when fused at the same RRF k as shallow ones. Splitting and
-        // fusing the deep list at the smaller `EXPAND_DEEP_RRF_K = 8`
-        // gives chain symbols a precision-first boost equivalent to
-        // traceback-frame priority — they're members of a verified
-        // single-seed call chain, on-bug by construction.
-        let (expand_shallow, expand_deep) = {
-            let (a, b): (Vec<_>, Vec<_>) =
-                reverse_results.into_iter().partition(|(_, s)| *s >= 0.45);
-            (a, b)
-        };
+        //
+        // Two-stage fix:
+        //
+        // 1. Depth split: deep chain candidates compete poorly against
+        //    multi-seed agreement (e.g. `gca`, `gcf` — graph-near to
+        //    several anchors) when fused at the same RRF k as shallow
+        //    ones. Fuse deep at the smaller `EXPAND_DEEP_RRF_K = 8`.
+        //
+        // 2. Per-seed split: with one merged deep list, a noisy seed's
+        //    deep emissions outrank a productive seed's chain because
+        //    they share the same list. matplotlib-24177 shape: chain
+        //    `Axes::hist → fill → add_patch → _update_patch_limits`
+        //    survives walker emission but gets drowned by noise from
+        //    other seeds at fusion time. Per-seed deep lists give each
+        //    seed's chain its own ranked queue so chain symbols rank
+        //    high within their seed's list — independent of how dense
+        //    other seeds' subtrees are.
+        let mut expand_shallow: Vec<(u64, f32)> = Vec::new();
+        let mut per_seed_deep: HashMap<u64, Vec<(u64, f32)>> = HashMap::new();
+        for (id, score, parent_seed) in reverse_results {
+            if score >= 0.45 {
+                expand_shallow.push((id, score));
+            } else {
+                per_seed_deep
+                    .entry(parent_seed)
+                    .or_default()
+                    .push((id, score));
+            }
+        }
+        // Stable order across runs (HashMap iteration is non-deterministic).
+        let mut deep_seed_ids: Vec<u64> = per_seed_deep.keys().copied().collect();
+        deep_seed_ids.sort_unstable();
         if tracing::enabled!(target: "cs_core::ranking", tracing::Level::DEBUG) {
+            let per_seed_summary: Vec<String> = deep_seed_ids
+                .iter()
+                .map(|sid| {
+                    let n = per_seed_deep.get(sid).map(|v| v.len()).unwrap_or(0);
+                    let fqn = self
+                        .graph
+                        .read()
+                        .get_symbol(*sid)
+                        .map(|s| s.fqn.clone())
+                        .unwrap_or_else(|| format!("<{}>", sid));
+                    format!("{}={}", fqn, n)
+                })
+                .collect();
             tracing::debug!(
                 target: "cs_core::ranking",
-                "expand fusion split: {} shallow (depth=1, k={}) + {} deep (depth≥2, k={})",
+                "expand fusion split: {} shallow (k={}); {} per-seed deep lists (k={}): [{}]",
                 expand_shallow.len(),
                 EXPAND_RRF_K,
-                expand_deep.len(),
-                EXPAND_DEEP_RRF_K
+                deep_seed_ids.len(),
+                EXPAND_DEEP_RRF_K,
+                per_seed_summary.join(", ")
             );
         }
 
-        // ANN semantic retrieval + RRF fusion across all sources.
-        // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
-        // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
-        // lost the target to body-field noise. Traceback frames and deep
-        // chain emissions sit at the most aggressive `k` (TRACEBACK_RRF_K /
-        // EXPAND_DEEP_RRF_K). Shallow expand sits between anchors and the
-        // default retrievers (`EXPAND_RRF_K`).
-        #[cfg(feature = "embeddings")]
+        // RRF fusion across all sources. The anchor list fuses with a
+        // smaller `k` (ANCHOR_RRF_K) so that a rank-1 precision-first
+        // anchor hit outweighs a rank-1 BM25 hit that lost the target to
+        // body-field noise. Traceback frames and deep chain emissions
+        // sit at the most aggressive `k` (TRACEBACK_RRF_K /
+        // EXPAND_DEEP_RRF_K). Shallow expand sits between anchors and
+        // the default retrievers (`EXPAND_RRF_K`). Each per-seed deep
+        // list is a separate input — a chain's rank is computed within
+        // its own seed's list, not pooled across all seeds.
         let mut search_results = {
+            #[cfg(feature = "embeddings")]
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
-            rrf_merge_ks(&[
-                (&bm25_results, RRF_K),
-                (&graph_results, RRF_K),
-                (&ann_results, RRF_K),
-                (&anchor_results, ANCHOR_RRF_K),
-                (&traceback_results, TRACEBACK_RRF_K),
-                (&expand_shallow, EXPAND_RRF_K),
-                (&expand_deep, EXPAND_DEEP_RRF_K),
-            ])
+            let mut rrf_inputs: Vec<(&[(u64, f32)], f32)> = vec![
+                (bm25_results.as_slice(), RRF_K),
+                (graph_results.as_slice(), RRF_K),
+                #[cfg(feature = "embeddings")]
+                (ann_results.as_slice(), RRF_K),
+                (anchor_results.as_slice(), ANCHOR_RRF_K),
+                (traceback_results.as_slice(), TRACEBACK_RRF_K),
+                (expand_shallow.as_slice(), EXPAND_RRF_K),
+            ];
+            for sid in &deep_seed_ids {
+                if let Some(list) = per_seed_deep.get(sid) {
+                    rrf_inputs.push((list.as_slice(), EXPAND_DEEP_RRF_K));
+                }
+            }
+            rrf_merge_ks(&rrf_inputs)
         };
-        #[cfg(not(feature = "embeddings"))]
-        let mut search_results = rrf_merge_ks(&[
-            (&bm25_results, RRF_K),
-            (&graph_results, RRF_K),
-            (&anchor_results, ANCHOR_RRF_K),
-            (&traceback_results, TRACEBACK_RRF_K),
-            (&expand_shallow, EXPAND_RRF_K),
-            (&expand_deep, EXPAND_DEEP_RRF_K),
-        ]);
 
         let graph = self.graph.read();
 
@@ -3115,12 +3151,16 @@ impl CoreEngine {
                 .unwrap_or(false)
         };
 
-        let pinning_candidates: Vec<(u64, f32)> = anchor_results
-            .iter()
-            .copied()
-            .chain(expand_shallow.iter().copied())
-            .chain(expand_deep.iter().copied())
-            .collect();
+        let pinning_candidates: Vec<(u64, f32)> = {
+            let mut out: Vec<(u64, f32)> = anchor_results.to_vec();
+            out.extend(expand_shallow.iter().copied());
+            for sid in &deep_seed_ids {
+                if let Some(list) = per_seed_deep.get(sid) {
+                    out.extend(list.iter().copied());
+                }
+            }
+            out
+        };
         let mut anchor_by_file: HashMap<String, Vec<u64>> = HashMap::new();
         for (id, _) in &pinning_candidates {
             if !is_eligible_pivot(*id) {
