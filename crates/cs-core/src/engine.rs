@@ -2644,27 +2644,10 @@ impl CoreEngine {
         // cosine similarity between the query embedding and each caller's
         // body embedding. This recovers fix sites like sympy-21379's
         // `Mod.eval` whose body is topically aligned with the problem
-        // statement but has no lexical overlap with the query terms.
-        #[cfg(feature = "embeddings")]
-        let (re_query_vec, re_emb_guard) = {
-            self.ensure_embedding_cache();
-            let qv = self
-                .embedder
-                .get()
-                .and_then(|emb| match emb.embed_one(&anchor_source) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        tracing::warn!("reverse-expand query embed failed: {}", e);
-                        None
-                    }
-                });
-            let guard = qv.as_ref().map(|_| self.embedding_cache.read());
-            (qv, guard)
-        };
-        #[cfg(feature = "embeddings")]
-        let re_emb_lookup: Option<std::collections::HashMap<u64, &[f32]>> =
-            re_emb_guard.as_ref().map(|g| g.iter().collect());
-
+        // statement but has no lexical overlap with the query terms. The
+        // query embedding + cache load are deferred to the seed-non-empty
+        // branch — paying that cost on every pipeline call (when most
+        // queries have no exception-class anchor) is pure waste.
         let reverse_results: Vec<(u64, f32)> = if self.config.reverse_expand_anchors {
             let graph = self.graph.read();
             let seed_ids: Vec<u64> = anchor_results
@@ -2687,6 +2670,26 @@ impl CoreEngine {
                 Vec::new()
             } else {
                 let terms = query_terms_for_reverse_expand(&anchor_source);
+
+                #[cfg(feature = "embeddings")]
+                let (re_query_vec, re_emb_guard) = {
+                    self.ensure_embedding_cache();
+                    let qv =
+                        self.embedder
+                            .get()
+                            .and_then(|emb| match emb.embed_one(&anchor_source) {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    tracing::warn!("reverse-expand query embed failed: {}", e);
+                                    None
+                                }
+                            });
+                    let guard = qv.as_ref().map(|_| self.embedding_cache.read());
+                    (qv, guard)
+                };
+                #[cfg(feature = "embeddings")]
+                let re_emb_lookup: Option<std::collections::HashMap<u64, &[f32]>> =
+                    re_emb_guard.as_ref().map(|g| g.iter().collect());
 
                 #[cfg(feature = "embeddings")]
                 let semantic_closure = |id: u64| -> Option<f32> {
