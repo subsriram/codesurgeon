@@ -81,7 +81,7 @@ jobs:
 
       - name: Post PR comment
         if: github.event_name == 'pull_request' && steps.summary.outputs.body != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           SUMMARY_BODY: ${{ steps.summary.outputs.body }}
         with:
