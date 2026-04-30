@@ -24,7 +24,7 @@ use crate::ranking::{
     ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
     MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT,
     REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
-    STUB_SCORE_WEIGHT,
+    STUB_SCORE_WEIGHT, TRACEBACK_LEAF_PROBE, TRACEBACK_RRF_K,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -1331,6 +1331,37 @@ impl CoreEngine {
         language: Option<&str>,
         file_hint: Option<&str>,
     ) -> Result<String> {
+        let capsule =
+            self.run_pipeline_capsule_with_context(task, context, budget, language, file_hint)?;
+        let mut out = format_capsule(&capsule);
+        let has_swift = capsule
+            .pivots
+            .iter()
+            .any(|p| p.file_path.ends_with(".swift"))
+            || capsule
+                .skeletons
+                .iter()
+                .any(|s| s.file_path.ends_with(".swift"));
+        if has_swift {
+            out.push_str(&swift_enrichment_hint(detect_xcode_mcp()));
+        }
+        Ok(out)
+    }
+
+    /// Same as `run_pipeline_with_context` but returns the structured `Capsule`
+    /// instead of a markdown-formatted string. Used by tooling that needs to
+    /// inspect pivots/skeletons programmatically (e.g. `codesurgeon context
+    /// --json`). Side effects — auto-observation and query logging — are
+    /// identical to the formatted variant; the only thing the formatted path
+    /// adds on top is the markdown rendering and the Swift enrichment hint.
+    pub fn run_pipeline_capsule_with_context(
+        &self,
+        task: &str,
+        context: Option<&str>,
+        budget: Option<u32>,
+        language: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<Capsule> {
         let t0 = Instant::now();
         let budget = budget.unwrap_or(self.config.default_token_budget);
         let intent = SearchIntent::detect(task);
@@ -1346,22 +1377,6 @@ impl CoreEngine {
             task, budget, &intent, language, file_hint, None, None, context,
         )?;
         let latency_ms = t0.elapsed().as_millis() as u64;
-        let mut out = format_capsule(&capsule);
-
-        // Append Swift enrichment hint when Swift symbols appear in results.
-        // Points agents toward Xcode MCP if available, or documents the fallback
-        // so they don't assume the tree-sitter results are complete.
-        let has_swift = capsule
-            .pivots
-            .iter()
-            .any(|p| p.file_path.ends_with(".swift"))
-            || capsule
-                .skeletons
-                .iter()
-                .any(|s| s.file_path.ends_with(".swift"));
-        if has_swift {
-            out.push_str(&swift_enrichment_hint(detect_xcode_mcp()));
-        }
 
         // Auto-capture this tool call as an observation for cross-session memory.
         // Gated on `config.auto_observations` (default false). See the field doc
@@ -1422,7 +1437,7 @@ impl CoreEngine {
             tracing::warn!("query log failed: {}", e);
         }
 
-        Ok(out)
+        Ok(capsule)
     }
 
     /// Get context capsule for a query.
@@ -2244,6 +2259,63 @@ impl CoreEngine {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
+    /// Resolve Python traceback frames in `query` to symbol IDs.
+    ///
+    /// Each frame carries `(file_path, function_name)` — enough for a
+    /// precision-first lookup that doesn't go through BM25/embeddings.
+    /// The traceback IS the call chain; every frame is a member of the
+    /// bug's code path.
+    ///
+    /// Returns `(symbol_id, 1.0)` pairs in frame order (most-recent call
+    /// first, the typical Python traceback convention). RRF fusion at
+    /// `TRACEBACK_RRF_K` ensures rank-1 frames dominate any single
+    /// BM25/ANN hit.
+    ///
+    /// File-path matching is suffix-based: a traceback frame
+    /// `astropy/io/registry.py` matches an indexed symbol whose
+    /// `file_path` ends with that string. This tolerates absolute paths
+    /// in tracebacks vs. workspace-relative paths in the index.
+    fn traceback_candidates(&self, anchors: &crate::anchors::Anchors) -> Vec<(u64, f32)> {
+        if anchors.traceback_frames.is_empty() {
+            return Vec::new();
+        }
+        let db = self.db.lock();
+        let graph = self.graph.read();
+        let mut out: Vec<(u64, f32)> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        for frame in &anchors.traceback_frames {
+            // Function name may be dotted (`Class.method`); resolver-side
+            // we use the last segment for symbol-name matching.
+            let func = frame
+                .function_name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&frame.function_name);
+            // Use the `leaf_name` index to fetch only symbols whose leaf
+            // matches `func` — avoids the O(|graph|) walk per frame.
+            // A reasonable cap: a single leaf-name almost never has more
+            // than a handful of definitions across a workspace; if it does
+            // (e.g. `__init__`), we only care about ones in this frame's
+            // file, which the suffix filter below selects.
+            let ids = match db.symbols_by_leaf_name(func, TRACEBACK_LEAF_PROBE) {
+                Ok(ids) => ids,
+                Err(_) => continue,
+            };
+            for id in ids {
+                let Some(sym) = graph.get_symbol(id) else {
+                    continue;
+                };
+                if !sym.file_path.ends_with(&frame.file_path) {
+                    continue;
+                }
+                if seen.insert(sym.id) {
+                    out.push((sym.id, 1.0));
+                }
+            }
+        }
+        out
+    }
+
     /// Stage 1: explicit symbol-name anchors.
     ///
     /// Extracts identifier-shaped tokens from the query (prose, imports, and
@@ -2254,8 +2326,11 @@ impl CoreEngine {
     ///
     /// Returns `(symbol_id, 1.0)` pairs in extraction order. RRF fusion
     /// handles rank-based blending with BM25 / graph / ANN.
-    fn anchor_candidates(&self, query: &str, limit: usize) -> (Vec<(u64, f32)>, AnchorStats) {
-        let anchors = crate::anchors::extract(query);
+    fn anchor_candidates(
+        &self,
+        anchors: &crate::anchors::Anchors,
+        limit: usize,
+    ) -> (Vec<(u64, f32)>, AnchorStats) {
         if anchors.symbol_names.is_empty() {
             return (vec![], AnchorStats::default());
         }
@@ -2287,7 +2362,12 @@ impl CoreEngine {
             } else {
                 ANCHOR_ROWS_PER_NAME
             };
-            let exact_ids = match db.symbols_by_exact_name(lookup, fetch) {
+            // Match by `leaf_name` so class methods (stored with
+            // `name = "Class::method"`) are reachable via their bare
+            // `method` lookup. The `prefer_module` sort still applies —
+            // it prefers fewer-`::` fqns, so module-level functions
+            // sort ahead of methods within the truncated top-K.
+            let exact_ids = match db.symbols_by_leaf_name(lookup, fetch) {
                 Ok(mut ids) => {
                     if prefer_module {
                         ids.sort_by_key(|id| {
@@ -2541,7 +2621,9 @@ impl CoreEngine {
             Some(ctx) if !ctx.is_empty() => format!("{query}\n{ctx}"),
             _ => query.to_string(),
         };
-        let (anchor_results, astats) = self.anchor_candidates(&anchor_source, ANCHOR_CANDIDATES);
+        // Extract once, reuse for both anchor_candidates and traceback_candidates.
+        let extracted = crate::anchors::extract(&anchor_source);
+        let (anchor_results, astats) = self.anchor_candidates(&extracted, ANCHOR_CANDIDATES);
         tracing::debug!(
             "anchor stats: {:?} (context bytes: {})",
             astats,
@@ -2649,11 +2731,26 @@ impl CoreEngine {
             Vec::new()
         };
 
+        // Traceback shortcut: when `--context` contains a Python traceback,
+        // every frame's `(file, function)` resolves to a high-confidence
+        // pivot candidate. The traceback IS the call chain; we feed its
+        // frames into RRF at the most aggressive `k` (`TRACEBACK_RRF_K`)
+        // so rank-1 frames dominate any single BM25/ANN hit. Empty when
+        // no Python traceback is present in the query/context.
+        let traceback_results = self.traceback_candidates(&extracted);
+        if !traceback_results.is_empty() {
+            tracing::debug!(
+                "traceback shortcut: {} frame symbols resolved",
+                traceback_results.len()
+            );
+        }
+
         // ANN semantic retrieval + RRF fusion across all sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
         // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
-        // lost the target to body-field noise. Reverse-expansion sits between
-        // anchors and the default retrievers (`REVERSE_EXPAND_RRF_K`).
+        // lost the target to body-field noise. Traceback frames sit at the
+        // most aggressive `k` (TRACEBACK_RRF_K). Reverse-expansion sits
+        // between anchors and the default retrievers (`REVERSE_EXPAND_RRF_K`).
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
@@ -2662,6 +2759,7 @@ impl CoreEngine {
                 (&graph_results, RRF_K),
                 (&ann_results, RRF_K),
                 (&anchor_results, ANCHOR_RRF_K),
+                (&traceback_results, TRACEBACK_RRF_K),
                 (&reverse_results, REVERSE_EXPAND_RRF_K),
             ])
         };
@@ -2670,6 +2768,7 @@ impl CoreEngine {
             (&bm25_results, RRF_K),
             (&graph_results, RRF_K),
             (&anchor_results, ANCHOR_RRF_K),
+            (&traceback_results, TRACEBACK_RRF_K),
             (&reverse_results, REVERSE_EXPAND_RRF_K),
         ]);
 

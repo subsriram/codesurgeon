@@ -2426,3 +2426,65 @@ RuntimeError: boom
          check: it proves the traceback case above used the new traceback path, not the prose path."
     );
 }
+
+/// Engine-level test for `traceback_candidates`: a traceback frame whose
+/// function name is a class method (`Class.method`) must resolve via
+/// leaf-name lookup, and the suffix-based file-path match must pin down
+/// the *specific* symbol — not the same-named function in another file.
+///
+/// Setup: two files each define a `flush` symbol — one is a top-level
+/// function, the other is `Buffer.flush`. The traceback names the class-method
+/// file, so only that symbol should surface as a traceback pivot.
+#[test]
+fn traceback_resolves_class_method_via_leaf_and_file_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("io")).unwrap();
+    std::fs::write(
+        dir.path().join("io/buffer.py"),
+        "class Buffer:\n    def flush(self):\n        return 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("io/sink.py"),
+        "def flush():\n    return 2\n",
+    )
+    .unwrap();
+    // Decoys so BM25 / ANN have noise to compete with.
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("decoy_{i}.py")),
+            format!("def decoy_func_{i}():\n    return {i}\n"),
+        )
+        .unwrap();
+    }
+    let engine = test_engine(&dir);
+    engine.index_workspace().expect("index");
+
+    let task = "diagnose the reported crash";
+    // Traceback frame names `Buffer.flush` (dotted) in `io/buffer.py`.
+    // The frame's file path is workspace-relative; the resolver's
+    // suffix match must accept it against the indexed `file_path`.
+    let tb = "\
+Traceback (most recent call last):
+  File \"app/main.py\", line 4, in <module>
+    b.flush()
+  File \"io/buffer.py\", line 3, in flush
+    raise RuntimeError(\"boom\")
+RuntimeError: boom
+";
+
+    let capsule = engine
+        .run_pipeline_capsule_with_context(task, Some(tb), Some(4000), None, None)
+        .expect("pipeline");
+
+    let pivot_files: Vec<&str> = capsule
+        .pivots
+        .iter()
+        .map(|p| p.file_path.as_str())
+        .collect();
+    assert!(
+        pivot_files.iter().any(|f| f.ends_with("io/buffer.py")),
+        "traceback frame `File \"io/buffer.py\", in flush` must surface the class method \
+         `Buffer::flush` via leaf-name + suffix-path match. Pivots saw: {pivot_files:?}"
+    );
+}

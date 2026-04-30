@@ -39,6 +39,13 @@ pub(crate) const ANCHOR_FUZZY_PROBE: usize = 20;
 /// most-specific anchor hit in that file). Remaining pivot slots are filled
 /// from the BM25/ANN/graph RRF fusion. See docs/explicit-symbol-anchors.md.
 pub(crate) const ANCHOR_FILE_BUDGET: usize = 5;
+/// Per-frame leaf-name probe depth for traceback resolution. Caps how many
+/// candidate symbols we fetch from the `leaf_name` index for a given frame's
+/// function name before applying the file-path suffix filter. A typical leaf
+/// has only a handful of definitions across a workspace; common collision
+/// names (`__init__`, `run`) can have many, but only ones in the frame's
+/// file matter — the file-path filter is the precision lever.
+pub(crate) const TRACEBACK_LEAF_PROBE: usize = 50;
 
 // ── Reverse-edge expansion (issue #67) ───────────────────────────────────────
 //
@@ -93,6 +100,12 @@ pub(crate) const RRF_K: f32 = 60.0;
 /// Safe because anchor extraction is precision-first: most noise is filtered
 /// out by the stop-word list and the exact-match gate in `anchor_candidates`.
 pub(crate) const ANCHOR_RRF_K: f32 = 15.0;
+/// RRF k for symbols resolved from Python traceback frames. Even more
+/// aggressive than `ANCHOR_RRF_K` because tracebacks carry **both** the
+/// file path and the function name — the resolution is precision-first
+/// by construction, and a frame in the traceback IS a member of the
+/// call chain that produced the bug.
+pub(crate) const TRACEBACK_RRF_K: f32 = 8.0;
 /// Structural injection: score multiplier for injected hub types.
 pub(crate) const STRUCTURAL_INJECTION_SCORE: f32 = 5.0;
 /// Centrality boost multiplier applied to BM25 score.

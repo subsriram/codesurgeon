@@ -190,7 +190,7 @@ fn traceback_frame_re() -> &'static Regex {
 }
 
 /// Extracted anchors, in order of discovery.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Anchors {
     /// Symbol names to try looking up exactly (deduplicated, in order).
     pub symbol_names: Vec<String>,
@@ -202,6 +202,25 @@ pub struct Anchors {
     /// class methods (2+ `::`), since a dotted call is almost always a
     /// module-level function, not a method.
     pub from_dotted_call: HashSet<String>,
+    /// Python traceback frames as `(file_path, function_name)` pairs.
+    /// Distinct from `symbol_names` because tracebacks carry **both** the
+    /// file path and the function name — that's enough to do a precise
+    /// graph lookup without going through BM25/RRF. Used by the
+    /// traceback shortcut in `engine.rs::traceback_candidates`: every
+    /// frame is pinned as a high-confidence pivot candidate, bypassing
+    /// the walk-direction question.
+    pub traceback_frames: Vec<TracebackFrame>,
+}
+
+/// One frame of a Python traceback, captured by `traceback_frame_re`.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TracebackFrame {
+    /// File path as it appears in the traceback — relative or absolute.
+    /// The graph lookup uses suffix matching to tolerate path differences.
+    pub file_path: String,
+    /// Function or method name. Synthetic names (`<module>`, `<genexpr>`,
+    /// `<listcomp>`) are filtered out at extraction time.
+    pub function_name: String,
 }
 
 /// Extract anchor candidates from a free-form query.
@@ -285,6 +304,7 @@ pub fn extract(query: &str) -> Anchors {
     //    Inserted after imports and before prose so traceback identifiers
     //    get rank priority over generic prose tokens.
     for cap in traceback_frame_re().captures_iter(query) {
+        let file_path = cap.get(1).map(|m| m.as_str().to_string());
         if let Some(func) = cap.get(2) {
             let name = func.as_str();
             if name.starts_with('<') || name.len() < 3 {
@@ -292,6 +312,15 @@ pub fn extract(query: &str) -> Anchors {
             }
             if STOP_WORDS.contains(&name.to_lowercase().as_str()) {
                 continue;
+            }
+            // Record the (file, function) pair separately so the engine
+            // can use it as a direct pivot candidate via the traceback
+            // shortcut (engine.rs::traceback_candidates).
+            if let Some(fp) = file_path {
+                out.traceback_frames.push(TracebackFrame {
+                    file_path: fp,
+                    function_name: name.to_string(),
+                });
             }
             // Dotted frame name (e.g. `ClassName.method_name`) — push both
             // the full chain and the tail so the resolver has options.

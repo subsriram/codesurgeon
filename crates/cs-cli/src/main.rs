@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "codesurgeon",
-    version,
+    version = cs_core::VERSION,
     about = "Local-first codebase context engine for AI coding agents"
 )]
 struct Cli {
@@ -57,6 +57,11 @@ enum Commands {
         /// to read from stdin.
         #[arg(long)]
         context: Option<String>,
+        /// Emit the structured capsule as JSON (pivots, skeletons,
+        /// memories, stats) instead of the markdown rendering. Useful
+        /// for tooling that needs to inspect retrieval programmatically.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show current configuration
@@ -65,8 +70,31 @@ enum Commands {
     /// Show skeleton (signatures only) for a file
     Skeleton { file_path: String },
 
+    /// Extract symbol-name anchors from a query (debug). Lets tooling
+    /// see what `run_pipeline`'s anchor extractor would resolve from a
+    /// given problem statement before going through full retrieval.
+    Anchors {
+        /// Free-form query text. Same format as `context` accepts (`task` +
+        /// optional `--context`).
+        query: String,
+        /// Optional raw-text blob (full problem statement / traceback). Use
+        /// @path/to/file or - for stdin, same conventions as `context`.
+        #[arg(long)]
+        context: Option<String>,
+        /// Emit JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show what would break if a symbol changed
-    Impact { symbol_fqn: String },
+    Impact {
+        symbol_fqn: String,
+        /// Emit the structured ImpactResult as JSON (direct + transitive
+        /// dependents, truncation counts, total_affected) instead of the
+        /// human-readable rendering.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Trace a logic path between two symbols
     Flow { from: String, to: String },
@@ -119,7 +147,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Log to stderr so debug output doesn't pollute the stdout JSON
+    // emitted by `--json` modes. Mirrors `codesurgeon-mcp`, where stdout
+    // is the JSON-RPC channel.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(std::env::var("CS_LOG").unwrap_or_else(|_| "warn".to_string()))
         .init();
 
@@ -168,6 +200,7 @@ async fn main() -> Result<()> {
             language,
             file_hint,
             context,
+            json,
         } => {
             // Resolve @path / - / literal into a plain String, matching the
             // existing `diff` subcommand's ergonomics.
@@ -182,14 +215,25 @@ async fn main() -> Result<()> {
                 Some(s) => Some(s.to_string()),
                 None => None,
             };
-            let result = engine.run_pipeline_with_context(
-                &task,
-                context_resolved.as_deref(),
-                Some(budget),
-                language.as_deref(),
-                file_hint.as_deref(),
-            )?;
-            println!("{}", result);
+            if json {
+                let capsule = engine.run_pipeline_capsule_with_context(
+                    &task,
+                    context_resolved.as_deref(),
+                    Some(budget),
+                    language.as_deref(),
+                    file_hint.as_deref(),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&capsule)?);
+            } else {
+                let result = engine.run_pipeline_with_context(
+                    &task,
+                    context_resolved.as_deref(),
+                    Some(budget),
+                    language.as_deref(),
+                    file_hint.as_deref(),
+                )?;
+                println!("{}", result);
+            }
         }
 
         Commands::Config => {
@@ -262,8 +306,56 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Impact { symbol_fqn } => {
+        Commands::Anchors {
+            query,
+            context,
+            json,
+        } => {
+            let context_resolved: Option<String> = match context.as_deref() {
+                Some("-") => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    Some(buf)
+                }
+                Some(s) if s.starts_with('@') => Some(std::fs::read_to_string(&s[1..])?),
+                Some(s) => Some(s.to_string()),
+                None => None,
+            };
+            // Anchor extraction reads `task` + `\n` + `context`, mirroring
+            // run_pipeline_with_context's anchor_source.
+            let anchor_source = match context_resolved.as_deref() {
+                Some(c) if !c.is_empty() => format!("{}\n{}", query, c),
+                _ => query.clone(),
+            };
+            let anchors = cs_core::anchors::extract(&anchor_source);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&anchors)?);
+            } else {
+                println!("symbol_names ({}):", anchors.symbol_names.len());
+                for n in &anchors.symbol_names {
+                    let dotted_tag = if anchors.from_dotted_call.contains(n) {
+                        " (dotted)"
+                    } else {
+                        ""
+                    };
+                    println!("  {}{}", n, dotted_tag);
+                }
+                if !anchors.module_paths.is_empty() {
+                    println!("\nmodule_paths ({}):", anchors.module_paths.len());
+                    for m in &anchors.module_paths {
+                        println!("  {}", m);
+                    }
+                }
+            }
+        }
+
+        Commands::Impact { symbol_fqn, json } => {
             let result = engine.get_impact_graph(&symbol_fqn, None, None, true)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
             println!("Impact graph for: {}", result.target_fqn);
             println!("Total affected: {}\n", result.total_affected);
 

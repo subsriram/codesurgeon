@@ -30,14 +30,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Don't fail the bench job if cs-benchmark isn't published yet —
+      # the summary step skips when the script is missing. `continue-on-error`
+      # is a step-level attribute, not a `with:` input, so it must sit
+      # alongside `uses:` rather than nested under it.
       - name: Check out cs-benchmark (sibling repo with baselines + summary script)
+        continue-on-error: true
         uses: actions/checkout@v6
         with:
           repository: subsriram/cs-benchmark
           path: cs-benchmark
-          # Don't fail the bench job if cs-benchmark isn't published yet —
-          # the summary step skips when the script is missing.
-          continue-on-error: true
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -79,7 +81,7 @@ jobs:
 
       - name: Post PR comment
         if: github.event_name == 'pull_request' && steps.summary.outputs.body != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           SUMMARY_BODY: ${{ steps.summary.outputs.body }}
         with:
