@@ -65,6 +65,23 @@ jobs:
       - name: Run token savings example (20 queries, advisory)
         run: cargo run --release --example token_savings -p cs-core
 
+      # Upload the raw criterion estimates + token-savings JSON so a baseline
+      # refresh can pull exact median/mean numbers without scraping logs.
+      # Regeneration recipe: trigger this workflow on `main`, download the
+      # `bench-results` artifact, feed the estimates.json files into the
+      # `cs-benchmark/benches/baseline.json` schema (`{median_ns, mean_ns}` per
+      # benchmark name).
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results
+          path: |
+            target/criterion/**/new/estimates.json
+            target/token_savings.json
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Render summary
         id: summary
         if: hashFiles('cs-benchmark/scripts/bench_summary.py') != ''
