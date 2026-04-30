@@ -76,19 +76,6 @@ pub(crate) const REVERSE_EXPAND_RRF_K: f32 = 30.0;
 /// dozens-to-low-hundreds of raisers; this caps the seed set but the per-hop
 /// `REVERSE_EXPAND_FAN_OUT` still bounds each walk.
 pub(crate) const REVERSE_EXPAND_SEED_MAX_CALLERS: usize = 500;
-/// Weight applied to body-text semantic similarity when ranking per-hop
-/// callers inside the reverse-expand walk (issue #69 v2). Multiplies the
-/// `[0, 1]` cosine similarity between the query embedding and each caller's
-/// body embedding. Calibrated so that:
-/// - one lexical term match (`+1.0`) still outweighs a moderately related
-///   caller (`sim ≈ 0.5` → `+1.0` weighted contribution);
-/// - amongst overlap=0 candidates (the common sympy-21379 failure mode
-///   where the fix site has no lexical overlap with the query), semantic
-///   similarity reorders by topical relevance rather than centrality alone.
-///
-/// Only applied when the `embeddings` feature is active AND a per-symbol
-/// embedding lookup is provided to `reverse_expand_from_anchors`.
-pub(crate) const REVERSE_EXPAND_SEMANTIC_WEIGHT: f32 = 2.0;
 
 // ── Fusion & scoring weights ──────────────────────────────────────────────────
 
@@ -212,22 +199,12 @@ pub(crate) fn is_trivial_exception_pivot(sym: &Symbol) -> bool {
 /// BFS reverse walk from `seed_ids` through incoming edges (`dependents`).
 ///
 /// Returns `(id, score)` pairs where earlier hops score higher (`1 / (depth + 1)`).
-/// Within a hop, callers are ranked by query-term overlap in their name/fqn
-/// plus optional body-text semantic similarity, lightly penalized by
-/// centrality so utility hubs don't crowd out the intended fix sites.
-/// Per-hop expansion is capped at `fan_out`.
+/// Within a hop, callers are ranked by query-term overlap in their name/fqn,
+/// lightly penalized by centrality so utility hubs don't crowd out the
+/// intended fix sites. Per-hop expansion is capped at `fan_out`.
 ///
 /// `query_terms` is the already-tokenised, lowercased list of task+context
-/// terms. An empty list still walks the graph, it just selects by centrality
-/// (and semantic similarity, if provided).
-///
-/// `semantic_scorer`, when `Some`, is called once per candidate and should
-/// return the cosine similarity between the query embedding and that
-/// symbol's body embedding in `[0, 1]`. `None` (or a closure returning
-/// `None` for a given id) falls back to pure term-overlap + centrality —
-/// this is the behaviour on no-embeddings builds and on symbols with no
-/// indexed body (e.g. synthetic `Import` entries, already filtered). The
-/// weight is `REVERSE_EXPAND_SEMANTIC_WEIGHT`. See issue #69 v2.
+/// terms. An empty list still walks the graph, it just selects by centrality.
 ///
 /// The return order is BFS order (depth-ascending), preserved for RRF.
 pub(crate) fn reverse_expand_from_anchors(
@@ -237,7 +214,6 @@ pub(crate) fn reverse_expand_from_anchors(
     max_depth: u32,
     fan_out: usize,
     max_total: usize,
-    semantic_scorer: Option<&dyn Fn(u64) -> Option<f32>>,
 ) -> Vec<(u64, f32)> {
     use std::collections::VecDeque;
 
@@ -258,18 +234,9 @@ pub(crate) fn reverse_expand_from_anchors(
             continue;
         }
 
-        // Score each caller by:
-        //   + `overlap` — count of query-term matches in name / fqn
-        //   + `SEMANTIC_WEIGHT * sim` — cosine of body embedding vs query embedding
-        //   − `0.1 * centrality` — small penalty so leaf callers beat utility hubs
-        //     when everything else ties.
-        //
-        // The semantic term closes the gap that motivated #69 v2: for
-        // symptom-anchored queries like sympy-21379, the fix site's *body*
-        // is topically aligned with the problem statement even though its
-        // *name* has no lexical overlap with the query. Term overlap alone
-        // kept such sites out of the top-`fan_out` beam; body-text similarity
-        // surfaces them.
+        // Score each caller: +1 per query-term hit in name/fqn, minus a small
+        // centrality penalty so top-K favours specific leaf callers over
+        // generic utility hubs when term overlap ties.
         //
         // Filter out `SymbolKind::Import` entries (retained after the #69
         // revert — the problem existed at #67 too, just less visible). Import
@@ -292,14 +259,7 @@ pub(crate) fn reverse_expand_from_anchors(
                     })
                     .count() as f32;
                 let centrality = graph.centrality_score(s.id);
-                let semantic = semantic_scorer
-                    .and_then(|f| f(s.id))
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                (
-                    s.id,
-                    overlap + REVERSE_EXPAND_SEMANTIC_WEIGHT * semantic - centrality * 0.1,
-                )
+                (s.id, overlap - centrality * 0.1)
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -550,167 +510,4 @@ pub(crate) fn resolve_adjacents<'a>(
             *count <= 2 // max 2 symbols per file in adjacents
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::graph::CodeGraph;
-    use crate::language::Language;
-    use crate::symbol::{EdgeKind, Symbol, SymbolKind};
-
-    fn mk(file: &str, name: &str, kind: SymbolKind) -> Symbol {
-        Symbol::new(
-            file,
-            name,
-            kind,
-            1,
-            1,
-            String::new(),
-            None,
-            String::new(),
-            Language::Python,
-        )
-    }
-
-    /// Build a tiny graph: one seed (exception class) and `n` direct callers
-    /// whose names have no lexical overlap with any reasonable query. Returns
-    /// `(graph, seed_id, caller_ids)`.
-    fn graph_with_anonymous_callers(n: usize) -> (CodeGraph, u64, Vec<u64>) {
-        let mut g = CodeGraph::new();
-        let seed = mk("err.py", "MyError", SymbolKind::Class);
-        let seed_id = seed.id;
-        g.add_symbol(seed);
-        let mut caller_ids = Vec::new();
-        for i in 0..n {
-            let c = mk(
-                &format!("c_{i}.py"),
-                &format!("anon_{i}"),
-                SymbolKind::Function,
-            );
-            caller_ids.push(c.id);
-            g.add_symbol(c);
-        }
-        for &cid in &caller_ids {
-            g.add_edge(cid, seed_id, EdgeKind::Calls);
-        }
-        g.warm_caches();
-        (g, seed_id, caller_ids)
-    }
-
-    /// Issue #69 v2: when every direct caller of a seed has zero lexical
-    /// overlap with the query, a semantic scorer that singles out one caller
-    /// must steer the BFS to that caller at `fan_out=1`. This is the
-    /// sympy-21379 failure mode reduced to a unit fixture.
-    #[test]
-    fn semantic_scorer_promotes_aligned_caller_under_zero_overlap() {
-        let (g, seed_id, caller_ids) = graph_with_anonymous_callers(6);
-        let terms: Vec<String> = vec!["substitution".into(), "piecewise".into()];
-        let aligned = caller_ids[3];
-        let scorer = |id: u64| -> Option<f32> {
-            if id == aligned {
-                Some(0.9)
-            } else {
-                Some(0.3)
-            }
-        };
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
-        assert_eq!(out.len(), 1);
-        assert_eq!(
-            out[0].0, aligned,
-            "semantic scorer should promote aligned caller; got {:?}",
-            out
-        );
-    }
-
-    /// Different semantic target, different winner — proves the scorer's
-    /// *output* drives selection, not a fixed id/ordering bias.
-    #[test]
-    fn semantic_scorer_winner_follows_scorer_output() {
-        let (g, seed_id, caller_ids) = graph_with_anonymous_callers(6);
-        let terms: Vec<String> = vec!["substitution".into()];
-        let target = caller_ids[5];
-        let scorer = |id: u64| -> Option<f32> {
-            if id == target {
-                Some(0.95)
-            } else {
-                Some(0.1)
-            }
-        };
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, target);
-    }
-
-    /// Strong lexical overlap (multiple term matches in name) must still win
-    /// against a high semantic score — the semantic term is a tiebreaker and
-    /// a soft signal for zero-overlap candidates, not a replacement for
-    /// explicit lexical hits. With `SEMANTIC_WEIGHT = 2.0`, two term matches
-    /// (`+2.0`) outweigh one perfect semantic hit (`2.0 * 0.9 = 1.8`).
-    #[test]
-    fn lexical_overlap_still_dominates_when_strong() {
-        let mut g = CodeGraph::new();
-        let seed = mk("err.py", "MyError", SymbolKind::Class);
-        let seed_id = seed.id;
-        g.add_symbol(seed);
-
-        let lexical = mk(
-            "a.py",
-            "substitution_piecewise_handler",
-            SymbolKind::Function,
-        );
-        let lexical_id = lexical.id;
-        g.add_symbol(lexical);
-
-        let semantic = mk("b.py", "anon_helper", SymbolKind::Function);
-        let semantic_id = semantic.id;
-        g.add_symbol(semantic);
-
-        g.add_edge(lexical_id, seed_id, EdgeKind::Calls);
-        g.add_edge(semantic_id, seed_id, EdgeKind::Calls);
-        g.warm_caches();
-
-        let terms: Vec<String> = vec!["substitution".into(), "piecewise".into()];
-        let scorer = |id: u64| -> Option<f32> {
-            if id == semantic_id {
-                Some(0.9)
-            } else {
-                None
-            }
-        };
-
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, Some(&scorer));
-        assert_eq!(out.len(), 1);
-        assert_eq!(
-            out[0].0, lexical_id,
-            "two term matches (+2.0) should outweigh one semantic hit (+1.8)"
-        );
-    }
-
-    /// No semantic scorer → behaviour is identical to the pre-v2 pure term-
-    /// overlap walk. A caller with strictly more lexical overlap must be
-    /// picked regardless of the other caller's graph position.
-    #[test]
-    fn no_scorer_falls_back_to_pure_term_overlap() {
-        let mut g = CodeGraph::new();
-        let seed = mk("err.py", "MyError", SymbolKind::Class);
-        let seed_id = seed.id;
-        g.add_symbol(seed);
-
-        let winner = mk("a.py", "substitution_handler", SymbolKind::Function);
-        let winner_id = winner.id;
-        g.add_symbol(winner);
-        let loser = mk("b.py", "anon_helper", SymbolKind::Function);
-        let loser_id = loser.id;
-        g.add_symbol(loser);
-
-        g.add_edge(winner_id, seed_id, EdgeKind::Calls);
-        g.add_edge(loser_id, seed_id, EdgeKind::Calls);
-        g.warm_caches();
-
-        let terms: Vec<String> = vec!["substitution".into()];
-        let out = reverse_expand_from_anchors(&g, &[seed_id], &terms, 3, 1, 1, None);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, winner_id);
-    }
 }
