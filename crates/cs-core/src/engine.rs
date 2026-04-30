@@ -24,7 +24,7 @@ use crate::ranking::{
     ANCHOR_ROWS_PER_NAME, ANCHOR_RRF_K, CENTRALITY_BOOST, GRAPH_CANDIDATES,
     MARKDOWN_CENTRALITY_BYPASS, REVERSE_EXPAND_CANDIDATES, REVERSE_EXPAND_FAN_OUT,
     REVERSE_EXPAND_MAX_DEPTH, REVERSE_EXPAND_RRF_K, REVERSE_EXPAND_SEED_MAX_CALLERS, RRF_K,
-    STUB_SCORE_WEIGHT,
+    STUB_SCORE_WEIGHT, TRACEBACK_RRF_K,
 };
 #[cfg(feature = "embeddings")]
 use crate::ranking::{ANN_CANDIDATES, BM25_BLEND_WEIGHT, SEMANTIC_BLEND_WEIGHT};
@@ -2269,6 +2269,53 @@ impl CoreEngine {
     ///
     /// Returns `(symbol_id, 1.0)` pairs in extraction order. RRF fusion
     /// handles rank-based blending with BM25 / graph / ANN.
+    /// Resolve Python traceback frames in `query` to symbol IDs.
+    ///
+    /// Each frame carries `(file_path, function_name)` — enough for a
+    /// precision-first lookup that doesn't go through BM25/embeddings.
+    /// The traceback IS the call chain; every frame is a member of the
+    /// bug's code path.
+    ///
+    /// Returns `(symbol_id, 1.0)` pairs in frame order (most-recent call
+    /// first, the typical Python traceback convention). RRF fusion at
+    /// `TRACEBACK_RRF_K` ensures rank-1 frames dominate any single
+    /// BM25/ANN hit.
+    ///
+    /// File-path matching is suffix-based: a traceback frame
+    /// `astropy/io/registry.py` matches an indexed symbol whose
+    /// `file_path` ends with that string. This tolerates absolute paths
+    /// in tracebacks vs. workspace-relative paths in the index.
+    fn traceback_candidates(&self, query: &str) -> Vec<(u64, f32)> {
+        let anchors = crate::anchors::extract(query);
+        if anchors.traceback_frames.is_empty() {
+            return Vec::new();
+        }
+        let graph = self.graph.read();
+        let mut out: Vec<(u64, f32)> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        for frame in &anchors.traceback_frames {
+            // Function name may be dotted (`Class.method`); resolver-side
+            // we use the last segment for symbol-name matching.
+            let func = frame
+                .function_name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&frame.function_name);
+            for sym in graph.all_symbols() {
+                if sym.name != func {
+                    continue;
+                }
+                if !sym.file_path.ends_with(&frame.file_path) {
+                    continue;
+                }
+                if seen.insert(sym.id) {
+                    out.push((sym.id, 1.0));
+                }
+            }
+        }
+        out
+    }
+
     fn anchor_candidates(&self, query: &str, limit: usize) -> (Vec<(u64, f32)>, AnchorStats) {
         let anchors = crate::anchors::extract(query);
         if anchors.symbol_names.is_empty() {
@@ -2664,11 +2711,26 @@ impl CoreEngine {
             Vec::new()
         };
 
+        // Traceback shortcut: when `--context` contains a Python traceback,
+        // every frame's `(file, function)` resolves to a high-confidence
+        // pivot candidate. The traceback IS the call chain; we feed its
+        // frames into RRF at the most aggressive `k` (`TRACEBACK_RRF_K`)
+        // so rank-1 frames dominate any single BM25/ANN hit. Empty when
+        // no Python traceback is present in the query/context.
+        let traceback_results = self.traceback_candidates(&anchor_source);
+        if !traceback_results.is_empty() {
+            tracing::debug!(
+                "traceback shortcut: {} frame symbols resolved",
+                traceback_results.len()
+            );
+        }
+
         // ANN semantic retrieval + RRF fusion across all sources.
         // The anchor list fuses with a smaller `k` (ANCHOR_RRF_K) so that a
         // rank-1 precision-first anchor hit outweighs a rank-1 BM25 hit that
-        // lost the target to body-field noise. Reverse-expansion sits between
-        // anchors and the default retrievers (`REVERSE_EXPAND_RRF_K`).
+        // lost the target to body-field noise. Traceback frames sit at the
+        // most aggressive `k` (TRACEBACK_RRF_K). Reverse-expansion sits
+        // between anchors and the default retrievers (`REVERSE_EXPAND_RRF_K`).
         #[cfg(feature = "embeddings")]
         let mut search_results = {
             let ann_results = self.ann_candidates(query, ANN_CANDIDATES);
@@ -2677,6 +2739,7 @@ impl CoreEngine {
                 (&graph_results, RRF_K),
                 (&ann_results, RRF_K),
                 (&anchor_results, ANCHOR_RRF_K),
+                (&traceback_results, TRACEBACK_RRF_K),
                 (&reverse_results, REVERSE_EXPAND_RRF_K),
             ])
         };
@@ -2685,6 +2748,7 @@ impl CoreEngine {
             (&bm25_results, RRF_K),
             (&graph_results, RRF_K),
             (&anchor_results, ANCHOR_RRF_K),
+            (&traceback_results, TRACEBACK_RRF_K),
             (&reverse_results, REVERSE_EXPAND_RRF_K),
         ]);
 
